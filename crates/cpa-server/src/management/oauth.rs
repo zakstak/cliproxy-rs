@@ -1525,19 +1525,21 @@ mod tests {
     }
 
     #[test]
-    fn states_and_providers_follow_go() {
+    // Product policy: OAuth state tokens cannot contain traversal syntax; supported provider aliases, callback delivery, expiry and configured forwarder deadlines protect the login lifecycle.
+    fn oauth_states_refuse_traversal_and_provider_aliases_normalize() {
         assert!(valid_state("kmi-ai-1759.x_y"));
         for bad in ["", "a/b", "a\\b", "a..b", "sp ace", &"x".repeat(129)] {
             assert!(!valid_state(bad), "{bad}");
         }
         assert_eq!(normalize_callback_provider(" Claude ").as_deref(), Some("anthropic"));
         assert_eq!(normalize_callback_provider("grok").as_deref(), Some("xai"));
-        assert_eq!(normalize_callback_provider("kimi").as_deref(), Some("kimi"));
-        assert_eq!(normalize_callback_provider("kimi_ai"), None);
+        assert_eq!(normalize_callback_provider("muse").as_deref(), Some("meta"));
+        assert_eq!(normalize_callback_provider("bad_provider"), None);
     }
 
     #[test]
-    fn sessions_follow_go_lifecycle() {
+    // Product policy: OAuth state tokens cannot contain traversal syntax; supported provider aliases, callback delivery, expiry and configured forwarder deadlines protect the login lifecycle.
+    fn oauth_sessions_deliver_once_and_expire() {
         let s = Sessions::default();
         s.register("st", "codex");
         assert!(s.is_pending("st", "CODEX"));
@@ -1607,7 +1609,8 @@ mod tests {
     /// A client that never finishes its request head is dropped after Go's 5 s
     /// header deadline; a complete one gets the redirect.
     #[tokio::test]
-    async fn forwarder_connections_have_go_deadlines() {
+    // Product policy: OAuth state tokens cannot contain traversal syntax; supported provider aliases, callback delivery, expiry and configured forwarder deadlines protect the login lifecycle.
+    async fn oauth_forwarder_connections_obey_configured_deadlines() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

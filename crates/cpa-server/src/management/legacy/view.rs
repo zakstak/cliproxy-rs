@@ -562,7 +562,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn durations_parse_like_go() {
+    // Product policy: Existing operator duration spellings remain valid configuration inputs and invalid units are refused.
+    fn legacy_views_accept_supported_operator_duration_units() {
         for (s, want) in [
             ("2s", 2_000_000_000),
             ("1m30s", 90_000_000_000),
@@ -578,15 +579,15 @@ mod tests {
     #[test]
     fn flatten_expands_v8_key_groups() {
         let doc: Yaml = serde_yaml_ng::from_str(
-            "observability:\n  logs:\n    debug: true\napi-keys:\n  gemini:\n    - name: g\n      base-url: b\n      keys:\n        - api-key: k1\n        - api-key: k2\n          prefix: p\naccess:\n  api-keys: [c]\n",
+            "observability:\n  logs:\n    debug: true\napi-keys:\n  claude:\n    - name: g\n      base-url: b\n      keys:\n        - api-key: k1\n        - api-key: k2\n          prefix: p\naccess:\n  api-keys: [c]\n",
         )
         .unwrap();
         let flat = flatten(&doc);
         assert_eq!(flat.get("debug"), Some(&Yaml::Bool(true)));
-        let gemini = flat.get("gemini-api-key").unwrap().as_sequence().unwrap();
-        assert_eq!(gemini.len(), 2);
-        assert_eq!(gemini[1].get("base-url").unwrap().as_str(), Some("b"));
-        assert_eq!(gemini[1].get("prefix").unwrap().as_str(), Some("p"));
+        let claude = flat.get("claude-api-key").unwrap().as_sequence().unwrap();
+        assert_eq!(claude.len(), 2);
+        assert_eq!(claude[1].get("base-url").unwrap().as_str(), Some("b"));
+        assert_eq!(claude[1].get("prefix").unwrap().as_str(), Some("p"));
         assert_eq!(flat.get("api-keys").unwrap().as_sequence().unwrap().len(), 1);
     }
 }

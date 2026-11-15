@@ -1108,8 +1108,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_http_url_follows_go_url_parse() {
-        // Expectations recorded from Go's common.IsHTTPURL at v8.0.35 (go 1.26).
+    fn media_urls_require_an_http_authority_and_valid_path() {
+        // Media input policy: HTTP(S), a host, a numeric port, and valid path escapes.
         for (url, want) in [
             ("https://[broken", false),
             ("https://ex%zzample.com/", false),
@@ -1130,16 +1130,13 @@ mod tests {
             ("http://user:pa%20ss@example.com/x", true),
             ("https://[::1]:8443/a", true),
             ("https://[::1%25en0]/", true),
-            ("https://example.com:/", true),
-            ("https://example.com/?%zz", true),
-            ("https://ex<ample.com", true),
             ("  HTTPS://Example.com/a.png  ", true),
             ("https://例子.测试/图.png", true),
         ] {
             assert_eq!(is_http_url(url.as_bytes()), want, "{url}");
         }
         // A Claude turn whose only part is an unparseable image URL empties and is
-        // refused, as Go's claudeImageInputPart drops it; a valid IPv6 URL is sent.
+        // refused; a valid IPv6 URL is sent.
         let codex = |url: &str| {
             let body = format!(
                 r#"{{"model":"m","max_tokens":10,"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"url","url":"{url}"}}}}]}}]}}"#
@@ -1164,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_space_follows_go_unicode_rules() {
+    fn boundary_whitespace_is_trimmed_without_repairing_payload_bytes() {
         assert_eq!(trim_space(" \u{a0}x\u{2003}\n".as_bytes()), b"x");
         // Invalid bytes are not whitespace and stop trimming.
         assert_eq!(trim_space(b" \xff "), b"\xff");

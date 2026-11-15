@@ -786,25 +786,105 @@ fn has_image_part(content: &Res<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    /// Go v8.0.35 `ConvertOpenAIRequestToCodex` on over-length tool call IDs (b0debb35):
-    /// see tests/reference/codex_chat.
+    use super::*;
+    use serde_json::{Value, json};
+
     #[test]
-    fn over_length_call_ids_match_go() {
-        let go: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/codex_chat_go.json")).unwrap();
-        for case in go["requests"].as_array().unwrap() {
-            let out = super::convert(
-                case["model"].as_str().unwrap(),
-                case["in"].as_str().unwrap().as_bytes(),
-                case["stream"].as_bool().unwrap(),
-                false,
-            )
-            .unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out),
-                case["out"].as_str().unwrap(),
-                "{}",
-                case["name"]
-            );
+    fn long_call_ids_are_bounded_distinct_and_keep_multiturn_references() {
+        let prefix = "a".repeat(80);
+        let ids = [format!("{prefix}-one"), format!("{prefix}-two")];
+        let body = json!({"model":"old", "messages":[
+            {"role":"assistant", "tool_calls": [
+                {"id":ids[0],"type":"function","function":{"name":"first","arguments":"{}"}},
+                {"id":ids[1],"type":"function","function":{"name":"second","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":ids[0],"content":"one"},
+            {"role":"tool","tool_call_id":ids[1],"content":"two"},
+            {"role":"user","content":"continue"}
+        ]});
+        let out = convert("gpt-test", &serde_json::to_vec(&body).unwrap(), false, false).unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        let input = out["input"].as_array().unwrap();
+        let calls: Vec<&Value> = input.iter().filter(|v| v["type"] == "function_call").collect();
+        let results: Vec<&Value> = input.iter().filter(|v| v["type"] == "function_call_output").collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(results.len(), 2);
+        let first = calls[0]["call_id"].as_str().unwrap();
+        let second = calls[1]["call_id"].as_str().unwrap();
+        assert!(first.len() <= 64 && second.len() <= 64);
+        assert_ne!(first, second);
+        for (call, result) in calls.iter().zip(&results) {
+            assert_eq!(call["call_id"], result["call_id"]);
         }
+        assert_eq!(results[0]["output"], "one");
+        assert_eq!(results[1]["output"], "two");
+        for id in [b"".as_slice(), b"call_short", &[b'x'; 64]] {
+            assert_eq!(shorten_call_id(id), id);
+        }
+    }
+    #[test]
+    fn call_identity_survives_collisions_missing_ids_and_unicode() {
+        use sha2::{Digest, Sha256};
+        let long = "z".repeat(90);
+        // Occupy the adapter's first two shortened candidates. These are adversarial
+        // inputs, not expected output: only uniqueness and references are asserted.
+        let occupied = shorten_call_id(long.as_bytes());
+        let next_sum = Sha256::new_with_prefix(long.as_bytes()).chain_update("_1").finalize();
+        let next_occupied = with_hash_suffix(long.as_bytes(), &next_sum);
+        let ids = [
+            Some(long.clone()),
+            Some(String::from_utf8(occupied).unwrap()),
+            Some(String::from_utf8(next_occupied).unwrap()),
+            Some("é".repeat(60)),
+            None,
+            None,
+        ];
+        let calls: Vec<Value> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut call = json!({"type":"function","function":{"name":format!("tool_{i}"),"arguments":"{}"}});
+                if let Some(id) = id {
+                    call["id"] = json!(id);
+                }
+                call
+            })
+            .collect();
+        let mut messages = vec![json!({"role":"assistant","tool_calls":calls})];
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(id) = id {
+                messages.push(json!({"role":"tool","tool_call_id":id,"content":format!("result-{i}")}));
+            }
+        }
+        let body = json!({"messages":messages});
+        let out: Value =
+            serde_json::from_slice(&convert("gpt-test", &serde_json::to_vec(&body).unwrap(), false, false).unwrap())
+                .unwrap();
+        let input = out["input"].as_array().unwrap();
+        let calls: Vec<&Value> = input.iter().filter(|v| v["type"] == "function_call").collect();
+        assert_eq!(calls.len(), 6);
+        let unique: std::collections::HashSet<&str> = calls.iter().map(|v| v["call_id"].as_str().unwrap()).collect();
+        assert_eq!(unique.len(), 6);
+        assert!(unique.iter().all(|id| !id.is_empty()));
+        let results: Vec<&Value> = input.iter().filter(|v| v["type"] == "function_call_output").collect();
+        assert_eq!(results.len(), 4);
+        for (call, result) in calls.iter().zip(results) {
+            assert_eq!(call["call_id"], result["call_id"]);
+        }
+        let duplicated = json!({"messages":[{"role":"assistant","tool_calls":[
+            {"id":long,"type":"function","function":{"name":"one","arguments":"{}"}},
+            {"id":long,"type":"function","function":{"name":"two","arguments":"{}"}}
+        ]}]});
+        let out: Value = serde_json::from_slice(
+            &convert("gpt-test", &serde_json::to_vec(&duplicated).unwrap(), false, false).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !out["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["type"] == "function_call")
+        );
     }
 }

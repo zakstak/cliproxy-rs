@@ -386,138 +386,155 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// Go goldens (tests/reference/server/main.go `resolvedModels`, run through
-    /// `GoldenResolvedModelInfo` in auth_export.go.overlay): Go's real
-    /// `attachResolvedExecutionModelInfo` on config-synthesized auths, mutated
-    /// `config_index` values and file-style auths.
     #[test]
-    fn resolved_models_match_go() {
-        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        // A `codex-api-key` model can no longer set `is-compat` (#28): the recorded config
-        // loses it, and the Codex cases bind without it.
-        let config = fixture["resolved_config"].as_str().unwrap();
-        let codex_compat = "          alias: sol\n          is-compat: true\n";
-        assert_eq!(config.matches(codex_compat).count(), 1);
-        // The removed providers' sections (issue #49) and their cases go.
-        let config = cpa_core::removed::strip_settings(&config.replace(codex_compat, "          alias: sol\n"));
-        let cfg = Config::parse(&config).unwrap();
-        let synthesized = credentials::from_config(&cfg);
-        let cases = fixture["resolved"].as_array().unwrap();
-        assert_eq!(cases.len(), 32);
-        let (mut bound, mut codex_oauth) = (0, 0);
-        for case in cases {
-            let name = case["name"].as_str().unwrap();
-            let id = case["auth_id"].as_str().unwrap();
-            if id.starts_with("openai-compatibility:") || id.starts_with("vertex:") {
-                continue;
-            }
-            let attributes: std::collections::BTreeMap<String, String> = case["attributes"]
-                .as_object()
-                .map(|a| {
-                    a.iter()
-                        .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let c = if case["synthetic"].as_bool().unwrap() {
-                // Go and Rust synthesize the same IDs; the case's config_index mutation
-                // is carried over from Go's attributes.
-                let mut c = synthesized
-                    .iter()
-                    .find(|c| c.id == id)
-                    .unwrap_or_else(|| panic!("{name}: no synthesized credential {id}"))
-                    .clone();
-                c.attributes
-                    .insert("config_index".into(), attributes["config_index"].clone());
-                c
+    fn configured_capabilities_bind_to_the_selected_entry_route_and_upstream() {
+        let cfg = Config::parse(
+            r#"config-version: 8
+api-keys:
+  claude:
+    - base-url: https://claude.example.invalid
+      models:
+        - name: own-model
+          alias: shared
+          is-compat: true
+          thinking:
+            levels: [HIGH, none, high, ' auto ']
+        - name: own-second
+          alias: shared
+        - alias: alias-only
+      keys: [{api-key: fake-claude}]
+    - base-url: https://claude.example.invalid
+      headers: {X-Entry: second}
+      models: [{name: second-entry, alias: entry-alias}]
+      keys: [{api-key: fake-claude}]
+  codex:
+    - base-url: https://codex.example.invalid
+      prefix: team
+      models:
+        - name: own-codex
+          alias: assistant
+          support-configuration-update: true
+          thinking: {min: 1, max: 9}
+      keys: [{api-key: fake-codex}]
+  xai:
+    - base-url: https://xai.example.invalid
+      models: [{name: own-xai, alias: research}]
+      keys: [{api-key: fake-xai}]
+  meta:
+    - models: [{name: own-meta, alias: social}]
+      keys: [{api-key: fake-meta}]
+"#,
+        )
+        .unwrap();
+        let all = credentials::from_config(&cfg);
+        let first = |provider: &str| {
+            all.iter()
+                .find(|c| c.provider == provider)
+                .unwrap_or_else(|| panic!("missing configured {provider} credential"))
+        };
+        for (provider, route, upstream) in [
+            ("claude", "shared", "own-model"),
+            ("claude", "shared(high)", "own-model(high)"),
+            ("claude", "OWN-MODEL", "own-model"),
+            ("claude", "alias-only", "alias-only"),
+            ("codex", "team/assistant", "own-codex"),
+            ("xai", "research", "own-xai"),
+            ("meta", "social", "own-meta"),
+        ] {
+            let got = resolve_attempt(&cfg, first(provider), route, upstream, None).unwrap();
+            assert_eq!(got.source, ResolvedSource::ApiKey);
+            assert_eq!(got.info.kind, provider);
+            let expected = if provider == "claude" && route == "alias-only" {
+                "alias-only"
+            } else if provider == "claude" {
+                "own-model"
             } else {
-                let meta = case["metadata"].as_object().cloned().unwrap_or_default();
-                let path = format!("/auth/{id}");
-                let mut c = Credential::from_file(Path::new("/auth"), Path::new(&path), meta).unwrap();
-                c.attributes = attributes;
-                c
+                upstream
             };
-            let restore = case["restore"].as_bool().unwrap();
-            let got = resolve_attempt(
-                &cfg,
-                &c,
-                case["route"].as_str().unwrap(),
-                case["upstream"].as_str().unwrap(),
-                restore.then(|| case["req_model"].as_str().unwrap()),
-            );
-            let source = match got.as_ref().map(|r| r.source) {
-                None => "",
-                Some(ResolvedSource::ApiKey) => "api_key",
-                Some(ResolvedSource::CodexOAuth) => "codex_oauth",
-                Some(ResolvedSource::Home) => "home",
-            };
-            assert_eq!(source, case["source"].as_str().unwrap(), "{name}: source");
-            let Some(got) = got else { continue };
-            let mut want = case["info"].clone();
-            if c.provider.eq_ignore_ascii_case("codex")
-                && let Some(info) = want.as_object_mut()
-            {
-                info.remove("is_compat");
-            }
-            if want["id"] == "claude-opus-4-7" {
-                // Recorded before Go ad9e456d made Opus 4.7 adaptive-only in the v8.0.35
-                // catalog (internal/registry/models/models.json).
-                want["thinking"] = serde_json::json!({
-                    "zero_allowed": true,
-                    "dynamic_allowed": true,
-                    "levels": ["low", "medium", "high", "xhigh", "max"]
-                });
-            }
-            bound += 1;
-            codex_oauth += usize::from(got.source == ResolvedSource::CodexOAuth);
-            // Go's JSON drops internal fields; compare everything else, ignoring zero
-            // values Go emits for an unknown static model.
-            let visible = |m: &Map<String, Value>| -> Map<String, Value> {
-                m.iter()
-                    .filter(|(k, v)| {
-                        !matches!(
-                            k.as_str(),
-                            "support_configuration_update" | "is_compat" | "user_defined" | "native_capabilities"
-                        ) && !matches!(v, Value::Null)
-                            && *v != &Value::from("")
-                            && *v != &Value::from(0)
-                    })
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            };
-            assert_eq!(
-                Value::Object(visible(&got.info.raw)),
-                Value::Object(visible(want.as_object().unwrap())),
-                "{name}: info"
-            );
-            assert_eq!(got.info.id, want["id"].as_str().unwrap(), "{name}: id");
-            assert_eq!(got.info.kind, want["type"].as_str().unwrap(), "{name}: type");
-            assert_eq!(
-                got.is_compat(),
-                case["is_compat"].as_bool().unwrap() && !c.provider.eq_ignore_ascii_case("codex"),
-                "{name}: is_compat"
-            );
-            let caps = cpa_common::thinking::ModelCaps::from(&got.info);
-            assert_eq!(
-                caps.support_configuration_update,
-                case["support_configuration_update"].as_bool().unwrap(),
-                "{name}: support_configuration_update"
-            );
-            assert_eq!(
-                caps.user_defined,
-                case["user_defined"].as_bool().unwrap(),
-                "{name}: user_defined"
-            );
-            assert_eq!(
-                got.info.thinking.as_ref().map(dynamic::thinking_value),
-                want.get("thinking").cloned(),
-                "{name}: typed thinking"
-            );
+            assert_eq!(got.info.id, expected);
+            assert!(!cpa_common::thinking::ModelCaps::from(&got.info).user_defined);
+            assert_eq!(got.is_compat(), provider == "claude" && route != "alias-only");
         }
-        // 25 in Go; the OpenAI-compatible and Vertex cases went with those providers.
-        assert_eq!((bound, codex_oauth), (21, 4));
+        let configured = resolve(&cfg, first("claude"), "shared", "own-model").unwrap();
+        let thinking = configured.info.thinking.unwrap();
+        assert_eq!(thinking.levels, ["high", "none", "auto"]);
+        assert!(thinking.zero_allowed && thinking.dynamic_allowed);
+        let second = resolve(&cfg, first("claude"), "shared", "own-second").unwrap();
+        assert_eq!(second.info.id, "own-second");
+        assert!(!second.is_compat());
+        assert!(resolve(&cfg, first("claude"), "shared", "unrelated").is_none());
+        assert!(resolve(&cfg, first("claude"), "missing", "own-model").is_none());
+        let second_entry = all
+            .iter()
+            .find(|c| c.provider == "claude" && c.attributes["config_index"] == "1")
+            .unwrap();
+        assert_eq!(
+            resolve(&cfg, second_entry, "entry-alias", "second-entry")
+                .unwrap()
+                .info
+                .id,
+            "second-entry"
+        );
+        assert!(
+            resolve(&cfg, second_entry, "shared", "own-model").is_none(),
+            "a matching key does not borrow another configured entry's capabilities"
+        );
+        let mut stale = second_entry.clone();
+        stale.attributes.insert("config_index".into(), "999".into());
+        assert_eq!(
+            resolve(&cfg, &stale, "shared", "own-model").unwrap().info.id,
+            "own-model",
+            "a stale entry index resolves by key/base URL"
+        );
+        // Restoring an execution model binds Codex only; it must not borrow a Claude route.
+        assert!(resolve_attempt(&cfg, first("claude"), "shared", "own-model", Some("own-model")).is_none());
+        let codex = resolve_attempt(&cfg, first("codex"), "unrelated", "ignored", Some("own-codex")).unwrap();
+        assert_eq!(codex.info.id, "own-codex");
+        assert!(cpa_common::thinking::ModelCaps::from(&codex.info).support_configuration_update);
+        let unknown = resolve(&cfg, first("codex"), "unlisted", "future-codex").unwrap();
+        assert_eq!(unknown.info.id, "future-codex");
+        assert_eq!(unknown.source, ResolvedSource::ApiKey);
+        assert!(!unknown.is_compat());
+        let mut wrong = first("codex").clone();
+        wrong.attributes.insert("api_key".into(), "unmatched".into());
+        assert!(resolve(&cfg, &wrong, "unlisted", "future-codex").is_none());
+        let mut no_match = first("claude").clone();
+        no_match.attributes.insert("api_key".into(), "unmatched".into());
+        assert!(resolve(&cfg, &no_match, "shared", "own-model").is_none());
     }
 
+    #[test]
+    fn codex_oauth_capabilities_follow_plan_catalog_without_borrowing_api_key_configuration() {
+        let cfg = Config::default();
+        for plan in ["pro", "plus", "team", "business", "go", "free", "unknown"] {
+            let mut credential = Credential::from_file(
+                Path::new("/fake"),
+                Path::new("/fake/codex.json"),
+                serde_json::json!({"type":"codex","access_token":"fake-token"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+            credential.attributes.insert("plan_type".into(), plan.into());
+            let got = resolve(&cfg, &credential, "client-alias", "gpt-5.5(high)").unwrap();
+            assert_eq!(got.source, ResolvedSource::CodexOAuth);
+            assert_eq!(got.info.id, "gpt-5.5");
+            assert!(!got.is_compat());
+            assert!(got.info.thinking.is_some());
+            assert!(resolve(&cfg, &credential, "client-alias", "nonexistent-codex-model").is_none());
+        }
+        let other = Credential::from_file(
+            Path::new("/fake"),
+            Path::new("/fake/claude.json"),
+            serde_json::json!({"type":"claude","access_token":"fake-token"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        assert!(resolve(&cfg, &other, "gpt-5.5", "gpt-5.5").is_none());
+    }
     /// Go `TestResolveModelInfoConfiguredThinkingKeepsCatalogDisableType`: configured levels
     /// replace the catalog's, but an empty `disable-type` keeps the catalog's way of turning
     /// thinking off; an explicit one wins.

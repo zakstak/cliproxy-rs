@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn the_gate_classifies_credentials_like_go_auth_kind() {
+    fn replay_gate_requires_an_api_key_credential() {
         let credential = |attrs: &[(&str, &str)], meta: serde_json::Value| {
             let mut c = Credential::from_file(
                 std::path::Path::new("/a"),
@@ -666,73 +666,80 @@ mod tests {
         assert_eq!(model_family(&credential, "k", "", " "), "");
     }
 
-    /// Go's Home KV backend for Claude replay, recorded by the reference's
-    /// internal/cache/zz_rustgolden_test.go: reservation, CAS appends against the read
-    /// bytes, stale writes, deduplicated turns, tombstones and the rejected legacy form.
+    /// The shared Home schema uses generations, CAS updates, and tombstones to
+    /// prevent lost updates and resurrection by stale requests.
     #[tokio::test]
-    async fn home_kv_replay_matches_go() {
+    async fn home_replay_uses_compare_and_swap_and_tombstones() {
         use std::collections::HashMap;
         use std::sync::Mutex;
-        let golden: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/go_claude_replay_home.json")).unwrap();
-        let steps = golden["steps"].as_array().unwrap();
         let values = Arc::new(Mutex::new(HashMap::new()));
         let home = cpa_home::fake::FakeHome::start(super::super::kv_test::kv_home(values.clone())).await;
         let client = home.client();
         let turn_a = br#"[ {"type":"thinking","thinking":"a<b","signature":"sig-a"}, {"type":"tool_use","id":"t1","name":"f","input":{}} ]"#;
         let turn_b = br#"[{"type":"thinking","thinking":"b","signature":"sig-b"},{"type":"tool_use","id":"t2","name":"f","input":{"x":1}}]"#;
-        let mut seen = 0;
-        let mut calls = || {
-            let all: Vec<serde_json::Value> = home
-                .commands()
-                .iter()
-                .filter_map(|c| super::super::kv_test::as_go_call(c))
-                .map(|call| {
-                    serde_json::from_str(&super::super::kv_test::normalize_generations(&call.to_string())).unwrap()
-                })
-                .collect();
-            let new = all[seen..].to_vec();
-            seen = all.len();
-            serde_json::Value::from(new)
-        };
-        let texts = |contents: &[Vec<u8>]| -> serde_json::Value {
-            contents.iter().map(|c| String::from_utf8(c.clone()).unwrap()).collect()
-        };
         let key = kv_key(" claude:x ", " sess-1 ");
-        let (first, got) = home_get(&client, &key).await.unwrap();
-        assert_eq!(texts(&got), steps[0]["result"]["contents"]);
-        assert_eq!(calls(), steps[0]["calls"], "get_reserves");
-        assert_eq!(home_append(&client, &key, &first, turn_a).await, Ok(true));
-        assert_eq!(calls(), steps[1]["calls"], "append_a");
-        assert_eq!(home_append(&client, &key, &first, turn_b).await, Ok(false));
-        assert_eq!(calls(), steps[2]["calls"], "append_stale");
-        let (second, got) = home_get(&client, &key).await.unwrap();
-        assert_eq!(texts(&got), steps[3]["result"]["contents"]);
-        assert_eq!(calls(), steps[3]["calls"], "get_a");
-        assert_eq!(home_append(&client, &key, &second, turn_b).await, Ok(true));
-        assert_eq!(calls(), steps[4]["calls"], "append_b");
-        let (third, got) = home_get(&client, &key).await.unwrap();
-        assert_eq!(texts(&got), steps[5]["result"]["contents"]);
-        assert_eq!(calls(), steps[5]["calls"], "get_ab");
-        assert_eq!(home_append(&client, &key, &third, turn_a).await, Ok(true));
-        assert_eq!(calls(), steps[6]["calls"], "append_duplicate");
-        let (fourth, got) = home_get(&client, &key).await.unwrap();
-        assert_eq!(texts(&got), steps[7]["result"]["contents"]);
-        assert_eq!(calls(), steps[7]["calls"], "get_after_duplicate");
-        assert_eq!(home_delete(&client, &key, &fourth).await, Ok(true));
-        assert_eq!(calls(), steps[8]["calls"], "delete");
-        let (_, got) = home_get(&client, &key).await.unwrap();
-        assert!(got.is_empty());
-        assert_eq!(calls(), steps[9]["calls"], "get_deleted");
-        let legacy = kv_key("claude:x", "legacy");
-        values.lock().unwrap().insert(
-            legacy.clone(),
-            r#"[{"type":"thinking","thinking":"x","signature":"s"}]"#.into(),
+        assert_eq!(key, kv_key("claude:x", "sess-1"));
+        assert_ne!(key, kv_key("claude:x", "sess-2"));
+        let (first, contents) = home_get(&client, &key).await.unwrap();
+        assert!(contents.is_empty());
+        assert!(home_append(&client, &key, &first, turn_a).await.unwrap());
+        assert!(
+            !home_append(&client, &key, &first, turn_b).await.unwrap(),
+            "a stale reader must not overwrite a turn"
         );
+        let (second, contents) = home_get(&client, &key).await.unwrap();
+        let semantic = |contents: &[Vec<u8>]| {
+            contents
+                .iter()
+                .map(|c| serde_json::from_slice::<serde_json::Value>(c).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(semantic(&contents), semantic(&[turn_a.to_vec()]));
+        assert!(home_append(&client, &key, &second, turn_b).await.unwrap());
+        let (third, contents) = home_get(&client, &key).await.unwrap();
+        assert_eq!(semantic(&contents), semantic(&[turn_a.to_vec(), turn_b.to_vec()]));
+        assert!(home_append(&client, &key, &third, turn_a).await.unwrap());
+        let (fourth, contents) = home_get(&client, &key).await.unwrap();
         assert_eq!(
-            home_get(&client, &legacy).await.unwrap_err(),
-            steps[10]["result"]["error_text"].as_str().unwrap()
+            semantic(&contents),
+            semantic(&[turn_a.to_vec(), turn_b.to_vec()]),
+            "duplicate turns are not appended"
         );
-        assert_eq!(calls(), steps[10]["calls"], "get_legacy_rejected");
+        assert!(
+            !home_delete(&client, &key, &third).await.unwrap(),
+            "stale deletion must not erase newer state"
+        );
+        assert!(home_delete(&client, &key, &fourth).await.unwrap());
+        assert!(
+            !home_append(&client, &key, &fourth, turn_b).await.unwrap(),
+            "deleted generations cannot resurrect state"
+        );
+        assert!(home_get(&client, &key).await.unwrap().1.is_empty());
+        let stored: serde_json::Value = serde_json::from_str(&values.lock().unwrap()[&key]).unwrap();
+        assert_eq!(stored["deleted"], true);
+        assert!(uuid::Uuid::parse_str(stored["generation"].as_str().unwrap()).is_ok());
+        for invalid in [
+            r#"[{"type":"thinking","thinking":"x","signature":"s"}]"#,
+            r#"{"generation":"","contents":[]}"#,
+            "not json",
+        ] {
+            let invalid_key = kv_key("claude:x", invalid);
+            values.lock().unwrap().insert(invalid_key.clone(), invalid.into());
+            assert!(
+                home_get(&client, &invalid_key).await.is_err(),
+                "invalid replay state: {invalid}"
+            );
+        }
+        let commands = home.commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c[0].eq_ignore_ascii_case("cas") && c.iter().any(|arg| arg == "PX"))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c[0].eq_ignore_ascii_case("expire") && c[1] == key)
+        );
     }
 }

@@ -1,6 +1,5 @@
 use super::*;
 use cpa_core::exec::Caller;
-use cpa_core::gostr::GoStr;
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
@@ -8,8 +7,6 @@ use std::time::Duration;
 thread_local! {
     /// The clock requests prepared on this test thread read, when set.
     static CLOCK: std::cell::Cell<Option<chrono::DateTime<chrono::Utc>>> = const { std::cell::Cell::new(None) };
-    /// The date the currentDate reminder reads on this test thread, when pinned.
-    static TODAY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The instant [`set_clock`] set for this thread.
@@ -17,38 +14,22 @@ pub(super) fn clock() -> Option<chrono::DateTime<chrono::Utc>> {
     CLOCK.get()
 }
 
-/// Sets the clock requests prepared on this thread read, as Go's tests do with
-/// `claudeCodeCurrentTimeFunc`, until a [`Pins`] guard drops. `#[tokio::test]` runs the
-/// executor on the test's own thread.
+/// Set a fixed request clock until a [`Pins`] guard drops. Each Tokio test runs
+/// on its own thread.
 fn set_clock(now: Option<&str>) {
     CLOCK.set(now.map(|now| chrono::DateTime::parse_from_rfc3339(now).unwrap().to_utc()));
 }
 
-/// The local date [`pin_today`] pinned for this thread.
-pub(super) fn pinned_today() -> Option<String> {
-    TODAY.with_borrow(Clone::clone)
-}
-
-/// Pins the date itself, for replays of a Go run that recorded only the date its clock
-/// gave in the credential's zone, until the returned guard drops.
-pub(super) fn pin_today(date: Option<&str>) -> Pins {
-    TODAY.with_borrow_mut(|today| *today = date.map(str::to_owned));
-    Pins
-}
-
-/// Releases this thread's clock and date pins when it drops, so a test that panics
-/// leaves neither behind.
+/// Release the fixed clock even when an assertion panics.
 pub(super) struct Pins;
 
 impl Drop for Pins {
     fn drop(&mut self) {
         CLOCK.set(None);
-        TODAY.with_borrow_mut(|today| *today = None);
     }
 }
 
-/// The fake, local-only credential of the retired Go differential harness, whose captures
-/// `testdata/go_captures.json` holds.
+/// An in-memory OAuth credential containing only local test identities.
 fn harness_credential() -> Credential {
     let metadata = serde_json::json!({
         "type": "claude", "access_token": "sk-ant-oat01-FAKE-LOCAL-ONLY",
@@ -109,39 +90,44 @@ fn request(case: &Value) -> ExecRequest {
     }
 }
 
+/// The Messages pipeline retains caller content and isolates upstream credentials.
+/// First-party identity values have their own measured-client fixture tests.
 #[tokio::test]
-async fn pipeline_reproduces_go_upstream_captures() {
-    let captures: Value = serde_json::from_str(include_str!("testdata/go_captures.json")).unwrap();
+async fn prepared_messages_preserve_content_tools_and_credential_boundaries() {
     let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
     let credential = harness_credential();
-    let cfg = super::settings::as_recorded_with_2_1_280_profile(Config::parse("").unwrap());
-    for case in captures["cases"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        let req = enrich(request(case));
-        let mut ctx = Ctx::new(&executor, &credential, &req, &cfg);
-        ctx.today = "2026-10-02".into();
-        let translated = translate::request(
-            &req,
-            ctx.codex,
-            &ctx.base_model,
-            ctx.is_compat,
-            ctx.tool_search(),
-            ctx.system_turns(&req, false),
-        )
-        .unwrap();
-        let prepared = if req.operation == Operation::CountTokens {
-            let baseline = translate::count_original(
+    let cfg = Config::parse("").unwrap();
+    for stream in [false, true] {
+        for tools in [false, true] {
+            let mut body = serde_json::json!({
+                "model":"claude-sonnet-4-6", "max_tokens":17, "stream":stream,
+                "messages":[{"role":"user","content":"Local question"}],
+                "system":"Preserve caller instructions", "unknown_extension":{"value":"untouched"}
+            });
+            if tools {
+                body["tools"] = serde_json::json!([
+                    {"name":"lookup","description":"Local tool","input_schema":{"type":"object"}},
+                    {"name":"mcp__native__lookup","input_schema":{"type":"object"}}
+                ]);
+                body["tool_choice"] = serde_json::json!({"type":"tool","name":"lookup"});
+                body["messages"].as_array_mut().unwrap().extend([
+                    serde_json::json!({"role":"assistant","content":[{"type":"tool_use","id":"previous_tool","name":"lookup","input":{"name":"literal"}}]}),
+                    serde_json::json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"previous_tool","content":"Local result"}]}),
+                ]);
+            }
+            let case = serde_json::json!({"request_body":body.to_string(),"request_headers":[["authorization","Bearer client-only-secret"]],"path":"/v1/messages"});
+            let req = enrich(request(&case));
+            let mut ctx = Ctx::new(&executor, &credential, &req, &cfg);
+            ctx.today = "2026-10-02".into();
+            let translated = translate::request(
                 &req,
-                &translated,
                 ctx.codex,
                 &ctx.base_model,
                 ctx.is_compat,
                 ctx.tool_search(),
-                ctx.system_turns(&req, true),
+                ctx.system_turns(&req, false),
             )
             .unwrap();
-            ctx.prepare_count(&req, &translated, &baseline).await.unwrap()
-        } else {
             let original = translate::original(
                 &req,
                 &translated,
@@ -152,41 +138,49 @@ async fn pipeline_reproduces_go_upstream_captures() {
                 ctx.system_turns(&req, false),
             )
             .unwrap();
-            ctx.prepare_messages(&req, &translated, &original, req.stream)
+            let prepared = ctx
+                .prepare_messages(&req, &translated, &original, stream)
                 .await
-                .unwrap()
-        };
-        assert_eq!(prepared.body, case["upstream_body"].as_str().unwrap(), "{name}: body");
-        let go: Vec<(String, String)> = case["upstream_headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|h| (h[0].as_str().unwrap().to_owned(), h[1].as_str().unwrap().to_owned()))
-            .filter(|(k, _)| k != "Host" && k != "Content-Length")
-            .collect();
-        let names = |h: &[(String, String)]| h.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
-        assert_eq!(names(&prepared.headers), names(&go), "{name}: header order and casing");
-        for ((k, ours), (_, theirs)) in prepared.headers.iter().zip(&go) {
-            if k == "x-client-request-id" {
-                assert!(uuid::Uuid::parse_str(ours).is_ok(), "{name}: request id");
-                continue;
+                .unwrap();
+            let sent: Value = serde_json::from_str(&prepared.body).unwrap();
+            assert_eq!(sent["model"], body["model"]);
+            assert_eq!(sent["max_tokens"], 17);
+            assert_eq!(sent["stream"], stream);
+            assert_eq!(sent["unknown_extension"], body["unknown_extension"]);
+            assert!(prepared.body.contains("Local question"));
+            assert!(prepared.body.contains("Preserve caller instructions"));
+            assert!(!prepared.body.contains("client-only-secret"));
+            let headers: http::HeaderMap = prepared
+                .headers
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.parse::<http::HeaderName>().unwrap(),
+                        v.parse::<http::HeaderValue>().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(headers["authorization"], "Bearer sk-ant-oat01-FAKE-LOCAL-ONLY");
+            assert!(prepared.headers.iter().all(|(_, v)| !v.contains("client-only-secret")));
+            assert_eq!(signing::sign(prepared.body.clone()).unwrap(), prepared.body);
+            if tools {
+                let alias = sent["tools"][0]["name"].as_str().unwrap();
+                assert_ne!(alias, "lookup");
+                assert_eq!(prepared.reverse.get(alias).map(String::as_str), Some("lookup"));
+                assert_eq!(sent["tools"][1]["name"], "mcp__native__lookup");
+                assert_eq!(sent["tool_choice"]["name"], alias);
+                let assistant = sent["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m["role"] == "assistant")
+                    .unwrap();
+                assert_eq!(assistant["content"][0]["name"], alias);
+                assert_eq!(assistant["content"][0]["input"]["name"], "literal");
+                assert!(prepared.body.contains("previous_tool"));
+                assert!(prepared.body.contains("Local result"));
             }
-            if k == "anthropic-beta" && super::betas::matches_go(ours, theirs, case["upstream_body"].as_str().unwrap())
-            {
-                continue;
-            }
-            assert_eq!(ours, theirs, "{name}: {k}");
         }
-        let order: Vec<_> = case["upstream_headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|h| h[0].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            prepared.order, order,
-            "{name}: wire order including Host/Content-Length"
-        );
     }
 }
 
@@ -312,9 +306,8 @@ async fn count_defaults_read_the_original_request() {
     assert_eq!(count(rule, original).await, plain, "the original sets system");
 }
 
-/// Go's conductor observes the quota headers of every Messages response (success,
-/// undecodable success or upstream error) for Claude credentials; count_tokens results
-/// skip observation.
+/// Messages update the credential's quota snapshot on success, decode failure and
+/// upstream rejection; local token counts do not invent quota observations.
 #[tokio::test]
 async fn messages_responses_record_the_quota_snapshot() {
     use axum::response::IntoResponse;
@@ -427,8 +420,7 @@ async fn messages_responses_record_the_quota_snapshot() {
     assert_eq!(signal(&executor), "undecodable");
 }
 
-/// Go `session.Enrich` + `ExtractSessionID`, as the server applies them before the
-/// executor (crates/cpa-server/src/session.rs, on the shared `cpa_common::session`).
+/// Apply the server's shared session derivation before preparing a request.
 fn enrich(mut req: ExecRequest) -> ExecRequest {
     use cpa_common::session::{self as shared, Meta};
     let scope = shared::caller_scope(&req.caller.principal);
@@ -448,244 +440,1038 @@ fn enrich(mut req: ExecRequest) -> ExecRequest {
     req
 }
 
-/// Replaces values Go and Rust generate independently (random device/session IDs in
-/// non-CLI fake user IDs, and the CCH computed over them) with fixed markers.
-fn normalize_random(text: &str) -> String {
-    let device = regex::Regex::new(r#"(device_id\\?":\\?")[0-9a-f]{64}"#).unwrap();
-    let session = regex::Regex::new(r#"(session_id\\?":\\?")[0-9a-f-]{36}"#).unwrap();
-    let cch = regex::Regex::new(r"cch=[0-9a-f]{5};").unwrap();
-    let text = device.replace_all(text, "${1}<device>");
-    let text = session.replace_all(&text, "${1}<session>");
-    cch.replace_all(&text, "cch=<cch>;").into_owned()
-}
-
-/// The model capabilities Go bound to the scenario's request (dispatch's job in Rust).
-fn resolved(scenario: &Value) -> Option<cpa_core::exec::ResolvedModel> {
-    let info = scenario.get("resolved_info")?.as_object()?.clone();
-    Some(cpa_core::exec::ResolvedModel {
-        info: cpa_core::registry::ModelInfo::from_raw(info).unwrap(),
-        source: cpa_core::exec::ResolvedSource::ApiKey,
-    })
-}
-
-/// [`normalize_random`] plus the values a cloaked request derives from the wall clock
-/// and a fresh fake user ID.
-fn normalize_replay(text: &str) -> String {
-    let date = regex::Regex::new(r"Today's date is \d{4}-\d{2}-\d{2}").unwrap();
-    let user = regex::Regex::new(r#"("user_id":")(?:[^"\\]|\\.)*""#).unwrap();
-    let text = normalize_random(text);
-    let text = date.replace_all(&text, "Today's date is <date>");
-    user.replace_all(&text, "${1}<user>\"").into_owned()
-}
-
-/// Runs the scenario's upstream reply through the executor's response half (decoding,
-/// error-body reading and classification) exactly as `send` does after the exchange.
-async fn finish_reply(scenario: &Value, ctx: &Ctx<'_>, prepared: &Prepared) -> Result<RawResponse, ExecError> {
-    use base64::Engine;
-    let reply = &scenario["reply"];
-    let mut headers = http::HeaderMap::new();
-    headers.insert(
-        http::header::CONTENT_TYPE,
-        reply["content_type"].as_str().unwrap().parse().unwrap(),
+/// Targeted request edits preserve unknown fields and untouched byte spans.
+#[test]
+fn payload_edits_preserve_unmodified_bytes_and_json_meaning() {
+    use crate::rawjson::{delete, set_raw, set_str};
+    let body = r#"{ "unknown":1e+03, "messages":[{"role":"user","content":"a<b"}], "nested":{"value":true} }"#;
+    let changed = set_str(body, "messages.0.content", "changed <text>");
+    assert!(changed.starts_with(r#"{ "unknown":1e+03, "messages":[{"role":"user","content":"#));
+    assert!(changed.ends_with(r#"}], "nested":{"value":true} }"#));
+    let parsed: Value = serde_json::from_str(&changed).unwrap();
+    assert_eq!(parsed["messages"][0]["content"], "changed <text>");
+    let changed = set_raw(&changed, "nested.value", r#"{"keep":9007199254740993}"#);
+    let parsed: Value = serde_json::from_str(&changed).unwrap();
+    assert_eq!(parsed["nested"]["value"]["keep"].as_u64(), Some(9_007_199_254_740_993));
+    assert!(changed.contains(r#""unknown":1e+03"#));
+    let deleted = delete(&changed, "nested.value");
+    let parsed: Value = serde_json::from_str(&deleted).unwrap();
+    assert_eq!(parsed["nested"], serde_json::json!({}));
+    assert_eq!(delete(body, "missing.path"), body);
+    assert_eq!(
+        serde_json::from_str::<Value>(&set_str("{}", "metadata.user_id", "identity")).unwrap(),
+        serde_json::json!({"metadata":{"user_id":"identity"}})
     );
-    for kv in reply["headers"].as_array().into_iter().flatten() {
-        headers.append(
-            http::HeaderName::from_bytes(kv[0].as_str().unwrap().as_bytes()).unwrap(),
-            kv[1].as_str().unwrap().parse().unwrap(),
-        );
-    }
-    let body = match reply["body_b64"].as_str() {
-        Some(b64) => base64::engine::general_purpose::STANDARD.decode(b64).unwrap(),
-        None => scenario["upstream"][0]["reply"].as_str().unwrap().as_bytes().to_vec(),
-    };
-    let upstream = crate::proxy::Upstream {
-        status: reply["status"].as_u64().unwrap() as u16,
-        headers,
-        body: futures_util::stream::iter([Ok(Bytes::from(body))]).boxed(),
-    };
-    let fast = ctx.first_party && prepared.fast;
-    finish(
-        decode_upstream(upstream).await,
-        fast,
-        ctx.settings.model_level_cooling,
-        &Default::default(),
-    )
-    .await
 }
 
-/// Scenarios recorded at an older Go whose error scope and retry hint this fork takes
-/// from the selective Go v8.0.67 target instead (docs/DIFFERENCES-FROM-GO.md). The
-/// recording keeps its provenance; each entry must differ from it, so an entry cannot
-/// outlive the difference.
-const SELECTIVE_ERRORS: &[(&str, FailureScope, bool, &str)] = &[(
-    "oauth-overage-retry-after-429",
-    FailureScope::Model,
-    false,
-    "#72: a rejected overage claim with an allowed 7d window and no 5h headers is a \
-     model-scoped rejection without a quota reset (0130d6f3)",
-)];
-
-/// The error Rust builds from the scenario's upstream reply matches what Go's conductor
-/// and handlers read from its error: scope, retry hint, and the direct response.
-fn assert_go_error(name: &str, scenario: &Value, info: &serde_json::Map<String, Value>, error: ExecError) {
-    let status = scenario["error_status"]
-        .as_u64()
-        .or(info.get("direct_status").and_then(Value::as_u64))
-        .map(|s| s as u16);
-    let flag = |k: &str| info[k].as_bool().unwrap();
-    let scope = if flag("request_scoped") {
-        FailureScope::Request
-    } else if flag("credential_scoped") {
-        FailureScope::Credential
-    } else if error.status == 429 {
-        FailureScope::Model
-    } else if status.is_none() {
-        // A plain Go error: no status, scope or retry semantics.
-        FailureScope::Transport
+/// Prepare a native Messages operation with public config, without opening a socket.
+async fn prepare_native_contract(
+    body: &str,
+    headers: http::HeaderMap,
+    credential: &Credential,
+    cfg: &Config,
+    count: bool,
+) -> Result<Prepared, ExecError> {
+    let executor = ClaudeExecutor::with_client(wreq::Client::builder().no_proxy().build().unwrap(), DEFAULT_BASE_URL);
+    let mut req = client_request(body.to_owned(), headers);
+    req.operation = if count {
+        Operation::CountTokens
     } else {
-        crate::upstream::scope_for(error.status)
+        Operation::Generate
     };
-    let (scope, retry_hint) = match SELECTIVE_ERRORS.iter().find(|(n, ..)| *n == name) {
-        Some((_, selective, hint, why)) => {
-            assert!(
-                (scope, flag("retry_after")) != (*selective, *hint),
-                "{name}: SELECTIVE_ERRORS entry matches the recording"
-            );
-            eprintln!("{name}: follows v8.0.67 ({why})");
-            (*selective, *hint)
-        }
-        None => (scope, flag("retry_after")),
-    };
-    assert_eq!(error.scope, scope, "{name}: scope");
-    assert_eq!(error.retry_after.is_some(), retry_hint, "{name}: retry hint");
-    assert_eq!(error.direct, flag("direct"), "{name}: direct response");
-    if let Some(status) = status {
-        assert_eq!(error.status, status, "{name}: status");
+    let ctx = Ctx::new(&executor, credential, &req, cfg);
+    let translated = translate::request(
+        &req,
+        ctx.codex,
+        &ctx.base_model,
+        ctx.is_compat,
+        ctx.tool_search(),
+        ctx.system_turns(&req, count),
+    )?;
+    if count {
+        let original = translate::count_original(
+            &req,
+            &translated,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, true),
+        )?;
+        ctx.prepare_count(&req, &translated, &original).await
+    } else {
+        let original = translate::original(
+            &req,
+            &translated,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )?;
+        ctx.prepare_messages(&req, &translated, &original, req.stream).await
     }
-    if error.direct {
-        assert_eq!(error.body, info["direct_body"].as_str().unwrap(), "{name}: direct body");
-        let mut ours: Vec<(String, String)> = error
+}
+
+/// Anthropic's explicit-cache mode gives the caller ownership of its breakpoints.
+/// Normal agent requests use the configured shared prefix; subagents opt in to 1h
+/// independently, avoiding an accidental TTL upgrade of short-lived helper traffic.
+#[tokio::test]
+async fn cache_ownership_and_subagent_ttl_are_explicit() {
+    let cfg = Config::parse("").unwrap();
+    let credential = harness_credential();
+    for (name, mode, subagent, requested_1h) in [
+        ("ordinary", "auto", false, false),
+        ("subagent short", "auto", true, false),
+        ("subagent requested one hour", "auto", true, true),
+        ("explicit caller cache", "explicit", false, false),
+        ("explicit subagent cache", "explicit", true, false),
+    ] {
+        let mut body = serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":128,"prompt_cache_options":{"mode":mode},"tools":[{"name":"lookup","input_schema":{"type":"object"}}],"system":[{"type":"text","text":"House rules"}],"messages":[{"role":"user","content":[{"type":"text","text":"Keep this prefix","cache_control":{"type":"ephemeral"}}]}]});
+        let mut headers = http::HeaderMap::new();
+        if subagent {
+            headers.insert("x-claude-code-agent-id", "child-1".parse().unwrap());
+        }
+        if requested_1h {
+            headers.insert("anthropic-beta", betas::EXTENDED_CACHE_TTL.parse().unwrap());
+        }
+        if mode == "explicit" {
+            let marker = serde_json::json!({"type":"ephemeral","ttl":"1h"});
+            body["tools"][0]["cache_control"] = marker.clone();
+            body["system"][0]["cache_control"] = marker.clone();
+            body["messages"][0]["content"][0]["cache_control"] = marker;
+        }
+        let prepared = prepare_native_contract(&body.to_string(), headers, &credential, &cfg, false)
+            .await
+            .unwrap();
+        let sent: Value = serde_json::from_str(&prepared.body).unwrap();
+        assert!(
+            sent.get("prompt_cache_options").is_none(),
+            "{name}: proxy option leaked"
+        );
+        let markers: Vec<_> = signals::blocks(&prepared.body)
+            .into_iter()
+            .filter_map(|(_, block)| {
+                let value: Value = serde_json::from_str(&block).unwrap();
+                value.get("cache_control").cloned()
+            })
+            .collect();
+        assert!(!markers.is_empty(), "{name}");
+        assert!(markers.len() <= 4, "{name}");
+        if mode == "explicit" {
+            assert_eq!(
+                markers,
+                vec![serde_json::json!({"type":"ephemeral","ttl":"1h"}); 3],
+                "{name}"
+            );
+        } else if !subagent || requested_1h {
+            assert!(markers.iter().all(|cc| cc["ttl"] == "1h"), "{name}: {markers:?}");
+        } else {
+            assert!(markers.iter().all(|cc| cc.get("ttl").is_none()), "{name}: {markers:?}");
+        }
+        assert!(prepared.body.contains("Keep this prefix"));
+    }
+}
+
+#[tokio::test]
+async fn explicit_cache_markers_survive_counting_and_never_create_automatic_markers() {
+    let cfg = Config::parse("").unwrap();
+    let credential = harness_credential();
+    for model in ["claude-sonnet-4-5", "claude-sonnet-4-6"] {
+        for with_markers in [false, true] {
+            let mut body = serde_json::json!({"model":model,"max_tokens":128,"prompt_cache_options":{"mode":"explicit"},"system":[{"type":"text","text":"Caller system"}],"tools":[{"name":"lookup","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":[{"type":"text","text":"Keep the caller cache"}]}]});
+            if with_markers {
+                body["system"][0]["cache_control"] = serde_json::json!({"type":"ephemeral","ttl":"1h"});
+                body["tools"][0]["cache_control"] = serde_json::json!({"type":"ephemeral","ttl":"1h"});
+                body["messages"][0]["content"][0]["cache_control"] = serde_json::json!({"type":"ephemeral"});
+            }
+            for count in [false, true] {
+                let prepared = prepare_native_contract(&body.to_string(), Default::default(), &credential, &cfg, count)
+                    .await
+                    .unwrap();
+                assert!(!rawjson::get(&prepared.body, "prompt_cache_options").exists());
+                assert_eq!(
+                    cloak::count_cache_controls(&prepared.body),
+                    if with_markers { 3 } else { 0 },
+                    "model={model} count={count}"
+                );
+                if with_markers {
+                    let markers = signals::blocks(&prepared.body)
+                        .into_iter()
+                        .filter_map(|(_, b)| serde_json::from_str::<Value>(&b).unwrap().get("cache_control").cloned())
+                        .collect::<Vec<_>>();
+                    assert_eq!(markers.iter().filter(|cc| cc["ttl"] == "1h").count(), 2);
+                }
+            }
+        }
+    }
+}
+
+/// Count-token requests are independently shaped and operator rules remain final.
+/// The upstream API excludes generated identity/diagnostics and unsupported tools.
+#[tokio::test]
+async fn count_payload_rules_keep_the_operator_system_and_filter_tools() {
+    let cfg = Config::parse(
+        r#"
+requests:
+  payload:
+    override:
+      - models: [{name: '*', protocol: claude}]
+        params: {system: "Configured count system"}
+    default-raw:
+      - models: [{name: '*', protocol: claude}]
+        params: {diagnostics: '{"operator":true}'}
+    filter:
+      - models: [{name: '*', protocol: claude}]
+        params: [tools.1]
+"#,
+    )
+    .unwrap();
+    let body = serde_json::json!({"model":"claude-opus-5-5","system":"Caller count system","metadata":{"user_id":"caller"},"tools":[{"name":"lookup","input_schema":{"type":"object"}}, {"type":"web_search_20250305","name":"web_search","allowed_domains":[]}],"messages":[{"role":"user","content":"Count these words"}]});
+    let prepared = prepare_native_contract(&body.to_string(), Default::default(), &harness_credential(), &cfg, true)
+        .await
+        .unwrap();
+    let sent: Value = serde_json::from_str(&prepared.body).unwrap();
+    assert_eq!(sent["system"], "Configured count system");
+    assert_eq!(sent["diagnostics"], serde_json::json!({"operator":true}));
+    assert_eq!(sent["tools"].as_array().unwrap().len(), 1);
+    assert!(sent.to_string().contains("Count these words"));
+    assert!(sent.get("metadata").is_none());
+    assert!(sent.get("context_management").is_none());
+}
+
+/// Cloaking policy and supported header configuration are observable operator choices.
+#[tokio::test]
+async fn configured_cloaking_and_header_defaults_control_the_prepared_request() {
+    let body = r#"{"model":"claude-sonnet-4-6","max_tokens":128,"system":"Preserve these house rules","messages":[{"role":"user","content":"Keep the question"}]}"#;
+    let credential = harness_credential();
+    for disabled in [false, true] {
+        let cfg = Config::parse(&format!("upstream:\n  claude:\n    disable-claude-cloak-mode: {disabled}\n    header-defaults:\n      os: Linux\n      arch: x64\n      timezone: UTC\n")).unwrap();
+        let prepared = prepare_native_contract(body, Default::default(), &credential, &cfg, false)
+            .await
+            .unwrap();
+        assert_eq!(prepared.body.contains(cloak::CLI_IDENTITY), !disabled);
+        assert!(prepared.body.contains("Preserve these house rules"));
+        assert!(prepared.body.contains("Keep the question"));
+        let headers: http::HeaderMap = prepared
             .headers
             .iter()
             .map(|(k, v)| {
                 (
-                    crate::proxy::canonical_header(k.as_str()),
-                    v.to_str().unwrap().to_owned(),
+                    k.parse::<http::HeaderName>().unwrap(),
+                    v.parse::<http::HeaderValue>().unwrap(),
                 )
             })
             .collect();
-        ours.sort();
-        let theirs: Vec<(String, String)> = info["direct_headers"]
+        assert_eq!(headers["authorization"], "Bearer sk-ant-oat01-FAKE-LOCAL-ONLY");
+        if !disabled {
+            assert_eq!(headers["x-stainless-os"], "Linux");
+            assert_eq!(headers["x-stainless-arch"], "x64");
+        }
+    }
+    let mut key = harness_credential();
+    key.attributes.insert("api_key".into(), "private-test-key".into());
+    for strict in [false, true] {
+        let cfg = Config::parse(&format!("api-keys:\n  claude:\n    - keys:\n        - api-key: private-test-key\n          cloak:\n            mode: always\n            strict-mode: {strict}\n")).unwrap();
+        let prepared = prepare_native_contract(body, Default::default(), &key, &cfg, false)
+            .await
+            .unwrap();
+        assert!(prepared.body.contains(cloak::CLI_IDENTITY));
+        assert_eq!(prepared.body.contains("Preserve these house rules"), !strict);
+        assert!(prepared.body.contains("Keep the question"));
+    }
+}
+
+#[tokio::test]
+async fn helper_requests_omit_interactive_continuity_and_disabled_images_leave_other_tools() {
+    let credential = harness_credential();
+    let cfg = Config::parse("").unwrap();
+    for (tokens, system, question) in [
+        (1, "House rules", "quota"),
+        (64, "Return a short title for this coding session.", "Fix the login bug"),
+    ] {
+        let body = serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":tokens,"system":system,"messages":[{"role":"user","content":question}]});
+        let prepared = prepare_native_contract(&body.to_string(), Default::default(), &credential, &cfg, false)
+            .await
+            .unwrap();
+        assert!(prepared.continuity.key.is_empty());
+        assert!(rawjson::get(&prepared.body, "diagnostics").json().is_empty());
+        assert!(!prepared.body.contains("cc_turn_origin=human"));
+        assert!(prepared.body.contains(question));
+        assert!(!signals::has_1h_ttl(&prepared.body));
+    }
+    let cfg = Config::parse("disable-image-generation: true").unwrap();
+    for only_image in [false, true] {
+        let mut body = serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":128,"messages":[{"role":"user","content":"Keep the question"}],"tools":[{"type":"image_generation"}],"tool_choice":{"type":"image_generation"}});
+        if !only_image {
+            body["tools"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name":"lookup","input_schema":{"type":"object"}}));
+        }
+        let prepared = prepare_native_contract(&body.to_string(), Default::default(), &credential, &cfg, false)
+            .await
+            .unwrap();
+        assert!(!prepared.body.contains("image_generation"));
+        assert_eq!(prepared.reverse.values().any(|name| name == "lookup"), !only_image);
+        assert!(prepared.body.contains("Keep the question"));
+    }
+}
+
+/// Caller system instructions follow the leading user run on current models.
+/// Per-turn effort directives keep their place across compaction; legacy first-party
+/// routes refuse unsupported middle-system turns unless rebuilding is configured.
+#[tokio::test]
+async fn system_placement_keeps_effort_and_validates_the_final_model() {
+    let cfg = Config::parse("").unwrap();
+    let credential = harness_credential();
+    for count in [false, true] {
+        let body = serde_json::json!({"model":"claude-opus-5-5","max_tokens":64,"system":"Caller guidance","messages":[{"role":"user","content":"<conversation-checkpoint>Earlier context</conversation-checkpoint>"},{"role":"system","content":[],"output_config":{"effort":"low"}},{"role":"user","content":"Next question"},{"role":"assistant","content":"Answer"},{"role":"user","content":"Continue"}]});
+        let prepared = prepare_native_contract(&body.to_string(), Default::default(), &credential, &cfg, count)
+            .await
+            .unwrap();
+        let sent: Value = serde_json::from_str(&prepared.body).unwrap();
+        let messages = sent["messages"].as_array().unwrap();
+        assert_eq!(messages[1]["output_config"]["effort"], "low");
+        assert_eq!(messages[1]["role"], "system");
+        let system = messages
+            .iter()
+            .position(|m| m["role"] == "system" && m.to_string().contains("Caller guidance"))
+            .unwrap();
+        let answer = messages.iter().position(|m| m["role"] == "assistant").unwrap();
+        assert!(system > 2 && system < answer, "{messages:?}");
+        assert!(prepared.body.contains("Earlier context"));
+        assert!(prepared.body.contains("Next question"));
+    }
+    let body = r#"{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"First"},{"role":"system","content":"Middle guidance"},{"role":"user","content":"Next"}]}"#;
+    for count in [false, true] {
+        let error = prepare_native_contract(body, Default::default(), &credential, &cfg, count)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!((error.status, error.scope), (400, FailureScope::Request));
+        let mut gateway = credential.clone();
+        gateway
+            .attributes
+            .insert("base_url".into(), "http://gateway.invalid".into());
+        let allowed = prepare_native_contract(body, Default::default(), &gateway, &cfg, count)
+            .await
+            .unwrap();
+        assert!(allowed.body.contains("Middle guidance"));
+    }
+    let repaired_cfg = Config::parse("api-keys:\n  claude:\n    - keys:\n        - api-key: sk-ant-oat01-FAKE-LOCAL-ONLY\n          rebuild-mid-system-message: true\n").unwrap();
+    let repaired = prepare_native_contract(body, Default::default(), &credential, &repaired_cfg, false)
+        .await
+        .unwrap();
+    let repaired: Value = serde_json::from_str(&repaired.body).unwrap();
+    assert!(repaired.to_string().contains("Middle guidance"));
+    assert!(
+        !repaired["messages"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|kv| (kv[0].as_str().unwrap().to_owned(), kv[1].as_str().unwrap().to_owned()))
-            .collect();
-        assert_eq!(ours, theirs, "{name}: direct headers");
-    } else {
-        assert_eq!(error.body, scenario["error"].as_str().unwrap(), "{name}: error message");
-    }
+            .any(|m| m["role"] == "system")
+    );
 }
 
-const GO_EXECUTOR: &str = include_str!("testdata/go_executor.json");
-
-/// sjson edits recorded from Go, through the shared `rawjson` editor the executor uses.
-#[test]
-fn sjson_cases_generated_by_go_match() {
-    use crate::rawjson::{delete, set_raw, set_str};
-    let fixture: Value = serde_json::from_str(GO_EXECUTOR).unwrap();
-    for case in fixture["sjson"].as_array().unwrap() {
-        let (json, path) = (case["json"].as_str().unwrap(), case["path"].as_str().unwrap());
-        let value = case["value"].as_str().unwrap_or_default();
-        let out = match case["op"].as_str().unwrap() {
-            "raw" => set_raw(json, path, value),
-            "delete" => delete(json, path),
-            _ => set_str(json, path, value),
-        };
-        assert_eq!(out, case["out"].as_str().unwrap(), "{case}");
+/// A decoded HTTP error keeps its status/body. Fast mode returns it directly and
+/// stays request-scoped, while decoding failures must never masquerade as success.
+#[tokio::test]
+async fn fast_errors_and_compressed_responses_preserve_status_and_failure_boundaries() {
+    use std::io::Write;
+    let gzip = |data: &[u8]| {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    };
+    for fast in [false, true] {
+        for status in [200, 429, 500] {
+            for invalid in [false, true] {
+                let original = if status == 200 {
+                    b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".as_slice()
+                } else {
+                    br#"{"error":{"type":"overloaded_error","message":"try later"}}"#.as_slice()
+                };
+                let mut headers = http::HeaderMap::new();
+                headers.insert("content-encoding", "gzip".parse().unwrap());
+                headers.insert(
+                    "content-type",
+                    if status == 200 {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    }
+                    .parse()
+                    .unwrap(),
+                );
+                headers.insert("x-request-id", "local-request".parse().unwrap());
+                let data = if invalid {
+                    b"invalid gzip".to_vec()
+                } else {
+                    gzip(original)
+                };
+                let decoded = decode_upstream(crate::proxy::Upstream {
+                    status,
+                    headers,
+                    body: futures_util::stream::iter([Ok(Bytes::from(data))]).boxed(),
+                })
+                .await;
+                let result = finish(decoded, fast, false, &Default::default()).await;
+                if status == 200 && !invalid {
+                    let response = result.unwrap();
+                    assert_eq!(response.status, 200);
+                    assert!(response.headers.get("content-encoding").is_none());
+                    let ResponseBody::Stream(raw) = response.body else {
+                        panic!("decoded response must stream")
+                    };
+                    assert_eq!(collect(raw).await.unwrap().as_ref(), original);
+                } else {
+                    let error = result.err().expect("upstream failure");
+                    if status == 200 {
+                        assert!(error.status >= 400);
+                        assert!(!error.direct);
+                    } else {
+                        assert_eq!(error.status, status);
+                        assert_eq!(error.direct, fast && !invalid);
+                    }
+                    assert_eq!(
+                        error.scope,
+                        if fast {
+                            FailureScope::Request
+                        } else if status == 200 {
+                            FailureScope::Transport
+                        } else if status == 429 {
+                            FailureScope::Model
+                        } else {
+                            FailureScope::Credential
+                        }
+                    );
+                    if status != 200 {
+                        assert_eq!(error.headers["x-request-id"], "local-request");
+                    }
+                    assert!(error.headers.get("content-encoding").is_none());
+                    if !invalid {
+                        assert_eq!(error.body.as_ref(), original);
+                    }
+                }
+            }
+        }
     }
 }
 
 #[tokio::test]
-async fn executor_scenarios_match_go() {
-    // Sequenced through execute(): compat_replay_sequence_matches_go; config keys:
-    // m1_0041_to_m1_0056_config_keys_match_go.
-    scenarios_match_go(GO_EXECUTOR, "all", |name| {
-        !name.starts_with("replay-")
-            && !is_config_scenario(name)
-            && !FOLLOWS_V8_0_27.contains(&name)
-            && !FOLLOWS_V8_0_35.contains(&name)
+async fn duplicate_identity_metadata_is_refused_before_it_can_choose_credentials() {
+    for metadata in [
+        r#""metadata":{},"metadata":{"user_id":"attacker"}"#,
+        r#""metadata":{"user_id":"first","user_id":"second"}"#,
+        r#""metadata":{"user_id":"{\"extra\":1,\"extra\":2}"}"#,
+    ] {
+        let body = format!(
+            r#"{{"model":"claude-sonnet-4-6","max_tokens":128,"messages":[{{"role":"user","content":"Question"}}],{metadata}}}"#
+        );
+        let error = prepare_native_contract(
+            &body,
+            Default::default(),
+            &harness_credential(),
+            &Config::parse("").unwrap(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!((error.status, error.scope), (400, FailureScope::Request));
+        assert!(!error.direct);
+    }
+}
+
+#[tokio::test]
+async fn native_search_aliases_definitions_history_and_references_before_final_payload_rules() {
+    for count in [false, true] {
+        for final_rule in [false, true] {
+            let rules = if final_rule {
+                "requests:\n  payload:\n    override:\n      - models: [{name: '*', protocol: claude}]\n        params: {tools.0.name: operator-final-name}\n"
+            } else {
+                ""
+            };
+            let cfg = Config::parse(&format!("upstream:\n  claude:\n    tool-search: true\n{rules}")).unwrap();
+            let credential = harness_credential();
+            let executor =
+                ClaudeExecutor::with_client(wreq::Client::builder().no_proxy().build().unwrap(), DEFAULT_BASE_URL);
+            let body = serde_json::json!({"model":"claude-sonnet-4-6","stream":false,"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},{"type":"tool_search","execution":"client","parameters":{"type":"object"}}],"input":[{"type":"message","role":"user","content":"Find the weather tool"},{"type":"tool_search_call","call_id":"previous","execution":"client","arguments":{"query":"weather"}},{"type":"tool_search_output","call_id":"previous","execution":"client","tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"},"defer_loading":true}]},{"type":"message","role":"user","content":"Paris"}]}).to_string();
+            let mut req = client_request(body, Default::default());
+            req.operation = if count {
+                Operation::CountTokens
+            } else {
+                Operation::Generate
+            };
+            req.source_format = Format::OpenAIResponse;
+            req.response_format = Format::OpenAIResponse;
+            let ctx = Ctx::new(&executor, &credential, &req, &cfg);
+            ctx.tool_search_fallback(&mut req);
+            let translated = translate::request(
+                &req,
+                ctx.codex,
+                &ctx.base_model,
+                ctx.is_compat,
+                ctx.tool_search(),
+                ctx.system_turns(&req, count),
+            )
+            .unwrap();
+            let prepared = if count {
+                let original = translate::count_original(
+                    &req,
+                    &translated,
+                    ctx.codex,
+                    &ctx.base_model,
+                    ctx.is_compat,
+                    ctx.tool_search(),
+                    ctx.system_turns(&req, true),
+                )
+                .unwrap();
+                ctx.prepare_count(&req, &translated, &original).await.unwrap()
+            } else {
+                let original = translate::original(
+                    &req,
+                    &translated,
+                    ctx.codex,
+                    &ctx.base_model,
+                    ctx.is_compat,
+                    ctx.tool_search(),
+                    ctx.system_turns(&req, false),
+                )
+                .unwrap();
+                ctx.prepare_messages(&req, &translated, &original, true).await.unwrap()
+            };
+            let sent: Value = serde_json::from_str(&prepared.body).unwrap();
+            let tools = sent["tools"].as_array().unwrap();
+            if final_rule {
+                assert_eq!(tools[0]["name"], "operator-final-name");
+            }
+            let weather = tools
+                .iter()
+                .find(|tool| {
+                    tool["defer_loading"] == true
+                        && tool["name"].as_str().is_some_and(|name| name.ends_with("get_weather"))
+                })
+                .unwrap();
+            let name = weather["name"].as_str().unwrap();
+            assert_ne!(name, "get_weather");
+            let mut refs = Vec::new();
+            fn references(value: &Value, output: &mut Vec<String>) {
+                match value {
+                    Value::Object(fields) => {
+                        if fields.get("type").is_some_and(|v| v == "tool_reference") {
+                            output.push(fields["tool_name"].as_str().unwrap().to_owned());
+                        }
+                        for value in fields.values() {
+                            references(value, output);
+                        }
+                    }
+                    Value::Array(items) => {
+                        for value in items {
+                            references(value, output);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            references(&sent["messages"], &mut refs);
+            assert_eq!(refs, [name], "count={count} final_rule={final_rule}");
+            assert!(prepared.body.contains("previous"));
+            assert!(prepared.body.contains("Paris"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn thread_continuations_reuse_completed_aliases_and_reserve_a_cache_breakpoint() {
+    let executor = ClaudeExecutor::with_client(wreq::Client::builder().no_proxy().build().unwrap(), DEFAULT_BASE_URL);
+    let mut credential = harness_credential();
+    credential.id = format!("local-thread-{}", uuid::Uuid::new_v4());
+    let cfg = Config::parse("").unwrap();
+    let create = serde_json::json!({"model":"claude-opus-5-5","max_tokens":64,"thread":{"type":"create"},"system":[{"type":"text","text":"Thread rules","cache_control":{"type":"ephemeral"}},{"type":"text","text":"Additional rules","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"Read","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"Read the changelog","cache_control":{"type":"ephemeral"}}]}]}).to_string();
+    let req = client_request(create, Default::default());
+    let ctx = Ctx::new(&executor, &credential, &req, &cfg);
+    let translated = translate::request(
+        &req,
+        ctx.codex,
+        &ctx.base_model,
+        ctx.is_compat,
+        ctx.tool_search(),
+        ctx.system_turns(&req, false),
+    )
+    .unwrap();
+    let original = translate::original(
+        &req,
+        &translated,
+        ctx.codex,
+        &ctx.base_model,
+        ctx.is_compat,
+        ctx.tool_search(),
+        ctx.system_turns(&req, false),
+    )
+    .unwrap();
+    let mut prepared = ctx.prepare_messages(&req, &translated, &original, false).await.unwrap();
+    assert!(
+        cloak::count_cache_controls(&prepared.body) <= 3,
+        "thread itself occupies the fourth breakpoint"
+    );
+    let aliases = prepared.reverse.clone();
+    let alias = aliases
+        .iter()
+        .find(|(_, name)| name.as_str() == "Read")
+        .unwrap()
+        .0
+        .clone();
+    ctx.completion(&mut prepared)
+        .complete("msg_thread_created", "req_thread_created");
+    for previous in ["msg_thread_created", "unknown-message"] {
+        let body = serde_json::json!({"model":"claude-opus-5-5","max_tokens":64,"thread":{"type":"continue","previous_message_id":previous},"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_read","content":"Version notes"}]}]}).to_string();
+        let req = client_request(body, Default::default());
+        let ctx = Ctx::new(&executor, &credential, &req, &cfg);
+        let translated = translate::request(
+            &req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )
+        .unwrap();
+        let original = translate::original(
+            &req,
+            &translated,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )
+        .unwrap();
+        let result = ctx.prepare_messages(&req, &translated, &original, false).await;
+        if previous == "unknown-message" {
+            let error = result.err().unwrap();
+            assert_eq!((error.status, error.scope), (404, FailureScope::Request));
+        } else {
+            let prepared = result.unwrap();
+            assert!(Arc::ptr_eq(&prepared.reverse, &aliases));
+            let response =
+                serde_json::json!({"content":[{"type":"tool_use","name":alias,"id":"tool_next","input":{}}]})
+                    .to_string();
+            let restored: Value =
+                serde_json::from_str(&alias::restore_response(&response, &prepared.reverse).unwrap()).unwrap();
+            assert_eq!(restored["content"][0]["name"], "Read");
+            assert!(prepared.body.contains("Version notes"));
+        }
+    }
+}
+
+/// Synthetic envelopes prove the local replay-safety policy, not cryptographic
+/// validity or provider acceptance. Foreign and malformed thinking is removed before
+/// sending, while valid structural history and ordinary tool data survive.
+#[tokio::test]
+async fn request_preparation_sanitizes_history_for_known_claude_models_only() {
+    use base64::Engine;
+    let model = b"synthetic-claude";
+    let mut inner = vec![0x08, 11, 0x32, model.len() as u8];
+    inner.extend_from_slice(model);
+    let mut envelope = vec![0x12, (inner.len() + 2) as u8, 0x0a, inner.len() as u8];
+    envelope.extend(inner);
+    let signature = base64::engine::general_purpose::STANDARD.encode(envelope);
+    let mut credential = harness_credential();
+    credential.attributes.insert("api_key".into(), "local-api-key".into());
+    let cfg = Config::parse("").unwrap();
+    for model in ["claude-sonnet-4-6", "opaque-custom-model"] {
+        let body = serde_json::json!({"model":model,"max_tokens":4096,"messages":[{"role":"user","content":"Question"},{"role":"assistant","content":[{"type":"thinking","thinking":"keep valid history","signature":signature},{"type":"thinking","thinking":"drop malformed history","signature":"not base64"},{"type":"thinking","thinking":"drop encrypted foreign history","signature":"gAAAA-not-valid"},{"type":"thinking","thinking":"","signature":""},{"type":"tool_use","id":"tool_one","name":"lookup","input":{"retain":9007199254740993u64},"signature":"foreign","thought_signature":"foreign"},{"type":"text","text":"Keep the answer"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_one","content":"Result"}]}]});
+        let prepared = prepare_native_contract(&body.to_string(), Default::default(), &credential, &cfg, false)
+            .await
+            .unwrap();
+        let sent: Value = serde_json::from_str(&prepared.body).unwrap();
+        let blocks = sent["messages"][1]["content"].as_array().unwrap();
+        assert!(prepared.body.contains("keep valid history"));
+        assert!(prepared.body.contains("Keep the answer"));
+        assert!(prepared.body.contains("Result"));
+        let tool = blocks.iter().find(|block| block["type"] == "tool_use").unwrap();
+        assert_eq!(tool["input"], serde_json::json!({"retain":9007199254740993u64}));
+        if model.starts_with("claude-") {
+            assert_eq!(blocks.len(), 3);
+            assert!(!prepared.body.contains("drop malformed history"));
+            assert!(!prepared.body.contains("drop encrypted foreign history"));
+            assert!(tool.get("signature").is_none());
+            assert!(tool.get("thought_signature").is_none());
+        } else {
+            assert_eq!(
+                sent["messages"][1], body["messages"][1],
+                "unknown providers own their signature format"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn request_thinking_suffix_uses_the_base_model_and_manual_token_budget() {
+    let mut credential = harness_credential();
+    credential.attributes.insert("api_key".into(), "local-api-key".into());
+    let cfg = Config::parse("").unwrap();
+    let body = r#"{"model":"claude-sonnet-4-5(2048)","max_tokens":4096,"messages":[{"role":"user","content":"Reason through this"}]}"#;
+    let prepared = prepare_native_contract(body, Default::default(), &credential, &cfg, false)
+        .await
+        .unwrap();
+    let sent: Value = serde_json::from_str(&prepared.body).unwrap();
+    assert_eq!(sent["model"], "claude-sonnet-4-5");
+    assert_eq!(sent["thinking"]["type"], "enabled");
+    assert_eq!(sent["thinking"]["budget_tokens"], 2048);
+    assert_eq!(sent["max_tokens"], 4096);
+}
+
+#[tokio::test]
+async fn translated_stream_failures_cannot_return_a_completed_response() {
+    for source in [Format::OpenAI, Format::OpenAIResponse] {
+        for stream in [false, true] {
+            for (name, reply) in [
+                ("empty", ""),
+                (
+                    "incomplete",
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"partial\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[]}}\n\n",
+                ),
+                (
+                    "upstream error",
+                    "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Provider refused\"}}\n\n",
+                ),
+            ] {
+                let router = axum::Router::new()
+                    .fallback(move || async move { ([(http::header::CONTENT_TYPE, "text/event-stream")], reply) });
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+                let mut credential = harness_credential();
+                credential.attributes.insert("base_url".into(), base);
+                let auth = std::env::temp_dir().join(format!("cpa-stream-failure-{}", uuid::Uuid::new_v4()));
+                let cfg = Config::parse(&format!("oauth:\n  auth-dir: {}\n", auth.display())).unwrap();
+                let body = if source == Format::OpenAI {
+                    serde_json::json!({"model":"claude-sonnet-4-6","stream":stream,"messages":[{"role":"user","content":"Question"}]})
+                } else {
+                    serde_json::json!({"model":"claude-sonnet-4-6","stream":stream,"input":"Question"})
+                };
+                let mut req = client_request(body.to_string(), Default::default());
+                req.source_format = source;
+                req.response_format = source;
+                let executor =
+                    ClaudeExecutor::with_client(wreq::Client::builder().no_proxy().build().unwrap(), DEFAULT_BASE_URL);
+                let result = executor.execute(&credential, req, &cfg).await;
+                match result {
+                    Err(error) => assert!(error.status >= 400, "{name}: {source:?} stream={stream}"),
+                    Ok(response) => {
+                        let ResponseBody::Stream(events) = response.body else {
+                            panic!("{name}: {source:?} returned buffered success")
+                        };
+                        let chunks: Vec<_> = events.collect().await;
+                        for error in chunks.iter().filter_map(|chunk| chunk.as_ref().err()) {
+                            assert!(error.status >= 400, "{name}: invalid failure status");
+                        }
+                        // An unfinished peer may close without an error event. It
+                        // cannot synthesize a normal terminal marker for either API.
+                        let bytes = chunks
+                            .iter()
+                            .filter_map(|chunk| chunk.as_ref().ok())
+                            .flat_map(|bytes| bytes.to_vec())
+                            .collect::<Vec<_>>();
+                        let text = String::from_utf8(bytes).unwrap();
+                        for data in text.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                            assert_ne!(data, "[DONE]", "{name}: {source:?} invented a success terminator");
+                            if let Ok(event) = serde_json::from_str::<Value>(data) {
+                                assert_ne!(
+                                    event["type"], "response.completed",
+                                    "{name}: incomplete Responses stream completed"
+                                );
+                                if let Some(choices) = event["choices"].as_array() {
+                                    assert!(
+                                        choices
+                                            .iter()
+                                            .all(|choice| choice.get("finish_reason").is_none_or(Value::is_null)),
+                                        "{name}: incomplete Chat stream finished: {event}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                server.abort();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn oauth_tool_calls_round_trip_across_supported_client_formats() {
+    use axum::response::IntoResponse;
+    for source in [Format::Claude, Format::OpenAI, Format::OpenAIResponse] {
+        for stream in [false, true] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let captured = seen.clone();
+            let router=axum::Router::new().fallback(move |body:Bytes| {
+                let sent:Value=serde_json::from_slice(&body).unwrap();
+                captured.lock().unwrap().push(sent.clone());
+                async move {
+                    let tool=sent["tools"][0]["name"].as_str().unwrap();
+                    let call=serde_json::json!({"type":"tool_use","id":"tool_patch","name":tool,"input":{"patch":"*** Begin Patch\n*** End Patch"}});
+                    let message=serde_json::json!({"id":"msg_patch","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[call.clone()],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4}});
+                    if sent["stream"]==true {
+                        let events=[serde_json::json!({"type":"message_start","message":{"id":"msg_patch","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":3,"output_tokens":0}}}),serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool_patch","name":tool,"input":{}}}),serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":call["input"].to_string()}}),serde_json::json!({"type":"content_block_stop","index":0}),serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}),serde_json::json!({"type":"message_stop"})];
+                        let sse=events.iter().map(|e|format!("event: {}\ndata: {e}\n\n",e["type"].as_str().unwrap())).collect::<String>();
+                        ([(http::header::CONTENT_TYPE,"text/event-stream")],sse).into_response()
+                    } else {( [(http::header::CONTENT_TYPE,"application/json")],message.to_string()).into_response()}
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let mut credential = harness_credential();
+            credential.attributes.insert("base_url".into(), base);
+            let auth = std::env::temp_dir().join(format!("cpa-tool-roundtrip-{}", uuid::Uuid::new_v4()));
+            let cfg = Config::parse(&format!("oauth:\n  auth-dir: {}\n", auth.display())).unwrap();
+            let body = match source {
+                Format::Claude => {
+                    serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"stream":stream,"messages":[{"role":"user","content":"Apply a patch"}],"tools":[{"name":"apply_patch","input_schema":{"type":"object","properties":{"patch":{"type":"string"}}}}]})
+                }
+                Format::OpenAI => {
+                    serde_json::json!({"model":"claude-sonnet-4-6","stream":stream,"messages":[{"role":"user","content":"Apply a patch"}],"tools":[{"type":"function","function":{"name":"apply_patch","parameters":{"type":"object","properties":{"patch":{"type":"string"}}}}}]})
+                }
+                _ => {
+                    serde_json::json!({"model":"claude-sonnet-4-6","stream":stream,"input":"Apply a patch","tools":[{"type":"function","name":"apply_patch","parameters":{"type":"object","properties":{"patch":{"type":"string"}}}}]})
+                }
+            };
+            let mut req = client_request(body.to_string(), Default::default());
+            req.source_format = source;
+            req.response_format = source;
+            let executor =
+                ClaudeExecutor::with_client(wreq::Client::builder().no_proxy().build().unwrap(), DEFAULT_BASE_URL);
+            let response = executor.execute(&credential, req, &cfg).await.unwrap();
+            let bytes = match response.body {
+                ResponseBody::Buffered(b) => b.to_vec(),
+                ResponseBody::Stream(events) => events.map(|chunk| chunk.unwrap()).collect::<Vec<_>>().await.concat(),
+            };
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.contains("apply_patch"), "{source:?} stream={stream}: {text}");
+            assert!(text.contains("tool_patch"));
+            assert!(text.contains("Begin Patch"), "{text}");
+            let captured = seen.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            let alias = captured[0]["tools"][0]["name"].as_str().unwrap();
+            assert_ne!(alias, "apply_patch");
+            assert!(!text.contains(alias), "wire alias leaked to client");
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_markerless_helpers_keep_their_wire_shape_and_transport_encoding_is_controlled() {
+    let session = "11111111-2222-4333-8444-555555555555";
+    let identity = format!(
+        r#"{{"device_id":"{}","account_uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","session_id":"{session}"}}"#,
+        "f".repeat(64)
+    );
+    let body = format!(
+        r#"{{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{{"role":"user","content":"helper probe"}}],"metadata":{{"user_id":{}}}}}"#,
+        serde_json::to_string(&identity).unwrap()
+    );
+    let beta = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+    let headers: http::HeaderMap = [
+        ("accept", "application/json"),
+        ("accept-encoding", "gzip, deflate, br, zstd"),
+        ("anthropic-beta", beta),
+        ("anthropic-dangerous-direct-browser-access", "true"),
+        ("anthropic-version", "2023-06-01"),
+        ("content-type", "application/json"),
+        ("user-agent", profile::BASELINE.user_agent),
+        ("x-app", "cli"),
+        ("x-claude-code-session-id", session),
+        ("x-stainless-lang", "js"),
+        ("x-stainless-runtime", "node"),
+        ("x-stainless-retry-count", "0"),
+        ("x-stainless-timeout", "600"),
+        ("x-stainless-package-version", profile::BASELINE.package_version),
+        ("x-stainless-runtime-version", profile::BASELINE.runtime_version),
+        ("x-stainless-os", "MacOS"),
+        ("x-stainless-arch", "arm64"),
+    ]
+    .into_iter()
+    .map(|(k, v)| {
+        (
+            k.parse::<http::HeaderName>().unwrap(),
+            v.parse::<http::HeaderValue>().unwrap(),
+        )
     })
-    .await;
-}
-
-/// 6fecc6e scenarios with payload rules: the rules now run once, last (868e137), and
-/// the v8.0.35 fixture holds Go's answer.
-const FOLLOWS_V8_0_35: &[&str] = &[
-    "payload-model-to-fable",
-    "payload-model-to-legacy",
-    "payload-declassify-probe",
-    "payload-make-probe-fable",
-    "payload-default-reads-original",
-    "payload-filter-fable",
-];
-
-/// Requests without payload rules that cloaking turns into a probe or a helper, or out
-/// of one, and image-tool stripping and `prompt_cache_options` handling, which now run
-/// after cloaking. cliproxy-rs before 868e137 sent each of these differently.
-const NO_RULES_V8_0_35: &[&str] = &[
-    "noroles-quota-probe-with-system",
-    "noroles-legacy-title-helper",
-    "noroles-hi-becomes-probe",
-    "noroles-image-tool-last",
-    "noroles-image-tool-only-probe",
-    "noroles-duplicate-prompt-cache-options",
-    "noroles-duplicate-prompt-cache-options-explicit",
-    "noroles-duplicate-thinking",
-    "noroles-duplicate-tool-choice",
-    "noroles-duplicate-cache-control",
-    "noroles-duplicate-metadata",
-    // Go's IsArray guards and ForEach walks on non-array messages, content and tools.
-    "noroles-object-messages-system",
-    "noroles-object-messages-user",
-    "noroles-object-messages-foreach",
-    "noroles-object-messages-timing",
-    "noroles-object-messages-title-schema",
-    "noroles-object-messages-advisor",
-    "noroles-object-content-inline-tools",
-    "noroles-object-tools-advisor",
-    // strings.EqualFold(strings.TrimSpace(role), "system"), len(props.Map()), EqualFold.
-    "noroles-mid-system-spaced-role",
-    "noroles-title-duplicate-props",
-    "noroles-fold-speed-display",
-];
-
-/// 868e137 through Go v8.0.35's executor (scenarios-v8.0.35.json): payload rules see
-/// the fully prepared body and nothing repairs their result.
-#[tokio::test]
-async fn v8_0_35_payload_barrier_scenarios_match_go() {
-    let fixture = include_str!("testdata/go_executor_v8.0.35.json");
-    assert!(fixture.contains(r#""source": "CLIProxyAPI v8.0.35 "#));
-    for name in FOLLOWS_V8_0_35.iter().chain(NO_RULES_V8_0_35) {
-        assert!(fixture.contains(&format!(r#""name": "{name}""#)), "{name}");
+    .collect();
+    let cfg = Config::parse("").unwrap();
+    let credential = harness_credential();
+    assert!(detect::detect(&headers, &body, false, &Settings::from_config(&cfg)).helper_profile);
+    let prepared = prepare_native_contract(&body, headers, &credential, &cfg, false)
+        .await
+        .unwrap();
+    for absent in ["system", "stream", "tools", "diagnostics", "context_management"] {
+        assert!(
+            !rawjson::get(&prepared.body, absent).exists(),
+            "{absent} added to markerless helper"
+        );
     }
-    scenarios_match_go(fixture, "v8.0.35", |_| true).await;
+    assert_eq!(cloak::count_cache_controls(&prepared.body), 0);
+    assert_eq!(
+        rawjson::get(&prepared.body, "messages").json(),
+        rawjson::get(&body, "messages").json()
+    );
+    for stream in [false, true] {
+        let body=serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":128,"stream":stream,"messages":[{"role":"user","content":"Question"}]}).to_string();
+        let mut headers = http::HeaderMap::new();
+        headers.insert("accept-encoding", "custom-unsupported".parse().unwrap());
+        let prepared = prepare_native_contract(&body, headers, &credential, &cfg, false)
+            .await
+            .unwrap();
+        let encoding = prepared
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+            .unwrap()
+            .1
+            .as_str();
+        // The first-party native transport negotiates compressed responses for
+        // both buffered and streaming calls and decodes before relaying.
+        assert!(encoding.split(',').map(str::trim).any(|token| token == "gzip"));
+        assert_ne!(encoding, "custom-unsupported");
+    }
 }
 
-/// `upstream.claude.tool-search` on Responses requests (Go v8.0.35): native tool search
-/// on Anthropic's origin and on keys with `native-tool-search`, the pre-tool_search
-/// translation elsewhere, for legacy models and with the switch off.
+/// Exercise the public payload configuration as the final operator-controlled
+/// transformation. A model/probe change or removal must not trigger a second shaping
+/// pass that silently overwrites the configured result.
 #[tokio::test]
-async fn tool_search_scenarios_match_go() {
-    let fixture = include_str!("testdata/go_executor_tool_search.json");
-    assert!(fixture.contains(r#""source": "CLIProxyAPI v8.0.35 "#));
-    scenarios_match_go(fixture, "tool-search", |_| true).await;
+async fn payload_rules_are_final_and_defaults_respect_caller_presence() {
+    async fn prepare(body: Value, rules: &str) -> Value {
+        let dir = std::env::temp_dir().join(format!("cpa-payload-policy-{}", uuid::Uuid::new_v4()));
+        let cfg = Config::parse(&format!(
+            "config-version: 8\noauth:\n  auth-dir: {}\n{rules}",
+            dir.display()
+        ))
+        .unwrap();
+        let executor =
+            ClaudeExecutor::with_client(wreq::Client::builder().no_proxy().build().unwrap(), DEFAULT_BASE_URL);
+        let credential = harness_credential();
+        let req = enrich(client_request(body.to_string(), Default::default()));
+        let ctx = Ctx::new(&executor, &credential, &req, &cfg);
+        let translated = translate::request(
+            &req,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )
+        .unwrap();
+        let original = translate::original(
+            &req,
+            &translated,
+            ctx.codex,
+            &ctx.base_model,
+            ctx.is_compat,
+            ctx.tool_search(),
+            ctx.system_turns(&req, false),
+        )
+        .unwrap();
+        let result = ctx.prepare_messages(&req, &translated, &original, false).await.unwrap();
+        assert_eq!(signing::sign(result.body.clone()).unwrap(), result.body);
+        serde_json::from_str(&result.body).unwrap()
+    }
+    let initial = serde_json::json!({"model":"claude-sonnet-4-6", "max_tokens":256,"messages":[{"role":"user","content":"Preserve my prompt"}],"system":"Original instructions","thinking":{"type":"adaptive"},"extension":{"large":9007199254740993u64}});
+    let changed = prepare(
+        initial.clone(),
+        r#"
+requests:
+  payload:
+    override:
+      - models: [{name: '*', protocol: claude}]
+        params:
+          model: claude-fable-5-1
+          max_tokens: 1
+          system: Final operator instructions
+    override-raw:
+      - models: [{name: '*', protocol: claude}]
+        params:
+          thinking: '{"type":"disabled"}'
+          fallbacks: '[{"model":"operator-fallback"}]'
+          diagnostics: '{"operator":true}'
+"#,
+    )
+    .await;
+    assert_eq!(changed["model"], "claude-fable-5-1");
+    assert_eq!(changed["max_tokens"], 1);
+    assert_eq!(changed["system"], "Final operator instructions");
+    assert_eq!(changed["thinking"], serde_json::json!({"type":"disabled"}));
+    assert_eq!(changed["fallbacks"], serde_json::json!([{"model":"operator-fallback"}]));
+    assert_eq!(changed["diagnostics"], serde_json::json!({"operator":true}));
+    assert_eq!(changed["extension"], initial["extension"]);
+    assert!(changed.to_string().contains("Preserve my prompt"));
+    let filtered = prepare(
+        initial.clone(),
+        r#"
+requests:
+  payload:
+    filter:
+      - models: [{name: '*', protocol: claude}]
+        params: [system, metadata, diagnostics, thinking.display, context_management]
+"#,
+    )
+    .await;
+    for removed in ["system", "metadata", "diagnostics", "context_management"] {
+        assert!(filtered.get(removed).is_none(), "{removed} was reinjected");
+    }
+    assert!(filtered["thinking"].get("display").is_none());
+    let defaults = r#"
+requests:
+  payload:
+    default-raw:
+      - models: [{name: '*', protocol: claude}]
+        params:
+          diagnostics: '{"operator":true}'
+          context_management: '{"edits":[]}'
+"#;
+    let absent = prepare(initial.clone(), defaults).await;
+    assert_eq!(absent["diagnostics"], serde_json::json!({"operator":true}));
+    assert_eq!(absent["context_management"], serde_json::json!({"edits":[]}));
+    let mut explicit = initial;
+    // Probes keep caller diagnostics; ordinary cloaked turns own continuity.
+    explicit["max_tokens"] = 1.into();
+    explicit["messages"] = serde_json::json!([{"role":"user","content":"quota"}]);
+    explicit.as_object_mut().unwrap().remove("thinking");
+    explicit["diagnostics"] = serde_json::json!({"caller":"preserved"});
+    explicit["context_management"] = serde_json::json!({"edits":[{"type":"caller-extension"}]});
+    let preserved = prepare(explicit.clone(), defaults).await;
+    assert_eq!(preserved["diagnostics"], explicit["diagnostics"]);
+    assert_eq!(preserved["context_management"], explicit["context_management"]);
+    let conditions = prepare(serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":128,"messages":[{"role":"user","content":"Do not replay rules"}]}), r#"
+requests:
+  payload:
+    override:
+      - models: [{name: '*', protocol: claude, exist: [metadata.user_id]}]
+        params: {observed_generated_identity: true}
+    filter:
+      - models: [{name: '*', protocol: claude, exist: [metadata.user_id]}]
+        params: [metadata]
+"#).await;
+    assert_eq!(
+        conditions["observed_generated_identity"], true,
+        "conditions inspect the prepared identity"
+    );
+    assert!(
+        conditions.get("metadata").is_none(),
+        "a later shaping pass must not reinject removed identity"
+    );
 }
 
-/// Go `TestClaudeExecutor_SupportsNativeToolSearch`: which credentials take Codex
-/// tool_search natively, while the switch is on (and none while it is off).
+/// Native search requires an enabled switch, capable model and trusted origin
+/// or explicit credential capability.
 #[test]
-fn native_tool_search_support_matches_go() {
+fn native_tool_search_requires_a_capable_origin_model_and_opt_in() {
     const GATEWAY: &str = "https://gateway.example.test";
     let on = "upstream:\n  claude:\n    tool-search: true\n";
     let forced =
@@ -759,514 +1545,98 @@ fn native_tool_search_support_matches_go() {
     }
 }
 
-/// The same Go recordings through `execute` against a loopback upstream: the response
-/// translation reads the request's tool-search switch, so a native tool_search tool_use
-/// answers as a tool_search_call and a fallback one as a plain function call.
+/// Responses clients receive native search calls only when the upstream credential
+/// supports them; fallback tools remain ordinary function calls. The peer speaks the
+/// Anthropic Messages SSE event schema, independently of any recorder output.
 #[tokio::test]
-async fn tool_search_responses_match_go() {
-    let fixture: Value = serde_json::from_str(include_str!("testdata/go_executor_tool_search.json")).unwrap();
-    let created = regex::Regex::new(r#""created_at":\d+"#).unwrap();
-    for name in ["tool-search-native-key-non-stream", "tool-search-fallback-key"] {
-        let scenario = fixture["scenarios"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|s| s["name"] == name)
-            .unwrap();
-        let reply = scenario["reply"]["body"].as_str().unwrap().to_owned();
-        let router = axum::Router::new().fallback(move || {
-            let reply = reply.clone();
-            async move { ([(http::header::CONTENT_TYPE, "text/event-stream")], reply) }
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let dir = std::env::temp_dir().join(format!("cpa-claude-tool-search-{name}-{}", std::process::id()));
-        let text = scenario["config"]
-            .as_str()
-            .unwrap()
-            .replace("AUTH_DIR", dir.join("auth").to_str().unwrap())
-            .replace("http://gateway.invalid", &base);
-        let cfg = Config::parse(&text).unwrap();
-        let credential = cpa_core::config::credentials::load(&cfg)
-            .into_iter()
-            .find(|c| c.provider == "claude")
-            .unwrap();
-        let body = Bytes::from(scenario["body"].as_str().unwrap().to_owned());
-        let req = ExecRequest {
-            operation: Operation::Generate,
-            source_format: Format::OpenAIResponse,
-            response_format: Format::OpenAIResponse,
-            requested_model: "claude-sonnet-4-6".into(),
-            model: "claude-sonnet-4-6".into(),
-            original_body: body.clone(),
-            body,
-            stream: scenario["stream"].as_bool().unwrap(),
-            alt: None,
-            session: None,
-            execution_session: None,
-            derived_session: None,
-            resolved_model: None,
-            usage: Default::default(),
-            request_path: String::new(),
-            headers: Default::default(),
-            caller: Caller {
-                principal: "client-key-1".into(),
-                source: "authorization",
-                provider: String::new(),
-            },
-        };
-        let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
-        let output: Vec<String> = match executor.execute(&credential, req, &cfg).await.unwrap().body {
-            ResponseBody::Buffered(b) => vec![String::from_utf8(b.to_vec()).unwrap()],
-            ResponseBody::Stream(events) => {
-                events
-                    .map(|c| String::from_utf8(c.unwrap().to_vec()).unwrap())
-                    .collect()
-                    .await
-            }
-        };
-        let go: Vec<String> = scenario["output"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|o| o.as_str().unwrap().to_owned())
-            .collect();
-        let mask = |v: &[String]| -> Vec<String> {
-            v.iter()
-                .map(|o| created.replace_all(o, r#""created_at":0"#).into_owned())
-                .collect()
-        };
-        assert_eq!(mask(&output), mask(&go), "{name}");
-    }
-}
-
-/// 6fecc6e scenarios whose outcome now follows Go v8.0.27: the v8.0.27 fixture runs
-/// each of them again and holds the answer the executor gives now.
-const FOLLOWS_V8_0_27: &[&str] = &[
-    // 8080967: a reset past the seven-day window is a billing boundary, not a retry hint.
-    "oauth-unified-429",
-    "oauth-fast-unified-429",
-];
-
-/// v8.0.27 scenarios where Go keeps an API key's caller system text top-level and
-/// cliproxy-rs moves it after the leading user run, as it does for every request
-/// (docs/DIFFERENCES-FROM-GO.md). Rust's body is compared with Go's after
-/// [`with_relocated_system`].
-const RELOCATES_API_KEY_SYSTEM: &[&str] = &[
-    "apikey-cloak-system-single-user",
-    "apikey-cloak-system-leading-run",
-    "apikey-cloak-count-system-single-user",
-    "apikey-cloak-effort-directive",
-];
-
-/// Go v8.0.27's upstream body with the caller system blocks it left top-level (those
-/// Go deletes a Claude client's own `thinking` when it forces tool use; cliproxy-rs
-/// forwards it (docs/DIFFERENCES-FROM-GO.md), and a cloaked request then keeps the
-/// context management the cloak adds for thinking. Rust's body without both, after
-/// checking that the thinking is the caller's, so the rest compares with Go's recording
-/// byte for byte.
-pub(super) fn without_kept_thinking(rust_body: &str, caller_body: &str) -> String {
-    assert!(
-        matches!(
-            rawjson::string(caller_body, "tool_choice.type").as_str(),
-            "any" | "tool"
-        ),
-        "the caller forced no tool: {caller_body}"
-    );
-    let kept = rawjson::get(rust_body, "thinking");
-    assert_eq!(
-        kept.json(),
-        rawjson::get(caller_body, "thinking").json(),
-        "caller thinking"
-    );
-    let mut body = rawjson::delete(rust_body, "thinking");
-    if !rawjson::get(caller_body, "context_management").exists()
-        && rawjson::get(&body, "context_management").json()
-            == r#"{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]}"#
-    {
-        body = rawjson::delete(&body, "context_management");
-    }
-    body
-}
-
-/// Scenarios whose Claude client forces tool use with its own thinking, which Go
-/// deletes ([`without_kept_thinking`]).
-const KEEPS_CALLER_THINKING: &[&str] = &["noroles-duplicate-tool-choice"];
-
-/// after the billing, Claude Code identity and Fable blocks) moved into one system
-/// turn each after the leading user run (the first user turn and the user turns and
-/// effort directives that follow it), where cliproxy-rs puts them for API keys too.
-/// Every other byte is Go's; a body without such blocks comes back unchanged.
-pub(super) fn with_relocated_system(go_body: &str) -> String {
-    let system = rawjson::get(go_body, "system");
-    let blocks = system.array();
-    let ours = |block: &rawjson::Value| {
-        let text = block.get("text");
-        let text = text.str();
-        text.starts_with(cloak::BILLING_PREFIX) || text == cloak::CLI_IDENTITY || text == cloak::FABLE_REPORTING
-    };
-    let kept = blocks.iter().take_while(|b| ours(b)).count();
-    if kept == blocks.len() {
-        return go_body.to_owned();
-    }
-    let messages = rawjson::get(go_body, "messages");
-    let messages = messages.array();
-    let role = |i: usize| messages[i].get("role").str().to_owned();
-    let first = (0..messages.len()).find(|&i| role(i) == "user").expect("a user turn");
-    let mut at = first + 1;
-    while at < messages.len()
-        && (role(at) == "user" || (role(at) == "system" && messages[at].get("output_config").exists()))
-    {
-        at += 1;
-    }
-    let turns: Vec<String> = blocks[kept..]
-        .iter()
-        .map(|b| format!(r#"{{"role":"system","content":[{}]}}"#, b.json()))
-        .collect();
-    let list: Vec<&str> = messages[..at]
-        .iter()
-        .map(|m| m.json())
-        .chain(turns.iter().map(String::as_str))
-        .chain(messages[at..].iter().map(|m| m.json()))
-        .collect();
-    let body = rawjson::set_raw(go_body, "messages", &format!("[{}]", list.join(",")));
-    if kept == 0 {
-        return rawjson::delete(&body, "system");
-    }
-    let cpa: Vec<&str> = blocks[..kept].iter().map(|b| b.json()).collect();
-    rawjson::set_raw(&body, "system", &format!("[{}]", cpa.join(",")))
-}
-
-/// The prompt-cache and prompt-shaping fixes this executor follows from v8.0.27, run
-/// through Go v8.0.27's executor by the same generator (scenarios-v8.0.27.json): the
-/// session-pinned currentDate reminder (6d57ac9), thread breakpoint reservation and
-/// continuation aliases (26e5efb, 678a925, e7b2226), explicit prompt cache options
-/// (eb6a768), OAuth system placement and effort directives (14dc4e0, 2d8ec73),
-/// invalid markers (be8c35f) and overage billing resets (8080967). API-key system
-/// placement keeps 6fecc6e's ([`RELOCATES_API_KEY_SYSTEM`]). The scenarios run in
-/// order on one executor: a date pin and a thread's aliases carry from one scenario to
-/// the next, as in Go's run.
-#[tokio::test]
-async fn v8_0_27_cache_and_prompt_shaping_scenarios_match_go() {
-    let fixture = include_str!("testdata/go_executor_v8.0.27.json");
-    assert!(fixture.contains(r#""source": "CLIProxyAPI v8.0.27 "#));
-    for name in FOLLOWS_V8_0_27 {
-        assert!(fixture.contains(&format!(r#""name": "{name}""#)), "{name}");
-    }
-    scenarios_match_go(fixture, "v8.0.27", |_| true).await;
-}
-
-/// Scenarios whose only purpose is a `config.yaml` key (Go generator, same pipeline).
-fn is_config_scenario(name: &str) -> bool {
-    name.starts_with("config-") || name == "apikey-cloak-config-strict-sensitive"
-}
-
-/// M1-0041 rebuild-mid-system-message, M1-0043 cloak.strict-mode, M1-0044
-/// cloak.sensitive-words, M1-0048..M1-0055 every header-defaults key (stabilized and
-/// not) and M1-0056 disable-claude-cloak-mode, each set in config.yaml and run through
-/// Go's executor by the scenario generator.
-#[tokio::test]
-async fn m1_0041_to_m1_0056_config_keys_match_go() {
-    let fixture: Value = serde_json::from_str(include_str!("testdata/go_executor.json")).unwrap();
-    let count = fixture["scenarios"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|s| is_config_scenario(s["name"].as_str().unwrap()))
-        .count();
-    assert_eq!(count, 5);
-    scenarios_match_go(GO_EXECUTOR, "config", is_config_scenario).await;
-}
-
-async fn scenarios_match_go(fixture: &str, run: &str, selected: fn(&str) -> bool) {
-    let fixture: Value = serde_json::from_str(fixture).unwrap();
-    let root = std::env::temp_dir().join(format!("cpa-claude-go-{run}-{}", std::process::id()));
-    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
-    let prompt_id = regex::Regex::new(r"cc_prompt_id=[0-9a-f-]{36};").unwrap();
-    for scenario in fixture["scenarios"].as_array().unwrap() {
-        let name = scenario["name"].as_str().unwrap();
-        if !selected(name) {
-            continue;
-        }
-        let dir = root.join(name);
-        std::fs::create_dir_all(dir.join("auth")).unwrap();
-        let text = scenario["config"]
-            .as_str()
-            .unwrap()
-            .replace("AUTH_DIR", dir.join("auth").to_str().unwrap());
-        if let Some(auth) = scenario["auth_file"].as_str().filter(|s| !s.is_empty()) {
-            // The file name is the credential ID that keys the process-wide continuity
-            // store. One name per run keeps a run's date pins and prompt IDs to itself:
-            // the 6fecc6e and v8.0.27 fixtures send the same requests on different
-            // dates, and whichever ran first used to pin its date for the other.
-            std::fs::write(dir.join("auth").join(format!("fixture-{run}.json")), auth).unwrap();
-        }
-        let cfg = super::settings::as_recorded_with_2_1_280_profile(
-            super::settings::as_recorded_before_fallback_switch(Config::parse(&text).unwrap()),
-        );
-        let credential = cpa_core::config::credentials::load(&cfg)
-            .into_iter()
-            .find(|c| c.provider == "claude")
-            .unwrap_or_else(|| panic!("{name}: no claude credential"));
-        let body = Bytes::from(scenario["body"].as_str().unwrap().to_owned());
-        let source = match scenario["source"].as_str() {
-            Some("openai") => Format::OpenAI,
-            Some("openai-response") => Format::OpenAIResponse,
-            _ => Format::Claude,
-        };
-        let headers: http::HeaderMap = scenario["headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|h| {
-                (
-                    h[0].as_str().unwrap().parse().unwrap(),
-                    h[1].as_str().unwrap().parse().unwrap(),
-                )
-            })
-            .collect();
-        let count = scenario["count"].as_bool().unwrap();
-        let stream = scenario["stream"].as_bool().unwrap();
-        let req = ExecRequest {
-            operation: if count {
-                Operation::CountTokens
-            } else {
-                Operation::Generate
-            },
-            source_format: source,
-            response_format: source,
-            requested_model: scenario["requested_model"]
-                .as_str()
-                .or(scenario["model"].as_str())
-                .unwrap()
-                .into(),
-            model: scenario["model"].as_str().unwrap().into(),
-            original_body: body.clone(),
-            body,
-            stream,
-            alt: None,
-            session: None,
-            execution_session: scenario["execution_session"].as_str().map(str::to_owned),
-            derived_session: None,
-            resolved_model: resolved(scenario),
-            usage: Default::default(),
-            request_path: String::new(),
-            headers,
-            caller: Caller {
-                principal: scenario["client_key"].as_str().unwrap().into(),
-                source: "authorization",
-                provider: String::new(),
-            },
-        };
-        let mut req = enrich(req);
-        let mut ctx = Ctx::new(&executor, &credential, &req, &cfg);
-        ctx.today = scenario["date"].as_str().unwrap().into();
-        if let (true, true, Some(output)) = (count, scenario["upstream"].is_null(), scenario["output"].as_array()) {
-            // Counted locally: Go answered without an upstream request.
-            let response = executor.count_tokens(ctx, req).await.unwrap();
-            let ResponseBody::Buffered(body) = response.body else {
-                panic!("{name}: streamed count")
-            };
-            assert_eq!(
-                String::from_utf8_lossy(&body),
-                output[0].as_str().unwrap(),
-                "{name}: count"
-            );
-            continue;
-        }
-        // The stages below run inside generate() and count_tokens(), which drop
-        // tool_search first; count_tokens() itself is driven above and in go_unit.
-        ctx.tool_search_fallback(&mut req);
-        let translated = translate::request(
-            &req,
-            ctx.codex,
-            &ctx.base_model,
-            ctx.is_compat,
-            ctx.tool_search(),
-            ctx.system_turns(&req, false),
-        )
-        .unwrap();
-        let prepared = if count {
-            let baseline = translate::count_original(
-                &req,
-                &translated,
-                ctx.codex,
-                &ctx.base_model,
-                ctx.is_compat,
-                ctx.tool_search(),
-                ctx.system_turns(&req, true),
-            )
-            .unwrap();
-            ctx.prepare_count(&req, &translated, &baseline).await
-        } else {
-            // generate(): translated clients always stream upstream.
-            let original = translate::original(
-                &req,
-                &translated,
-                ctx.codex,
-                &ctx.base_model,
-                ctx.is_compat,
-                ctx.tool_search(),
-                ctx.system_turns(&req, false),
-            )
-            .unwrap();
-            ctx.prepare_messages(&req, &translated, &original, stream || source != Format::Claude)
-                .await
-        };
-        if scenario["upstream"].as_array().is_none_or(Vec::is_empty) {
-            // Go failed before sending (thinking validation and the like).
-            let error = prepared
-                .err()
-                .unwrap_or_else(|| panic!("{name}: Go sent nothing, Rust prepared a request"));
-            assert_eq!(error.body, scenario["error"].as_str().unwrap(), "{name}: error");
-            assert_eq!(
-                Some(u64::from(error.status)),
-                scenario["error_status"].as_u64(),
-                "{name}: status"
-            );
-            continue;
-        }
-        let prepared = prepared.unwrap_or_else(|e| panic!("{name}: {e}"));
-        let upstream = &scenario["upstream"][0];
-        // With execution metadata a new turn takes the continuity store's fresh random
-        // prompt ID (uuid.NewString in Go) instead of the deterministic fingerprint one.
-        let random_prompt = |text: &str| {
-            if scenario["execution_session"].is_string() {
-                prompt_id.replace_all(text, "cc_prompt_id=<random>;").into_owned()
-            } else {
-                text.to_owned()
-            }
-        };
-        let mut go_body = upstream["body"].as_str().unwrap().to_owned();
-        if RELOCATES_API_KEY_SYSTEM.contains(&name) {
-            let relocated = with_relocated_system(&go_body);
-            assert_ne!(relocated, go_body, "{name}: Go kept no caller system text top-level");
-            go_body = relocated;
-        }
-        let mut rust_body = prepared.body.clone();
-        if KEEPS_CALLER_THINKING.contains(&name) {
-            rust_body = without_kept_thinking(&rust_body, scenario["body"].as_str().unwrap());
-        }
-        assert_eq!(
-            random_prompt(&normalize_random(&rust_body)),
-            random_prompt(&normalize_random(&go_body)),
-            "{name}: upstream body"
-        );
-        // The masked CCH must still sign the body as sent (signing runs last).
-        assert_eq!(
-            super::signing::sign(prepared.body.clone()).unwrap(),
-            prepared.body,
-            "{name}: CCH"
-        );
-        let mut ours: Vec<(String, String)> = prepared.headers.clone();
-        ours.sort_by(|a, b| a.0.cmp(&b.0));
-        let theirs: Vec<(String, String)> = upstream["headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|h| (h[0].as_str().unwrap().to_owned(), h[1].as_str().unwrap().to_owned()))
-            .collect();
-        let names = |h: &[(String, String)]| h.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
-        // First-party API-key requests spell the header as Claude Code 2.1.325 does
-        // (headers::WIRE_CASING); Go records its canonical X-Api-Key.
-        let mut theirs = theirs;
-        if ours.iter().any(|(k, _)| k == "x-api-key") {
-            for (k, _) in &mut theirs {
-                if k == "X-Api-Key" {
-                    *k = "x-api-key".into();
+async fn responses_tool_search_preserves_call_arguments_and_respects_upstream_capability() {
+    for native in [false, true] {
+        for stream in [false, true] {
+            let reply = [
+                serde_json::json!({"type":"message_start","message":{"id":"msg_search","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[],"usage":{"input_tokens":3,"output_tokens":0}}}),
+                serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_search","name":"tool_search","input":{}}}),
+                serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":r#"{"query":"weather","limit":2}"#}}),
+                serde_json::json!({"type":"content_block_stop","index":0}),
+                serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":4}}),
+                serde_json::json!({"type":"message_stop"}),
+            ].into_iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect::<String>();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let captured = seen.clone();
+            let router = axum::Router::new().fallback(move |body: Bytes| {
+                captured.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+                let reply = reply.clone();
+                async move { ([(http::header::CONTENT_TYPE, "text/event-stream")], reply) }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let dir = std::env::temp_dir().join(format!("cpa-tool-search-{}", uuid::Uuid::new_v4()));
+            let cfg = Config::parse(&format!("config-version: 8\noauth:\n  auth-dir: {}\nupstream:\n  claude:\n    tool-search: true\napi-keys:\n  claude:\n    - base-url: {base}\n      keys:\n        - api-key: test-upstream-key\n          native-tool-search: {native}\n", dir.display())).unwrap();
+            let credential = cpa_core::config::credentials::load(&cfg)
+                .into_iter()
+                .find(|c| c.provider == "claude")
+                .unwrap();
+            let body = Bytes::from(serde_json::json!({
+                "model":"claude-sonnet-4-6", "stream":stream,
+                "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}, {"type":"tool_search","execution":"client","parameters":{"type":"object"}}],
+                "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"Weather?"}]}, {"type":"tool_search_call","call_id":"previous_search","execution":"client","arguments":{"query":"weather"}}, {"type":"tool_search_output","call_id":"previous_search","execution":"client","tools":[{"type":"function","name":"get_weather","parameters":{"type":"object"},"defer_loading":true}]}, {"type":"message","role":"user","content":[{"type":"input_text","text":"Paris"}]}]
+            }).to_string());
+            let mut req = client_request(String::from_utf8(body.to_vec()).unwrap(), Default::default());
+            req.source_format = Format::OpenAIResponse;
+            req.response_format = Format::OpenAIResponse;
+            req.model = "claude-sonnet-4-6".into();
+            req.requested_model = req.model.clone();
+            req.stream = stream;
+            let client = wreq::Client::builder().no_proxy().build().unwrap();
+            let executor = ClaudeExecutor::with_client(client, DEFAULT_BASE_URL);
+            let output = executor.execute(&credential, req, &cfg).await.unwrap();
+            let result: Value = match output.body {
+                ResponseBody::Buffered(b) => serde_json::from_slice(&b).unwrap(),
+                ResponseBody::Stream(events) => {
+                    let chunks: Vec<_> = events.map(|c| c.unwrap()).collect().await;
+                    let text = String::from_utf8(chunks.concat()).unwrap();
+                    let events: Vec<Value> = text
+                        .lines()
+                        .filter_map(|l| l.strip_prefix("data: "))
+                        .filter_map(|l| serde_json::from_str(l).ok())
+                        .collect();
+                    let done = events
+                        .iter()
+                        .find(|e| e["type"] == "response.completed")
+                        .expect("completed event");
+                    assert!(events.iter().any(|e| e["type"] == "response.output_item.done"));
+                    done["response"].clone()
                 }
-            }
-            theirs.sort_by(|a, b| a.0.cmp(&b.0));
-        }
-        assert_eq!(names(&ours), names(&theirs), "{name}: header names and casing");
-        for ((k, a), (_, b)) in ours.iter().zip(&theirs) {
-            if k.eq_ignore_ascii_case("x-client-request-id") && b != "9b6a3f8e-1c2d-4e5f-8a9b-0c1d2e3f4a5b" {
-                continue;
-            }
-            if k == "X-Claude-Code-Session-Id" && name.starts_with("apikey-cloak") {
-                continue;
-            }
-            // The default User-Agent names the build: CLIProxyAPI/dev in Go's generator.
-            if let Some(go_version) = b.strip_prefix("CLIProxyAPI/") {
-                assert_eq!(go_version, "dev", "{name}: header {k}");
-                assert_eq!(
-                    a,
-                    &format!("CLIProxyAPI/{}", env!("CARGO_PKG_VERSION")),
-                    "{name}: header {k}"
-                );
-                continue;
-            }
-            if k.eq_ignore_ascii_case("anthropic-beta") && super::betas::matches_go(a, b, &go_body) {
-                continue;
-            }
-            assert_eq!(a, b, "{name}: header {k}");
-        }
-        let reply = upstream["reply"].as_str().unwrap();
-        let output: Vec<String> = scenario["output"]
-            .as_array()
-            .map(|o| o.iter().map(|v| v.as_str().unwrap().to_owned()).collect())
-            .unwrap_or_default();
-        if source != Format::Claude {
-            // Translated clients: only the upstream request is compared here.
-            continue;
-        }
-        let finished = finish_reply(scenario, &ctx, &prepared).await;
-        if let Some(info) = scenario["error_info"].as_object() {
-            let error = finished
-                .err()
-                .unwrap_or_else(|| panic!("{name}: Go failed, Rust succeeded"));
-            assert_go_error(name, scenario, info, error);
-            continue;
-        }
-        if scenario["reply"]["body_b64"].is_string() {
-            let Ok(RawResponse {
-                body: ResponseBody::Stream(raw),
-                ..
-            }) = finished
-            else {
-                panic!("{name}: Rust failed where Go succeeded");
             };
-            let decoded = collect(raw).await.unwrap();
-            assert_eq!(decoded, output[0].as_bytes(), "{name}: decoded body");
-            continue;
-        }
-        let request_id = scenario["reply"]["headers"]
-            .as_array()
-            .and_then(|h| h.iter().find(|kv| kv[0] == "Request-Id"))
-            .map(|kv| kv[1].as_str().unwrap().to_owned())
-            .unwrap_or_default();
-        if count {
-            assert_eq!(output, [reply], "{name}: count passthrough");
-        } else if stream {
-            let raw = futures_util::stream::iter([Ok(Bytes::from(reply.to_owned()))]).boxed();
-            let mut prepared = prepared;
-            let completion = ctx.completion(&mut prepared);
-            let events: Vec<String> = stream::relay(
-                raw,
-                prepared.reverse.clone(),
-                Box::new(move |id| completion.complete(&id, &request_id)),
-                Default::default(),
-                Default::default(),
-            )
-            .map(|e| String::from_utf8(e.unwrap().to_vec()).unwrap())
-            .collect()
-            .await;
-            assert_eq!(events, output, "{name}: SSE events");
-        } else {
-            let restored = alias::restore_response(reply, &prepared.reverse).unwrap();
-            assert_eq!([restored], output.as_slice(), "{name}: restored response");
-            let mut prepared = prepared;
-            ctx.completion(&mut prepared)
-                .complete(&rawjson::string(reply, "id"), &request_id);
+            assert_eq!(result["status"], "completed");
+            assert_eq!(result["usage"]["input_tokens"], 3);
+            assert_eq!(result["usage"]["output_tokens"], 4);
+            let item = &result["output"][0];
+            assert_eq!(item["call_id"], "call_search");
+            assert_eq!(item["type"], if native { "tool_search_call" } else { "function_call" });
+            let arguments = if native {
+                item["arguments"].clone()
+            } else {
+                serde_json::from_str(item["arguments"].as_str().unwrap()).unwrap()
+            };
+            assert_eq!(arguments, serde_json::json!({"query":"weather","limit":2}));
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let upstream = &requests[0];
+            assert!(upstream.to_string().contains("Weather?"));
+            assert!(upstream.to_string().contains("Paris"));
+            let tools = upstream["tools"].as_array().unwrap();
+            assert!(tools.iter().any(|t| t["name"] == "shell"));
+            assert_eq!(tools.iter().any(|t| t["name"] == "tool_search"), native);
+            assert_eq!(tools.iter().any(|t| t["name"] == "get_weather"), native);
+            assert_eq!(upstream.to_string().contains("tool_reference"), native);
+            drop(requests);
+            server.abort();
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
-    let _ = std::fs::remove_dir_all(root);
 }
 
-/// A loopback Messages upstream that keeps the body of every request it gets and
-/// answers each with a minimal completed message, streamed when the request asks for
-/// a stream. Message IDs count the requests.
 async fn recording_upstream() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
     use axum::response::IntoResponse;
     let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -1528,9 +1898,8 @@ async fn api_key_cloak_keeps_the_caller_prompt_in_place_across_turns() {
     );
 }
 
-/// Go's non-stream native path: a reply whose OAuth tool alias cannot be restored
-/// returns before ParseClaudeUsage, so the deferred TrackFailure publishes no tokens
-/// even though the upstream body (and its model) was observed.
+/// Failed tool restoration must not publish successful token usage, even after
+/// receiving the upstream body.
 #[tokio::test]
 async fn unrestorable_tool_alias_publishes_no_tokens() {
     use axum::response::IntoResponse;
@@ -1602,17 +1971,14 @@ async fn unrestorable_tool_alias_publishes_no_tokens() {
     assert_eq!(
         reports.last().unwrap().2,
         format!("0 {message}"),
-        "Go's plain error has no status"
+        "restoration failed before an HTTP response could be delivered"
     );
 }
 
-/// Go's reporter calls on each Claude path (claude_executor_execute.go and
-/// claude_executor_stream.go): native Execute publishes, translated Execute and
-/// ExecuteStream require usage (no EnsurePublished), the TTFT marks bracket the round
-/// trip, a renamed upstream model is reported, and `responses/compact` reports only its
-/// summary turn, a native non-stream Execute (v8.0.35 2bc236d2).
+/// Usage events bracket the round trip and publish only observed tokens.
+/// Compaction publishes the summary turn's usage.
 #[tokio::test]
-async fn usage_reports_follow_go_reporter_calls() {
+async fn usage_reports_bracket_requests_and_publish_only_observed_usage() {
     use axum::response::IntoResponse;
     let router = axum::Router::new().fallback(|body: String| async move {
         let model = rawjson::get(&body, "model").str().to_owned();
@@ -1757,13 +2123,10 @@ impl cpa_core::exec::CaptureObserver for Captured {
     }
 }
 
-/// Go's request-log sites in claude_executor_execute.go, _stream.go and _tokens.go:
-/// RecordAPIRequest before each send (executor-built headers, provider and
-/// AccountInfo), RecordAPIResponseMetadata with Go's canonical header names, the whole
-/// body (Execute, count_tokens, error bodies) or each scanner line (ExecuteStream) as
-/// chunks, and RecordAPIResponseError on transport failures.
+/// Capture requests before sending, response metadata before body bytes, and
+/// transport errors through the shared capture observer.
 #[tokio::test]
-async fn request_logs_follow_go_capture_sites() {
+async fn capture_events_cover_requests_responses_and_transport_failures() {
     use axum::response::IntoResponse;
     let wire: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let seen = wire.clone();
@@ -1866,7 +2229,7 @@ async fn request_logs_follow_go_capture_sites() {
             .unwrap()
             .1
             .split(',')
-            .map(GoStr::go_lower)
+            .map(str::to_ascii_lowercase)
             .collect();
         let mut sent: Vec<String> = wire
             .lock()
@@ -1913,39 +2276,44 @@ async fn request_logs_follow_go_capture_sites() {
     assert!(events[1].starts_with("error "), "{events:?}");
 }
 
-/// Go's in-process compat replay across two requests (store, then restore), replayed
-/// through `execute()` against a local upstream that answers like Go's capture.
+/// A compatibility gateway may omit thinking blocks when it returns tool history.
+/// Store them after success, restore only on matching history, retain them after local
+/// validation failure, and clear an applied replay after an upstream rejection.
 #[tokio::test]
-async fn compat_replay_sequence_matches_go() {
+async fn compat_replay_restores_history_and_only_upstream_rejections_clear_it() {
     use axum::response::IntoResponse;
-    let fixture: Value = serde_json::from_str(include_str!("testdata/go_executor.json")).unwrap();
-    let steps: Vec<&Value> = fixture["scenarios"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|s| s["name"].as_str().unwrap().starts_with("replay-"))
-        .collect();
-    assert_eq!(steps.len(), 6);
-    // Replies in the order requests reach upstream (steps Go failed locally send none).
-    let replies: Vec<(u16, String)> = steps
-        .iter()
-        .filter(|s| s["upstream"].as_array().is_some_and(|u| !u.is_empty()))
-        .map(|s| {
-            (
-                s["reply"]["status"].as_u64().unwrap() as u16,
-                s["reply"]["body"].as_str().unwrap().to_owned(),
-            )
-        })
-        .collect();
+    let planning = serde_json::json!({
+        "id":"msg_plan", "type":"message", "role":"assistant", "model":"claude-sonnet-4-6",
+        "content":[{"type":"thinking","thinking":"private plan","signature":"sig-private-plan"},
+            {"type":"text","text":"Calling."},{"type":"tool_use","id":"tool_local","name":"read","input":{"path":"a"}}],
+        "stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":1}
+    })
+    .to_string();
+    let finished = serde_json::json!({
+        "id":"msg_done","type":"message","role":"assistant","model":"claude-sonnet-4-6",
+        "content":[{"type":"text","text":"done"}],"stop_reason":"end_turn",
+        "usage":{"input_tokens":3,"output_tokens":1}
+    })
+    .to_string();
+    let rejected = serde_json::json!({"type":"error","error":{"type":"invalid_request_error","message":"thinking signature rejected"}}).to_string();
+    let replies = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+        (200, planning.clone()),
+        (200, finished.clone()),
+        (200, planning),
+        (400, rejected),
+        (200, finished),
+    ])));
     let captured: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let seen = captured.clone();
     let router = axum::Router::new().fallback(move |body: String| {
-        let seen = seen.clone();
-        let replies = replies.clone();
+        let (replies, seen) = (replies.clone(), seen.clone());
         async move {
-            let mut seen = seen.lock().unwrap();
-            let (status, reply) = replies[seen.len()].clone();
-            seen.push(body);
+            seen.lock().unwrap().push(body);
+            let (status, reply) = replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected upstream request");
             (
                 http::StatusCode::from_u16(status).unwrap(),
                 [(http::header::CONTENT_TYPE, "application/json")],
@@ -1956,99 +2324,100 @@ async fn compat_replay_sequence_matches_go() {
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    // The mock is an HTTP proxy, so the credential keeps Go's gateway base URL (the
-    // config key match that binds is-compat uses it).
-    let client = wreq::Client::builder()
-        .proxy(wreq::Proxy::http(base.as_str()).unwrap())
-        .build()
-        .unwrap();
-    let executor = ClaudeExecutor::with_client(client, DEFAULT_BASE_URL);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let root = std::env::temp_dir().join(format!("cpa-claude-contract-replay-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("auth")).unwrap();
+    let executor = ClaudeExecutor::with_client(wreq::Client::builder().no_proxy().build().unwrap(), DEFAULT_BASE_URL);
     let usage = Arc::new(Usage::default());
-    let root = std::env::temp_dir().join(format!("cpa-claude-replay-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    for (step, scenario) in steps.iter().enumerate() {
-        let text = scenario["config"]
-            .as_str()
-            .unwrap()
-            .replace("AUTH_DIR", root.to_str().unwrap());
-        let cfg = super::settings::as_recorded_with_2_1_280_profile(Config::parse(&text).unwrap());
+    let first =
+        serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"messages":[{"role":"user","content":"hello"}]});
+    let continuation = serde_json::json!({"model":"claude-sonnet-4-6","max_tokens":64,"messages":[
+        {"role":"user","content":"hello"},
+        {"role":"assistant","content":[{"type":"text","text":"Calling."},{"type":"tool_use","id":"tool_local","name":"read","input":{"path":"a"}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_local","content":"result"}]}
+    ]});
+    for step in 0..6 {
+        let cloak = if step >= 2 {
+            "\n          cloak:\n            mode: always"
+        } else {
+            ""
+        };
+        let cfg = Config::parse(&format!("config-version: 8\noauth:\n  auth-dir: {}\napi-keys:\n  claude:\n    - base-url: {base}\n      keys:\n        - api-key: gateway-local-only{cloak}\n", root.join("auth").display())).unwrap();
         let credential = cpa_core::config::credentials::load(&cfg)
             .into_iter()
             .find(|c| c.provider == "claude")
             .unwrap();
-        let body = Bytes::from(scenario["body"].as_str().unwrap().to_owned());
-        let headers: http::HeaderMap = scenario["headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|h| {
-                (
-                    h[0].as_str().unwrap().parse().unwrap(),
-                    h[1].as_str().unwrap().parse().unwrap(),
-                )
-            })
-            .collect();
-        let req = enrich(ExecRequest {
-            operation: Operation::Generate,
-            source_format: Format::Claude,
-            response_format: Format::Claude,
-            requested_model: scenario["requested_model"].as_str().unwrap().into(),
-            model: scenario["model"].as_str().unwrap().into(),
-            original_body: body.clone(),
-            body,
-            stream: false,
-            alt: None,
-            session: None,
-            execution_session: None,
-            derived_session: None,
-            resolved_model: resolved(scenario),
-            usage: cpa_core::exec::UsageSink::new(usage.clone()),
-            request_path: String::new(),
-            headers,
-            caller: Caller {
-                principal: scenario["client_key"].as_str().unwrap().into(),
-                source: "authorization",
-                provider: String::new(),
-            },
+        let mut body = if matches!(step, 0 | 2) {
+            first.clone()
+        } else {
+            continuation.clone()
+        };
+        if step == 3 {
+            body["system"] =
+                serde_json::json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]);
+        }
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "x-claude-code-session-id",
+            "5a1f3c2e-1111-4222-8333-444455556666".parse().unwrap(),
+        );
+        let mut req = enrich(client_request(body.to_string(), headers));
+        req.resolved_model = Some(cpa_core::exec::ResolvedModel {
+            info: cpa_core::registry::ModelInfo::from_raw(
+                serde_json::json!({"id":"claude-sonnet-4-6","is_compat":true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap(),
+            source: cpa_core::exec::ResolvedSource::ApiKey,
         });
+        req.usage = cpa_core::exec::UsageSink::new(usage.clone());
         usage.0.lock().unwrap().clear();
-        let sent = captured.lock().unwrap().len();
+        let before = captured.lock().unwrap().len();
         let result = executor.execute(&credential, req, &cfg).await;
-        match scenario["error_status"].as_u64() {
-            Some(status) => match result {
-                Err(error) => assert_eq!(u64::from(error.status), status, "step {step}"),
-                Ok(_) => panic!("step {step}: Go failed with {status}"),
-            },
-            None => assert_eq!(result.map(|r| r.status).unwrap(), 200, "step {step}"),
+        if matches!(step, 3 | 4) {
+            assert_eq!(
+                result.err().expect("expected request rejection").status,
+                400,
+                "step {step}"
+            );
+        } else {
+            assert_eq!(result.unwrap().status, 200, "step {step}");
         }
-        let go = scenario["upstream"][0]["body"].as_str();
-        let rust = captured.lock().unwrap().get(sent).cloned();
-        assert_eq!(rust.is_some(), go.is_some(), "step {step}: upstream request");
-        if let (Some(rust), Some(go)) = (rust.clone(), go) {
-            assert_eq!(normalize_replay(&rust), normalize_replay(go), "step {step}");
+        let sent = captured.lock().unwrap().get(before).cloned();
+        assert_eq!(
+            sent.is_some(),
+            step != 3,
+            "local validation must precede any upstream request"
+        );
+        if let Some(sent) = &sent {
+            assert_eq!(
+                sent.contains("sig-private-plan"),
+                matches!(step, 1 | 4),
+                "step {step}: replay eligibility"
+            );
+            let parsed: Value = serde_json::from_str(sent).unwrap();
+            assert_eq!(parsed["max_tokens"], 64);
+            assert!(sent.contains("hello"));
+            if !matches!(step, 0 | 2) {
+                assert!(sent.contains("tool_local"));
+                assert!(sent.contains("result"));
+            }
         }
-        // Go's usage reporter reads the body sent upstream (SetTranslatedReasoningEffort)
-        // and the upstream reply as received (ParseClaudeUsage, ObserveResponseModel).
         let reports = usage.0.lock().unwrap().clone();
-        let mut want = Vec::new();
-        if let Some(sent) = rust {
-            let reply = scenario["reply"]["body"].as_str().unwrap().to_owned();
-            want.push(("request", Format::Claude, sent));
-            want.push(("round_trip_started", Format::Claude, String::new()));
-            if !reply.is_empty() {
-                want.push(("first_byte", Format::Claude, String::new()));
-            }
-            // Native Execute publishes ParseClaudeUsage of the body; errors leave the
-            // failure to the server (Go's deferred TrackFailure).
-            if scenario["error_status"].is_null() {
-                want.push(("body", Format::Claude, reply));
-                want.push(("publish", Format::Claude, String::new()));
-            }
+        if let Some(sent) = sent {
+            assert_eq!(reports[0], ("request", Format::Claude, sent));
+            assert_eq!(reports[1].0, "round_trip_started");
+            assert_eq!(reports[2].0, "first_byte");
+            assert_eq!(reports.iter().any(|(kind, _, _)| *kind == "publish"), step != 4);
+        } else {
+            assert!(reports.is_empty());
         }
-        assert_eq!(reports, want, "step {step}: usage reports");
     }
-    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(captured.lock().unwrap().len(), 5);
+    server.abort();
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Records what the executor reports to the usage queue.
@@ -2210,97 +2579,189 @@ fn shared_window_429_follows_model_level_cooling() {
     }
 }
 
-/// `tests/fixtures/claude_ratelimit_go.json`, recorded from v8.0.35 by
-/// `tests/reference/claude_ratelimit`: the per-minute 429 cooldown (db1bab01), the
-/// header-only cooldown it replaces, and the scope and retry of a classified and a fast
-/// direct 429.
+/// Retry policy distinguishes a short per-minute limit from an account quota
+/// window. The fixed clock makes deadlines exact without waiting for real time.
 #[test]
-fn claude_rate_limit_cooldown_and_scope_match_go() {
-    let fixture: Value = serde_json::from_str(include_str!("../../tests/fixtures/claude_ratelimit_go.json")).unwrap();
-    let fixed = std::time::UNIX_EPOCH + Duration::from_secs(fixture["now_unix"].as_u64().unwrap());
-    let headers = |case: &Value, now: std::time::SystemTime| -> http::HeaderMap {
-        let unix = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let expand = |raw: &str| {
-            let Some((kind, rest)) = raw.strip_prefix('{').and_then(|r| r.split_once('+')) else {
-                return raw.to_owned();
-            };
-            let offset: u64 = rest.trim_end_matches('}').parse().unwrap();
-            match kind {
-                "now" => (unix + offset).to_string(),
-                _ => httpdate::fmt_http_date(now + Duration::from_secs(offset)),
-            }
-        };
-        let mut map = http::HeaderMap::new();
-        for pair in case["headers"].as_array().unwrap() {
-            let name = http::HeaderName::from_bytes(pair[0].as_str().unwrap().as_bytes()).unwrap();
-            map.append(name, expand(pair[1].as_str().unwrap()).parse().unwrap());
+fn per_minute_limits_use_a_single_valid_retry_hint_without_a_quota_claim() {
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let window = Duration::from_secs(5 * 3600);
+    let headers = |retry: Option<&str>| {
+        let mut h = http::HeaderMap::new();
+        h.insert("anthropic-ratelimit-unified-reset", "1800018000".parse().unwrap());
+        if let Some(retry) = retry {
+            h.insert("retry-after", retry.parse().unwrap());
         }
-        map
+        h
     };
-    let millis = |d: Option<Duration>| d.map(|d| d.as_millis() as u64);
-    let scope = |scope: FailureScope| match scope {
-        FailureScope::Credential => "credential",
-        FailureScope::Model => "model",
-        FailureScope::Request => "request",
-        other => panic!("unexpected scope {other:?}"),
+    let body = |resource: &str| {
+        serde_json::json!({"type":"error","error":{"type":"rate_limit_error","message":format!("This request would exceed the {resource} per minute rate limit. Please try again later.")}}).to_string()
     };
-    for case in fixture["cases"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        let body = Bytes::from(case["body"].as_str().unwrap().to_owned());
-        let at_fixed = headers(case, fixed);
-        // DIFFERENCES-FROM-GO.md: of two byte-identical keys only the last counts, so a
-        // later `"error":null` hides the per-minute error and the header-only result stays.
-        let reset_ms = if name == "later null keeps the error" {
-            case["header_only_ms"].as_u64()
-        } else {
-            case["reset_ms"].as_u64()
-        };
+    for resource in ["requests", "input tokens", "output tokens"] {
+        let message = body(resource);
         assert_eq!(
-            millis(crate::quota::reset_for_error(&at_fixed, &body, fixed, Duration::ZERO)),
-            reset_ms,
-            "{name}: cooldown"
+            crate::quota::reset_for_error(&headers(Some("30")), message.as_bytes(), now, Duration::ZERO),
+            Some(Duration::from_secs(30))
         );
         assert_eq!(
-            millis(crate::quota::reset(&at_fixed, fixed, Duration::ZERO)),
-            case["header_only_ms"].as_u64(),
-            "{name}: header-only cooldown"
+            crate::quota::reset(&headers(Some("30")), now, Duration::ZERO),
+            Some(window)
         );
+    }
+    let message = body("requests");
+    let date = httpdate::fmt_http_date(now + Duration::from_secs(45));
+    for (hint, expected) in [
+        (Some("12.5"), Duration::from_millis(12_500)),
+        (Some(date.as_str()), Duration::from_secs(45)),
+        (Some("608400"), Duration::from_secs(608_400)),
+        (Some("608401"), window),
+        (Some("0"), window),
+        (Some("soon"), window),
+        (None, window),
+    ] {
         assert_eq!(
-            crate::quota::shared_rejection(&at_fixed),
-            case["shared"].as_bool().unwrap(),
-            "{name}"
+            crate::quota::reset_for_error(&headers(hint), message.as_bytes(), now, Duration::ZERO),
+            Some(expected),
+            "{hint:?}"
         );
-        let live = headers(case, std::time::SystemTime::now());
-        let classified = upstream_error(429, live.clone(), body.clone(), false, false);
-        assert_eq!(scope(classified.scope), case["scope"], "{name}: scope");
+    }
+    let mut repeated = headers(Some("30"));
+    repeated.append("retry-after", "30".parse().unwrap());
+    assert_eq!(
+        crate::quota::reset_for_error(&repeated, message.as_bytes(), now, Duration::ZERO),
+        Some(window)
+    );
+    for invalid in [
+        "",
+        "not json",
+        "[]",
+        r#"{"error":"rate_limit_error"}"#,
+        r#"{"error":{"type":"rate_limit_error","message":null}}"#,
+        r#"{"error":{"type":"rate_limit_error","message":7}}"#,
+        r#"{"error":{"type":"api_error","message":"This request would exceed the requests per minute rate limit. Please try again later."}}"#,
+        r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
+        r#"{"error":{"type":"rate_limit_error","message":"This request would not exceed the requests per minute rate limit. Please try again later."}}"#,
+        r#"{"error":{"type":"rate_limit_error","message":"This request would exceed the requests per minute rate limit. Please try again later. Your weekly quota is exhausted."}}"#,
+        r#"{"error":{"type":"rate_limit_error","message":"This request would exceed the requests per minute rate limit. Please try again later."}}trailing"#,
+        r#"{"error":{"type":"rate_limit_error","message":"This request would exceed the requests per minute rate limit. Please try again later."},"error":null}"#,
+    ] {
         assert_eq!(
-            classified.retry_after.is_some(),
-            case["classify_retry"],
-            "{name}: retry"
+            crate::quota::reset_for_error(&headers(Some("30")), invalid.as_bytes(), now, Duration::ZERO),
+            Some(window),
+            "{invalid}"
         );
-        let fast = upstream_error(429, live, body, true, false);
-        assert_eq!(scope(fast.scope), case["fast_scope"], "{name}: fast scope");
-        assert_eq!(fast.retry_after.is_some(), case["fast_retry"], "{name}: fast retry");
-        // Live cooldowns carry the 1-30 s fuzz on top of the fixed-clock base; the
-        // offsets are whole seconds from a clock that has a fraction.
-        for (path, retry) in [("classified", classified.retry_after), ("fast", fast.retry_after)] {
-            if let (Some(retry), Some(base)) = (retry, reset_ms) {
-                let ms = retry.as_millis() as u64;
-                assert!(
-                    ms > base.saturating_sub(2000) && ms <= base + 30_000,
-                    "{name}: {path} live cooldown {ms} vs {base}"
-                );
-            }
+    }
+    assert_eq!(
+        crate::quota::reset_for_error(&http::HeaderMap::new(), message.as_bytes(), now, Duration::ZERO),
+        None
+    );
+    for field in [
+        "anthropic-ratelimit-unified-status",
+        "anthropic-ratelimit-unified-overage-status",
+        "anthropic-ratelimit-unified-7d_oi-status",
+    ] {
+        for value in ["", " "] {
+            let mut h = headers(Some("30"));
+            h.insert(
+                http::HeaderName::from_bytes(field.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+            assert_eq!(
+                crate::quota::reset_for_error(&h, message.as_bytes(), now, Duration::ZERO),
+                Some(Duration::from_secs(30))
+            );
         }
     }
 }
 
-/// The cases of v8.0.35's claude_executor_compaction_test.go (2bc236d2): a compaction
-/// trigger or `responses/compact` becomes one non-stream Claude summary turn sealed into
+#[test]
+fn shared_quota_windows_cool_the_credential_and_model_override_remains_explicit() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for (five, seven, expected_seconds) in [
+        (Some(7200), None, 7200),
+        (None, Some(86400), 86400),
+        (Some(7200), Some(172800), 172800),
+        (Some(90000), Some(86400), 90000),
+    ] {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("retry-after", "30".parse().unwrap());
+        for (window, seconds) in [("5h", five), ("7d", seven)] {
+            if let Some(seconds) = seconds {
+                headers.insert(
+                    http::HeaderName::from_bytes(format!("anthropic-ratelimit-unified-{window}-status").as_bytes())
+                        .unwrap(),
+                    "rejected".parse().unwrap(),
+                );
+                headers.insert(
+                    http::HeaderName::from_bytes(format!("anthropic-ratelimit-unified-{window}-reset").as_bytes())
+                        .unwrap(),
+                    (now + seconds).to_string().parse().unwrap(),
+                );
+            }
+        }
+        assert!(crate::quota::shared_rejection(&headers));
+        assert_eq!(
+            crate::quota::reset(
+                &headers,
+                std::time::UNIX_EPOCH + Duration::from_secs(now),
+                Duration::ZERO
+            ),
+            Some(Duration::from_secs(expected_seconds))
+        );
+        for fast in [false, true] {
+            for model_override in [false, true] {
+                let error = upstream_error(429, headers.clone(), Bytes::from_static(b"{}"), fast, model_override);
+                assert_eq!(
+                    error.scope,
+                    if model_override && !fast {
+                        FailureScope::Model
+                    } else {
+                        FailureScope::Credential
+                    }
+                );
+                assert!(error.retry_after.is_some());
+            }
+        }
+    }
+    let body = Bytes::from_static(
+        br#"{"error":{"type":"rate_limit_error","message":"Usage credits are required for fast mode"}}"#,
+    );
+    let headers = [("retry-after", "30")]
+        .into_iter()
+        .map(|(k, v)| (k.parse().unwrap(), v.parse().unwrap()))
+        .collect::<http::HeaderMap>();
+    for fast in [false, true] {
+        let error = upstream_error(429, headers.clone(), body.clone(), fast, false);
+        assert_eq!(error.scope, FailureScope::Request);
+        assert!(error.retry_after.is_some());
+    }
+    let headers = [
+        ("retry-after", "30"),
+        ("anthropic-ratelimit-unified-status", "rejected"),
+        ("anthropic-ratelimit-unified-5h-status", "allowed"),
+        ("anthropic-ratelimit-unified-7d-status", "allowed"),
+        ("anthropic-ratelimit-unified-overage-status", "rejected"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.parse().unwrap(), v.parse().unwrap()))
+    .collect::<http::HeaderMap>();
+    assert!(
+        !crate::quota::shared_rejection(&headers),
+        "overage billing refusal is not account quota exhaustion"
+    );
+    let error = upstream_error(429, headers, Bytes::from_static(b"{}"), false, false);
+    assert_eq!(error.scope, FailureScope::Model);
+    assert_eq!(error.retry_after, None);
+}
+
+/// A compaction trigger or `responses/compact` becomes one non-stream Claude summary
+/// turn sealed into
 /// a single compaction item; replayed CPA capsules expand, foreign ones are dropped and
 /// broken ones fail with 400 before any upstream call.
 #[tokio::test]
-async fn responses_compaction_matches_go() {
+async fn responses_compaction_seals_summaries_and_validates_replayed_capsules() {
     use axum::response::IntoResponse;
     const PROMPT: &str = "Please provide a concise and comprehensive summary";
     const SUMMARY: &str = "Sealed summary of the build.";
@@ -2570,8 +3031,8 @@ async fn responses_compaction_matches_go() {
     reply.lock().unwrap().clear();
     // InvalidCompactionCapsuleReturns400, before any upstream call.
     let broken = r#"{"type":"compaction","encrypted_content":"cpa-ag-compact-v1:not-valid-base64"}"#;
-    // Go rejects it before its usage reporter exists, so no record is published, also
-    // when only the original request carries the capsule.
+    // Validate before sending or publishing usage, including when only the
+    // original request carries the capsule.
     let plain = input(continue_, "");
     let broken = input(&format!("{broken},{continue_}"), "");
     for (body, original) in [(broken.clone(), None), (plain, Some(broken.as_str()))] {
@@ -2582,8 +3043,8 @@ async fn responses_compaction_matches_go() {
         assert!(upstream.is_empty());
         assert_eq!(usage, ["discard"]);
     }
-    // A summary answer without text fails like Go's fmt.Errorf: no status and no
-    // transport fault, so it cools the model on the trigger path and is neutral on the
+    // An empty summary has no delivered HTTP status or transport fault. It cools
+    // the model on the trigger path and is neutral on the
     // compact alt, without a retry round (cpa-server classify tests); the summary turn
     // itself published its usage.
     *reply.lock().unwrap() = "empty".into();

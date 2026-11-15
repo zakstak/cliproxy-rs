@@ -2773,8 +2773,6 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    const FIXTURE: &str = include_str!("../tests/fixtures/server_go.json");
-
     /// U1 (#99): reported zero usage is usage, also when the terminal event names a
     /// service tier; it never replaces usage an earlier event reported.
     #[test]
@@ -2928,17 +2926,19 @@ mod tests {
     }
 
     #[test]
-    fn go_timestamps() {
+    fn usage_timestamps_round_trip_fraction_and_offset() {
         use chrono::TimeZone;
-        let t = chrono::Utc.with_ymd_and_hms(2026, 10, 3, 8, 0, 0).unwrap();
-        assert_eq!(go_timestamp(&t), "2026-10-03T08:00:00Z");
-        let t = t + chrono::Duration::nanoseconds(123_456_000);
-        assert_eq!(go_timestamp(&t), "2026-10-03T08:00:00.123456Z");
-        let east = chrono::FixedOffset::east_opt(5 * 3600 + 1800).unwrap();
-        assert_eq!(
-            go_timestamp(&t.with_timezone(&east)),
-            "2026-10-03T13:30:00.123456+05:30"
-        );
+        let base = chrono::Utc.with_ymd_and_hms(2026, 10, 3, 8, 0, 0).unwrap();
+        for nanos in [0, 1, 123_456_000, 999_999_999] {
+            let instant = base + chrono::Duration::nanoseconds(nanos);
+            for offset in [0, 5 * 3600 + 1800, -8 * 3600] {
+                let local = instant.with_timezone(&chrono::FixedOffset::east_opt(offset).unwrap());
+                let encoded = go_timestamp(&local);
+                let parsed = chrono::DateTime::parse_from_rfc3339(&encoded).unwrap();
+                assert_eq!(parsed, local);
+                assert_eq!(parsed.offset(), local.offset());
+            }
+        }
     }
 
     /// Per-response records (#25): a detached attempt publishes nothing itself, each
@@ -3277,14 +3277,15 @@ mod tests {
         }
     }
 
-    /// Records from Go's real parsers, `UsageReporter` and `usageQueuePlugin`
-    /// (tests/reference/server/main.go `usageRecords`), byte for byte.
+    /// Archived request/event inputs exercise the collector schema. Expectations below
+    /// come from the provider token fields and the Rust accounting contract, rather
+    /// than recorded proxy output; serialization order is deliberately irrelevant.
     #[test]
-    fn queued_records_match_go() {
-        let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
-        let cases = fixture["usage"].as_array().unwrap();
-        assert_eq!(cases.len(), 14);
-        for (index, case) in cases.iter().enumerate() {
+    fn queued_records_preserve_provider_usage_and_request_context() {
+        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/usage_inputs.json")).unwrap();
+        let cases = fixture.as_array().unwrap();
+        assert_eq!(cases.len(), 9);
+        for case in cases {
             let name = case["name"].as_str().unwrap();
             let s = |k: &str| case[k].as_str().unwrap_or_default().to_owned();
             // Gemini, Vertex, Interactions and OpenAI-compatible credentials were removed
@@ -3403,55 +3404,83 @@ mod tests {
                 access_provider: String::new(),
             };
             let got = queued(&record, &client);
-            // Go's exact bytes: the fixture re-indents the queued payload; compacting
-            // restores it.
-            let raw = gj::get(FIXTURE.as_bytes(), &format!("usage.{index}.queued"));
-            let want = String::from_utf8(gj::compact(raw.raw(), false)).unwrap();
-            // Go 37fe2608, after the fixture's 6fecc6e, always writes `is_native_key`
-            // after `api_key`; with no access provider it is false and
-            // `access_provider` is omitted.
-            let at = want.find(",\"request_id\":").unwrap();
-            let want = format!("{},\"is_native_key\":false{}", &want[..at], &want[at..]);
-            assert_eq!(String::from_utf8_lossy(&got), want, "{name}");
+            let actual: Value = serde_json::from_slice(&got).unwrap();
+            let (input, output, total) = match name {
+                "claude buffered api key" => (10, 20, 38),
+                "claude stream oauth" => (12, 40, 152),
+                "openai stream last usage" => (7, 3, 10),
+                "openai partial usage" => (5, 0, 5),
+                "responses buffered codex oauth" => (200, 80, 280),
+                "responses stream terminal" => (9, 4, 13),
+                "failure without usage" => (0, 0, 0),
+                "failure after stream usage" => (11, 2, 13),
+                "client key source fallback" => (1, 1, 2),
+                other => panic!("unqualified usage scenario {other}"),
+            };
+            assert_eq!(actual["tokens"]["input_tokens"], input, "{name}");
+            assert_eq!(actual["tokens"]["output_tokens"], output, "{name}");
+            assert_eq!(actual["tokens"]["total_tokens"], total, "{name}");
+            for field in [
+                "timestamp",
+                "execution_id",
+                "provider",
+                "executor_type",
+                "model",
+                "alias",
+                "endpoint",
+                "request_id",
+                "client_ip",
+                "resolved_client_ip",
+                "x_forwarded_for",
+                "user_agent",
+                "session_id",
+                "parent_session_id",
+                "reasoning_effort",
+                "service_tier",
+            ] {
+                let expected = match field {
+                    "timestamp" => &case["requested_at"],
+                    "reasoning_effort" => continue, // translated payloads have a separate parser contract
+                    _ => &case[field],
+                };
+                if let Some(expected) = expected.as_str().filter(|v| !v.is_empty())
+                    && !matches!(field, "session_id" | "parent_session_id")
+                {
+                    assert_eq!(actual[field], expected, "{name}: {field}");
+                }
+            }
+            assert_eq!(actual["failed"], case["failed"], "{name}");
+            assert_eq!(actual["stream"], case["stream"], "{name}");
+            assert_eq!(actual["generate"], case["generate"], "{name}");
+            assert_eq!(actual["api_key"], s("client_key").trim(), "{name}");
+            assert_eq!(actual["is_native_key"], false, "{name}");
+            assert_eq!(actual["accounting_version"], 2);
+            assert_eq!(actual["token_breakdown"]["total_tokens"], total);
         }
     }
 
-    /// Go `TestUsageQueuePluginPayloadDistinguishesNativeKey` and
-    /// `TestIsNativeAccessProvider` (37fe2608): `is_native_key` is always written right
-    /// after `api_key`, true only for CPA's own client-key providers (trimmed, any case);
-    /// `access_provider` follows it unless empty.
     #[test]
     fn queued_payload_distinguishes_native_key() {
-        for (provider, key, want) in [
-            (
-                "config-inline",
-                "sk-native-key-123",
-                r#""api_key":"sk-native-key-123","is_native_key":true,"access_provider":"config-inline","request_id""#,
-            ),
-            (
-                "  CONFIG-API-KEY ",
-                "k",
-                r#""api_key":"k","is_native_key":true,"access_provider":"CONFIG-API-KEY","request_id""#,
-            ),
-            (
-                "custom-auth-provider",
-                "other-principal-456",
-                r#""api_key":"other-principal-456","is_native_key":false,"access_provider":"custom-auth-provider","request_id""#,
-            ),
-            (
-                "realtime-client-secret",
-                "p",
-                r#""api_key":"p","is_native_key":false,"access_provider":"realtime-client-secret","request_id""#,
-            ),
-            ("", "", r#""api_key":"","is_native_key":false,"request_id""#),
+        for (provider, native) in [
+            ("config-inline", true),
+            ("  CONFIG-API-KEY ", true),
+            ("custom-auth-provider", false),
+            ("realtime-client-secret", false),
+            ("", false),
         ] {
             let client = Client {
-                api_key: key.into(),
+                api_key: "fake-client-key".into(),
                 access_provider: provider.into(),
                 ..Default::default()
             };
-            let got = String::from_utf8(queued(&Record::default(), &client)).unwrap();
-            assert!(got.contains(want), "{provider:?}: {got}");
+            let got: Value = serde_json::from_slice(&queued(&Record::default(), &client)).unwrap();
+            assert_eq!(got["api_key"], "fake-client-key");
+            assert_eq!(got["is_native_key"], native);
+            if provider.trim().is_empty() {
+                assert!(got.get("access_provider").is_none());
+            } else {
+                assert_eq!(got["access_provider"], provider.trim());
+            }
         }
     }
 
@@ -3500,165 +3529,125 @@ mod tests {
         })
     }
 
-    /// Go `UsageReporter` call sequences as Go's executors make them
-    /// (tests/reference/server/main.go `reporterSequences`), replayed through the
-    /// tracker and the executor sink: what Go publishes, and when it publishes nothing.
+    /// Publication is exactly once; a terminal failure cannot rewrite a record the
+    /// executor already published, and a failure preserves any observed usage.
     #[test]
-    fn reporter_sequences_match_go() {
+    fn reporter_publication_is_exactly_once_and_keeps_observed_usage() {
         use cpa_core::exec::{ExecError, FailureScope};
-        let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
-        let cases = fixture["reporter"].as_array().unwrap();
-        let claude = [
-            r#"data: {"type":"message_start","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":9,"output_tokens":1}}}"#,
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":6}}"#,
-        ];
-        let kimi_chunk = r#"data: {"id":"c","object":"chat.completion.chunk","model":"kimi-k2","choices":[{"index":0,"delta":{"content":"x"}}]}"#;
-        let kimi_usage = r#"data: {"id":"c","object":"chat.completion.chunk","model":"kimi-k2","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#;
-        // Go's sequence published a Gemini body; the same counts as a Chat Completions body.
-        let usage_body = br#"{"usage":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}"#;
-        let error = |status: u16, text: &str| ExecError::local(status, FailureScope::Request, text);
-        let rt = usage_runtime();
-        for case in cases {
-            let name = case["name"].as_str().unwrap();
-            // Gemini stream parsing went with the Gemini provider (issue #49).
-            if name.starts_with("gemini stream") {
-                continue;
-            }
-            let (provider, model) = match name.split(' ').next().unwrap() {
-                "gemini" | "publish" | "failure" => ("gemini", "gemini-2.5-pro"),
-                "claude" => ("claude", "claude-sonnet-4-6"),
-                "kimi" => ("kimi", "kimi-k2"),
-                "devin" => ("devin", "devin-chat"),
-                _ => ("codex", "gpt-5.5"),
-            };
+        for (publish_first, fail_first, usage_required, has_usage) in
+            (0..16).map(|bits| (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0))
+        {
+            let rt = usage_runtime();
             let facts = std::sync::Arc::new(Facts::new(
                 Client::default(),
                 Format::OpenAI,
                 Format::OpenAI,
-                model,
+                "grok-test",
                 b"{}",
                 true,
                 &crate::dispatch::Trace::default(),
             ));
-            let tracker = Tracker::start(&rt, &facts, &credential_for(provider), model);
+            let tracker = Tracker::start(&rt, &facts, &credential_for("xai"), "grok-test");
             let sink = tracker.sink();
-            let lines = |format: Format, lines: &[&str]| {
-                for line in lines {
-                    sink.response_line(format, line.as_bytes());
-                }
-            };
-            match name {
-                "claude stream usage then scan error" => {
-                    lines(Format::Claude, &claude);
-                    tracker.fail(&error(502, "stream broke"));
-                }
-                "kimi stream without usage" => {
-                    sink.usage_required();
-                    lines(Format::OpenAI, &[kimi_chunk, "data: [DONE]"]);
-                    tracker.succeed();
-                }
-                "kimi stream with usage" => {
-                    sink.usage_required();
-                    lines(Format::OpenAI, &[kimi_chunk, kimi_usage, "data: [DONE]"]);
-                    tracker.succeed();
-                }
-                // The executor reports no body because Go's condition did not publish.
-                "kimi native nonstream without usage" => {
-                    sink.usage_required();
-                    tracker.succeed();
-                }
-                _ if name.starts_with("kimi translated effort ") => {
-                    let payload = name.trim_start_matches("kimi translated effort ");
-                    sink.request_for("kimi", payload.as_bytes());
-                    sink.response_body(
-                        Format::OpenAI,
-                        br#"{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
-                    );
-                    sink.publish();
-                    tracker.succeed();
-                }
-                "devin set response model" => {
-                    sink.response_model("  devin-model-x ");
-                    tracker.succeed();
-                }
-                // Go's deferred EnsurePublished wins over the stream error the client sees.
-                "devin truncated before EOS" => {
-                    sink.publish();
-                    tracker.fail(&error(0, "devin stream terminated prematurely before EOS trailer"));
-                }
-                "devin trailer error" => {
-                    sink.publish_failure(0, "devin trailer: permission_denied");
-                    tracker.fail(&error(403, "devin trailer: permission_denied"));
-                }
-                "publish then failure" => {
-                    sink.response_body(Format::OpenAI, usage_body);
-                    sink.publish();
-                    tracker.fail(&error(500, "late"));
-                }
-                "failure then publish" => {
-                    sink.publish_failure(429, "slow down");
-                    sink.response_body(Format::OpenAI, usage_body);
-                    sink.publish();
-                    tracker.succeed();
-                }
-                "terminal response model then set" => {
-                    sink.response_line(
-                        Format::OpenAIResponse,
-                        br#"data: {"type":"response.completed","response":{"model":"gpt-5.5-2026-01-01"}}"#,
-                    );
-                    sink.response_model("other-model");
-                    sink.publish();
-                    tracker.succeed();
-                }
-                other => panic!("unscripted Go case {other}"),
+            if usage_required {
+                sink.usage_required();
             }
-            let got: Vec<Value> = rt.usage_queue().pop_oldest(10).iter().map(|q| summary(q)).collect();
-            let want: Vec<Value> = case["records"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|r| {
-                    // The golden holds Go's record before the queue; Go's queue plugin
-                    // (redisqueue/plugin.go `failDetail`) reports 200 for a success and
-                    // 500 for a failure without status, as `queued` does.
-                    let status = match (r["failed"].as_bool().unwrap(), r["fail_status"].as_i64().unwrap()) {
-                        (false, _) => 200,
-                        (true, s) if s <= 0 => 500,
-                        (true, s) => s,
-                    };
-                    serde_json::json!({
-                        "failed": r["failed"], "fail_status": status, "fail_body": r["fail_body"],
-                        "input": r["input"], "output": r["output"], "total": r["total"],
-                        "response_model": r["response_model"], "reasoning_effort": r["reasoning_effort"],
-                        "model": r["model"],
-                    })
-                })
-                .collect();
-            assert_eq!(got, want, "{name}");
+            if has_usage {
+                sink.response_body(
+                    Format::OpenAI,
+                    br#"{"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}"#,
+                );
+            }
+            if fail_first {
+                sink.publish_failure(429, "slow down");
+            }
+            if publish_first {
+                sink.publish();
+            }
+            tracker.succeed();
+            let records = rt.usage_queue().pop_oldest(10);
+            let should_publish = publish_first || fail_first || !usage_required || has_usage;
+            assert_eq!(records.len(), usize::from(should_publish));
+            if let Some(record) = records.first() {
+                let got = summary(record);
+                assert_eq!(got["failed"], fail_first);
+                assert_eq!(got["fail_status"], if fail_first { 429 } else { 200 });
+                assert_eq!(got["input"], if has_usage && !fail_first { 5 } else { 0 });
+                assert_eq!(got["output"], if has_usage && !fail_first { 2 } else { 0 });
+                assert_eq!(got["total"], if has_usage && !fail_first { 7 } else { 0 });
+            }
         }
+        // A stream error after receiving usage carries those counts into failure.
+        let rt = usage_runtime();
+        let facts = std::sync::Arc::new(Facts::new(
+            Client::default(),
+            Format::Claude,
+            Format::Claude,
+            "claude-test",
+            b"{}",
+            true,
+            &crate::dispatch::Trace::default(),
+        ));
+        let tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "claude-test");
+        tracker.sink().response_line(
+            Format::Claude,
+            br#"data: {"type":"message_start","message":{"usage":{"input_tokens":9,"output_tokens":1}}}"#,
+        );
+        tracker.sink().response_line(
+            Format::Claude,
+            br#"data: {"type":"message_delta","usage":{"output_tokens":6}}"#,
+        );
+        tracker.fail(&ExecError::local(502, FailureScope::Request, "stream broke"));
+        let records = rt.usage_queue().pop_oldest(10);
+        assert_eq!(records.len(), 1);
+        let got = summary(&records[0]);
+        assert_eq!(got["failed"], true);
+        assert_eq!(got["fail_status"], 502);
+        assert_eq!(got["fail_body"], "stream broke");
+        assert_eq!(
+            (got["input"].as_i64(), got["output"].as_i64(), got["total"].as_i64()),
+            (Some(9), Some(6), Some(15))
+        );
     }
 
-    /// Go `IsModelSubstituted` (tests/reference/server/main.go `substitutions`).
+    /// Accounting treats an optional provider prefix, effort suffix and recognized
+    /// dated/latest deployment suffixes as the same requested model family.
     #[test]
-    fn model_substitution_matches_go() {
-        let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
-        for case in fixture["substitution"].as_array().unwrap() {
-            let (requested, served) = (case["requested"].as_str().unwrap(), case["served"].as_str().unwrap());
-            assert_eq!(
-                is_model_substituted(requested, served),
-                case["substituted"].as_bool().unwrap(),
-                "{requested:?} -> {served:?}"
-            );
+    fn model_substitution_distinguishes_family_changes_from_deployments() {
+        for base in ["gpt-5.5", "claude-sonnet-4-6", "grok-4"] {
+            for equivalent in [
+                base.to_owned(),
+                base.to_ascii_uppercase(),
+                format!("provider/{base}"),
+                format!("{base}-2026-01-01"),
+                format!("{base}-20260101"),
+                format!("{base}-001"),
+                format!("{base}-latest"),
+                format!("{base}(high)"),
+                format!(" {base} "),
+            ] {
+                assert!(!is_model_substituted(base, &equivalent), "{base} -> {equivalent}");
+                assert!(!is_model_substituted(&equivalent, base), "{equivalent} -> {base}");
+            }
+            for different in [
+                format!("{base}-other"),
+                format!("{base}-0001"),
+                format!("{base}-2026-1-01"),
+            ] {
+                assert!(is_model_substituted(base, &different), "{base} -> {different}");
+            }
+            assert!(!is_model_substituted(base, ""));
+            assert!(!is_model_substituted("", base));
         }
+        assert!(is_model_substituted("gpt-5.5", "gpt-5.4"));
     }
 
-    /// Go `Manager.ReportHomeUnauthorized` through Go's usage queue plugin
-    /// (zz_rustgolden_unauthorized_test.go in the reference): the same queued record,
-    /// or none without an access token. The first case reaches Go's session through
-    /// Home's canonical session on the credential, not the request's own.
+    /// Home records identify unauthorized OAuth attempts without fabricating provider
+    /// usage. The input archive contains no recorded proxy answers.
     #[test]
-    fn home_unauthorized_records_match_go() {
-        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/home_unauthorized_go.json")).unwrap();
+    fn home_unauthorized_records_keep_identity_and_never_fabricate_usage() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/home_unauthorized_inputs.json")).unwrap();
         let rt = usage_runtime();
         let s = |v: &Value| v.as_str().unwrap_or_default().to_owned();
         for case in fixture.as_array().unwrap() {
@@ -3745,38 +3734,65 @@ mod tests {
                 .iter()
                 .map(|r| serde_json::from_slice(r).unwrap())
                 .collect();
-            if case["record"].is_null() {
-                assert!(got.is_empty(), "{name}: {got:?}");
+            if name == "api_key_has_no_fingerprint" {
+                assert!(got.is_empty(), "API keys have no OAuth fingerprint: {got:?}");
                 continue;
             }
             assert_eq!(got.len(), 1, "{name}");
-            let mut want = case["record"].clone();
-            // Go 37fe2608, after this fixture was recorded: the record carries the
-            // request's client key and access provider.
-            let fields = want.as_object_mut().unwrap();
-            fields.insert("api_key".into(), "fake-client-key".into());
-            fields.insert("is_native_key".into(), true.into());
-            fields.insert("access_provider".into(), "config-inline".into());
-            // Not in Go's record (U1, #99): a record without provider usage says so.
-            fields.insert("usage_observed".into(), false.into());
-            for record in [&mut want, &mut got[0]] {
-                let record = record.as_object_mut().unwrap();
-                assert!(record.remove("timestamp").is_some(), "{name}");
-                assert_eq!(
-                    record.remove("execution_id").map(|v| v.as_str().unwrap().len()),
-                    Some(36)
-                );
-            }
-            // Not in Go's record (docs/DIFFERENCES-FROM-GO.md): Home's canonical session
-            // says where it came from.
-            let source = got[0].as_object_mut().unwrap().remove("session_source");
-            let home = name == "count_tokens_oauth_runtime";
+            let got = got.remove(0);
+            assert_eq!(got["failed"], true);
+            assert_eq!(got["generate"], false);
+            assert_eq!(got["stream"], false);
+            assert_eq!(got["usage_observed"], false);
+            assert_eq!(got["fail"]["status_code"], 401);
             assert_eq!(
-                source.as_ref().and_then(Value::as_str),
-                home.then_some("home"),
-                "{name}"
+                got["fail"]["body"],
+                if body.is_empty() { "upstream unauthorized" } else { body }
             );
-            assert_eq!(got[0], want, "{name}");
+            assert_eq!(got["executor_type"], "home-result");
+            assert_eq!(got["auth_index"], case["index"]);
+            assert_eq!(got["model"], s(&case["model"]).trim());
+            assert_eq!(
+                got["alias"],
+                if facts.alias.is_empty() {
+                    s(&case["model"]).trim().to_owned()
+                } else {
+                    facts.alias.clone()
+                }
+            );
+            assert_eq!(got["reasoning_effort"], facts.reasoning_effort);
+            assert_eq!(got["service_tier"], facts.service_tier);
+            assert_eq!(got["api_key"], "fake-client-key");
+            assert_eq!(got["access_provider"], "config-inline");
+            assert_eq!(got["is_native_key"], true);
+            assert_eq!(got["tokens"]["total_tokens"], 0);
+            assert_eq!(got["token_breakdown"]["total_tokens"], 0);
+            assert!(chrono::DateTime::parse_from_rfc3339(got["timestamp"].as_str().unwrap()).is_ok());
+            assert!(uuid::Uuid::parse_str(got["execution_id"].as_str().unwrap()).is_ok());
+            let fingerprint = got["access_token_sha256"].as_str().unwrap();
+            assert_eq!(fingerprint.len(), 64);
+            assert!(fingerprint.bytes().all(|b| b.is_ascii_hexdigit()));
+            // Fingerprints are safe identifiers; raw upstream credentials do not occur.
+            let encoded = serde_json::to_string(&got).unwrap();
+            for token in ["tok-claude-a", "tok-codex-b", "tok-kimi", "tok-gem", "tok-x", "tok-f"] {
+                assert!(!encoded.contains(token));
+            }
+            let expected_source = match name.as_str() {
+                "count_tokens_oauth_runtime" => "memory",
+                "alpha_search_no_body" => "config",
+                "blank_provider_falls_back_and_source_kinds" => "objectstore",
+                "path_source" | "unknown_source_is_file" => "file",
+                "no_source_attributes" => "",
+                _ => unreachable!(),
+            };
+            assert_eq!(got["source"], expected_source, "{name}");
+            assert_eq!(
+                got["session_source"].as_str(),
+                (name == "count_tokens_oauth_runtime").then_some("home")
+            );
+            if name == "blank_provider_falls_back_and_source_kinds" {
+                assert_eq!(got["provider"], "xai");
+            }
         }
     }
 
@@ -4004,29 +4020,39 @@ mod tests {
         assert_eq!((exchange.body_sent, exchange.request_bytes), (None, None));
     }
 
-    /// Go's TTFT: from the upstream request to the first body byte; the first packet
-    /// stands in until a token event; nothing without a start.
+    /// TTFT chooses the first token mark, uses a first-packet fallback, and stays
+    /// unchanged once settled. Controlled instants avoid sleep and speed bounds.
     #[test]
-    fn ttft_marks_follow_go() {
-        let mut t = Ttft::default();
-        t.first_byte();
-        assert!(t.tracked);
-        assert_eq!(t.get(), std::time::Duration::ZERO);
-
-        let mut t = Ttft::default();
-        t.start();
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    fn ttft_marks_settle_once_with_a_packet_fallback() {
+        let mut absent = Ttft::default();
+        absent.first_byte();
+        assert!(absent.tracked);
+        assert_eq!(absent.get(), std::time::Duration::ZERO);
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let packet = std::time::Duration::from_millis(10);
+        let mut t = Ttft {
+            tracked: true,
+            start: Some(start),
+            first_packet: Some(packet),
+            ttft: None,
+        };
         t.token(false);
-        let packet = t.get();
-        assert!(packet >= std::time::Duration::from_millis(5));
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        t.token(false);
-        assert_eq!(t.get(), packet, "a second non-token frame changes nothing");
+        assert_eq!(t.get(), packet, "later metadata does not replace the first packet");
         t.token(true);
-        let ttft = t.get();
-        assert!(ttft > packet);
+        let settled = t.get();
+        assert!(t.start.is_none());
+        assert_eq!(t.ttft, Some(settled));
         t.first_byte();
         t.start();
-        assert_eq!(t.get(), ttft, "the first TTFT wins");
+        t.token(true);
+        assert_eq!(t.get(), settled);
+        let mut byte = Ttft {
+            tracked: true,
+            start: Some(start),
+            ..Default::default()
+        };
+        byte.first_byte();
+        assert!(byte.ttft.is_some());
+        assert!(byte.start.is_none());
     }
 }

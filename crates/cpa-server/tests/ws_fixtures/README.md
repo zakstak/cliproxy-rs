@@ -1,39 +1,22 @@
-# Responses WebSocket fixtures
+# Responses WebSocket regression inputs
 
-Both files were produced by CLIProxyAPI itself; the Rust tests never derive expected
-values from Rust code. Every credential is fake and the upstream is a loopback mock, so
-nothing reaches OpenAI.
+`ws_inputs.json` contains client messages and scripted local peer replies for 47
+transport scenarios. It preserves input provenance from the former CLIProxyAPI
+recording at Rust commit `f6bff59c4c1646747caced0fbb08388fd66626e0`.
+Most inputs originated at Go `6fecc6e`; `ws_request_fault_headers` and shared
+`upstream.codex` steering inputs came from `ae3ee3be` (v8.0.35).
+It contains no recorded client output, captured upstream request, expected header,
+close reason, or cancellation count.
 
-- `ws_vectors.json`: the handler's pure helpers (request normalization and incremental
-  merge, passthrough, prewarm, SSE payload extraction, error payloads, request-fault
-  exposure, completion output restoration, pending tool calls, tool-call repair against
-  the shared caches, close-reason truncation). Recorded from `6fecc6e`. Replayed by
-  `src/websocket_requests_tests.rs`.
-- `ws_e2e.json`: forty-seven scenarios through Go's real `ResponsesWebsocket` handler, auth
-  manager, built-in translators and `CodexAutoExecutor`, against a scripted upstream that
-  speaks both WebSocket and HTTP SSE. It records the frames and close codes the client
-  saw, what upstream received (WebSocket dials and frames, HTTP requests) and the upgrade
-  response's `x-codex-turn-state`. Replayed by `tests/ws_e2e.rs`, which masks UUIDs and
-  the prewarm timestamp. A full v8.0.35 (`ae3ee3be`) run reproduces every scenario
-  apart from random keys, IDs and timestamps. `ws_request_fault_headers` and the shared
-  `upstream.codex` steering scenarios (`steer_historical_oauth_path_steers_api_key`,
-  `steer_idle_upstream_close_upstream_*`, Go 52d5507d) come from that run; the others keep
-  their `6fecc6e` bytes.
+`tests/ws_e2e.rs` specifies expected behavior with an independent transcript model
+based on [the Codex contract](../../../../docs/codex/CONTRACT.md). It checks exact
+relayed bytes and operation order, permitted envelope edits, local validation,
+connection identity, cancellation, and terminal-event delivery. Its expected
+span edits use serde's borrowed raw values rather than the proxy's JSON editor.
+All credentials are fake and peers use loopback. Scripted peer closes wait for
+events to drain so each scenario tests a defined ordering.
 
-The upstream mock reads WebSocket frames itself, as gorilla does, so a text frame need not be UTF-8; a frame that is not UTF-8 is recorded with its exact bytes as `body_hex`.
-
-Scripted upstream closes wait 300 ms after their events. Without that pause Go's
-disconnect notifier races the turn and can close the client before the events are
-written; the fixtures record the intended order.
-
-## Regenerating
-
-```sh
-git -C <CLIProxyAPI> worktree add /tmp/cpa-ws ae3ee3be
-cp go/zz_rsfix_ws_test.go /tmp/cpa-ws/sdk/api/handlers/openai/
-(cd /tmp/cpa-ws && RSFIX_OUT=/tmp/rsfix-ws go test -count=1 -run TestRSFixWS ./sdk/api/handlers/openai/)
-cp /tmp/rsfix-ws/*.json .
-```
-
-To record one scenario, make `TestRSFixWSE2E` in the copy keep only the scenario named
-by `RSFIX_ONLY`, run with `RSFIX_ONLY=<name>`, and splice that element into `ws_e2e.json`.
+Fallback helper tests now construct their own typed input and expected values in
+`src/websocket_requests_tests.rs`. The previous `ws_vectors.json`, `ws_e2e.json`,
+and Go recorder are retired; their original bytes and provenance remain in Git
+history. Do not regenerate these inputs or expectations by running Go or this proxy.

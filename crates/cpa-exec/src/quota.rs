@@ -736,7 +736,7 @@ mod tests {
     /// The Issue6465 cases of v8.0.27's claude_ratelimit_test.go (8080967): whether the
     /// shared windows rejected the credential, and the cooldown without fuzz.
     #[test]
-    fn overage_billing_resets_and_far_deadlines_are_ignored_like_go() {
+    fn overage_billing_resets_and_far_deadlines_do_not_impose_cooldowns() {
         let now = |rfc3339: &str| SystemTime::from(chrono::DateTime::parse_from_rfc3339(rfc3339).unwrap());
         let oct7 = now("2026-10-07T20:46:04Z");
         let unix = |t: SystemTime, after: u64| (t.duration_since(UNIX_EPOCH).unwrap().as_secs() + after).to_string();
@@ -880,7 +880,7 @@ mod tests {
     /// TestQuotaStateObserveResponseHeadersRetainsMeasuredClaudeAndCodexWatermarks (the
     /// Claude half), quota_signals_test.go.
     #[test]
-    fn claude_observation_keeps_go_measured_watermarks() {
+    fn claude_observation_keeps_latest_quota_watermarks() {
         let measured = [
             ("Anthropic-Ratelimit-Unified-5h-Status", "allowed"),
             ("Anthropic-Ratelimit-Unified-5h-Utilization", "0.0"),
@@ -916,7 +916,7 @@ mod tests {
     /// and ...RejectsControlCharacterValues, for Claude's headers; per model as in
     /// TestMarkResultQuotaFailureDoesNotEraseSiblingObservation.
     #[test]
-    fn observations_replace_keep_advance_and_reject_like_go() {
+    fn observations_replace_advance_and_preserve_rejected_signals() {
         let at = |secs| UNIX_EPOCH + Duration::from_secs(secs);
         let obs = Observations::default();
         obs.observe_at(

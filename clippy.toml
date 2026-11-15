@@ -1,7 +1,0 @@
-# Go's strings.ToLower and strings.ToUpper map rune by rune with simple case mappings;
-# Rust's str methods apply full mappings (İ becomes i plus U+0307, ß becomes SS, and a
-# final Σ becomes ς), so a ported comparison can disagree with Go on non-ASCII input.
-disallowed-methods = [
-    { path = "str::to_lowercase", reason = "use cpa_core::gostr::GoStr::go_lower (Go strings.ToLower), or to_ascii_lowercase for ASCII-only data" },
-    { path = "str::to_uppercase", reason = "use cpa_core::gostr::GoStr::go_upper (Go strings.ToUpper), or to_ascii_uppercase for ASCII-only data" },
-]

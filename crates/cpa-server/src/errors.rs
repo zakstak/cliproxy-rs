@@ -255,15 +255,21 @@ mod tests {
         assert!(!res.headers().contains_key("anthropic-ratelimit-unified-status"));
     }
 
+    // Generated client JSON is a schema contract; member order and escape spelling are not.
+    fn assert_json(actual: impl AsRef<str>, expected: impl AsRef<str>) {
+        let actual: serde_json::Value = serde_json::from_str(actual.as_ref()).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(expected.as_ref()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
-    fn openai_envelope_matches_go() {
-        assert_eq!(
+    fn openai_errors_preserve_details_and_status_category() {
+        assert_json(
             openai_body(500, "status 500"),
-            r#"{"error":{"message":"status 500","type":"server_error","code":"internal_server_error"}}"#
+            r#"{"error":{"message":"status 500","type":"server_error","code":"internal_server_error"}}"#,
         );
-        assert_eq!(openai_body(400, " {\"a\":1} "), r#"{"a":1}"#);
-        // Recorded from Go v8.0.35 BuildErrorResponseBody, including its
-        // TestBuildErrorResponseBody_CompactsPrettyPrintedJSON input.
+        assert_json(openai_body(400, " {\"a\":1} "), r#"{"a":1}"#);
+        // JSON error details retain their values, including whitespace inside strings.
         for (text, want) in [
             (
                 "{\n  \"error\": {\n    \"code\": 500,\n    \"message\": \"Internal error encountered.\",\n    \"status\": \"INTERNAL\"\n  }\n}",
@@ -277,47 +283,47 @@ mod tests {
             ("{\"q\":\"a\\\" b\" , \"r\" : 1}", r#"{"q":"a\" b","r":1}"#),
             ("\"  spaced  \"", "\"  spaced  \""),
         ] {
-            assert_eq!(openai_body(502, text), want, "{text:?}");
+            assert_json(openai_body(502, text), want);
         }
-        assert_eq!(
+        assert_json(
             openai_body(422, "bad <x>"),
-            r#"{"error":{"message":"bad \u003cx\u003e","type":"invalid_request_error"}}"#
+            r#"{"error":{"message":"bad \u003cx\u003e","type":"invalid_request_error"}}"#,
         );
-        assert_eq!(
+        assert_json(
             openai_body(429, ""),
-            r#"{"error":{"message":"Too Many Requests","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#
+            r#"{"error":{"message":"Too Many Requests","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#,
         );
     }
 
     #[test]
-    fn claude_envelope_matches_go_detail_rules() {
-        assert_eq!(
+    fn claude_errors_expose_message_and_status_category() {
+        assert_json(
             claude_body(
                 429,
-                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+                r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
             ),
-            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#,
         );
-        assert_eq!(
+        assert_json(
             claude_body(400, r#"{"error":{"code":"bad_thing"}}"#),
-            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad_thing"}}"#
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad_thing"}}"#,
         );
-        assert_eq!(
+        assert_json(
             claude_body(529, r#"{"type":"error","message":"busy"}"#),
-            r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
         );
-        // Go: an empty upstream body becomes `status N` before formatting.
-        assert_eq!(
+        // A missing upstream detail retains the status context.
+        assert_json(
             claude_body(500, "status 500"),
-            r#"{"type":"error","error":{"type":"api_error","message":"status 500"}}"#
+            r#"{"type":"error","error":{"type":"api_error","message":"status 500"}}"#,
         );
-        assert_eq!(
+        assert_json(
             claude_body(502, "  "),
-            r#"{"type":"error","error":{"type":"api_error","message":"Bad Gateway"}}"#
+            r#"{"type":"error","error":{"type":"api_error","message":"Bad Gateway"}}"#,
         );
-        assert_eq!(
+        assert_json(
             claude_body(408, "stream closed"),
-            r#"{"type":"error","error":{"type":"timeout_error","message":"stream closed"}}"#
+            r#"{"type":"error","error":{"type":"timeout_error","message":"stream closed"}}"#,
         );
     }
 

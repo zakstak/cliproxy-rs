@@ -1,0 +1,24 @@
+config-version: 8
+api-keys:
+  claude:
+    - keys:
+        - api-key: ""
+        - api-key: fake-c1
+    - base-url: https://c.example
+      keys:
+        - api-key: fake-c2
+  codex:
+    - keys:
+        - api-key: fake-x0
+    - base-url: https://codex.example
+      keys:
+        - api-key: fake-x1
+        - api-key: fake-x2
+  xai:
+    - base-url: https://xai.example
+      keys:
+        - api-key: fake-xa1
+  meta:
+    - keys:
+        - api-key: dca:fake
+        - api-key: fake-m1

@@ -194,10 +194,6 @@ mod tests {
     use serde_json::Value;
     use std::time::Duration;
 
-    fn golden() -> Value {
-        serde_json::from_str(include_str!("../tests/fixtures/go_home_app_log.json")).unwrap()
-    }
-
     async fn pushed(home: &FakeHome, count: usize) -> Vec<String> {
         for _ in 0..200 {
             let pushes: Vec<String> = home
@@ -226,51 +222,69 @@ mod tests {
         (home, client)
     }
 
-    /// Go's forwarder, fed the same entries (zz_rustgolden_test.go in the reference):
-    /// the payload bytes, logrus level names, RFC3339Nano offsets and request IDs (Go
-    /// `TestHomeAppLogForwarder_ForwardsFormattedLogWhenBoundOwnerIsHealthy`, and
-    /// `TestHomeAppLogForwarder_OmitsPlaceholderRequestID` for the `--------` entry).
+    /// Log forwarding preserves the event instant and safe optional metadata.
     #[tokio::test]
-    async fn payloads_match_go() {
-        let golden = golden();
+    async fn app_log_payloads_preserve_line_level_instant_and_optional_request_id() {
         let (home, client) = home(":1\r\n").await;
         let forwarder = Forwarder::start(16);
         forwarder.bind(&client);
-        let entries = golden["entries"].as_array().unwrap();
-        for entry in entries {
-            let level: &'static str = match entry["level"].as_str().unwrap() {
-                "warning" => "warning",
-                "info" => "info",
-                "error" => "error",
-                "debug" => "debug",
-                "trace" => "trace",
-                other => panic!("{other}"),
-            };
-            let time = DateTime::parse_from_rfc3339(entry["time"].as_str().unwrap()).unwrap();
+        let entries = [
+            ("line <one>&\n", "info", "2026-10-03T09:01:02Z", "request-1"),
+            (
+                "warning\n",
+                "warning",
+                "2026-10-03T11:01:02.123456789+02:00",
+                " request-2 ",
+            ),
+            ("error\n", "error", "2026-10-03T09:01:02.12Z", "--------"),
+            ("debug\n", "debug", "2026-10-03T09:01:02Z", ""),
+            ("trace\n", "trace", "2026-10-03T04:01:02-05:00", "trace-id"),
+        ];
+        for (line, level, timestamp, request_id) in entries {
             forwarder.fire(
-                entry["line"].as_str().unwrap(),
+                line,
                 level,
-                time,
-                entry["request_id"].as_str().unwrap(),
+                DateTime::parse_from_rfc3339(timestamp).unwrap(),
+                request_id,
             );
         }
-        let got = pushed(&home, entries.len()).await;
-        let commands = home.commands();
-        let push = commands.iter().find(|c| c[0].eq_ignore_ascii_case("rpush")).unwrap();
-        assert_eq!(push[1], "app-log");
-        let want: Vec<&str> = entries.iter().map(|e| e["payload"].as_str().unwrap()).collect();
-        assert_eq!(got, want);
+        let pushed = pushed(&home, entries.len()).await;
+        for (raw, (line, level, timestamp, request_id)) in pushed.iter().zip(entries) {
+            let actual: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(actual["line"], line);
+            assert_eq!(actual["level"], level);
+            assert_eq!(
+                DateTime::parse_from_rfc3339(actual["timestamp"].as_str().unwrap()).unwrap(),
+                DateTime::parse_from_rfc3339(timestamp).unwrap()
+            );
+            if request_id.trim().is_empty() || request_id == "--------" {
+                assert!(actual.get("request_id").is_none());
+            } else {
+                assert_eq!(actual["request_id"], request_id.trim());
+            }
+        }
+        assert!(
+            home.commands()
+                .iter()
+                .filter(|c| c[0].eq_ignore_ascii_case("rpush"))
+                .all(|c| c[1] == "app-log")
+        );
         forwarder.stop().await;
     }
-
     #[test]
-    fn unsupported_matches_go() {
-        let golden = golden();
-        for (message, want) in golden["unsupported"].as_object().unwrap() {
-            assert_eq!(unsupported(message), want.as_bool().unwrap(), "{message:?}");
+    fn protocol_capability_errors_disable_forwarding_but_operational_errors_do_not() {
+        for detail in [
+            "ERR Unsupported Key: app-log",
+            "ERR unknown command 'RPUSH'",
+            "ERR unsupported command RPUSH",
+            "  UNKNOWN COMMAND  ",
+        ] {
+            assert!(unsupported(detail), "{detail}");
+        }
+        for detail in ["", "ERR denied", "connection refused", "request timed out"] {
+            assert!(!unsupported(detail), "{detail}");
         }
     }
-
     /// Go `TestHomeAppLogForwarder_RebindsOnlyToCurrentOwner`,
     /// `TestHomeAppLogForwarder_SkipsWhenBoundOwnerHeartbeatIsDown`,
     /// `TestHomeAppLogForwarder_UnboundNeverUsesGlobalFallbackClient` and

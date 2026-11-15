@@ -19,7 +19,8 @@ use super::*;
 use crate::realtime::relay::{Limiter, MediaRelay, Route};
 
 #[test]
-fn public_remote_ips_match_go() {
+// Product policy: Media endpoints exclude local/private addresses and use the ICE scheme defaults; session closure owns and closes every installed tunnel.
+fn remote_media_addresses_exclude_private_and_local_destinations() {
     for (ip, want) in [
         ("8.8.8.8", true),
         ("2001:4860::1", true),
@@ -325,7 +326,8 @@ async fn relays_audio_and_data_channel_between_peers() {
 
 /// Go's ICE URL parsing supplies default ports; webrtc-rs needs them explicit.
 #[test]
-fn ice_urls_get_go_default_ports() {
+// Product policy: Media endpoints exclude local/private addresses and use the ICE scheme defaults; session closure owns and closes every installed tunnel.
+fn ice_urls_apply_scheme_defaults_and_keep_explicit_ports() {
     assert_eq!(ice_url("stun:stun.example.org"), "stun:stun.example.org:3478");
     assert_eq!(ice_url("stun:stun.example.org:19302"), "stun:stun.example.org:19302");
     assert_eq!(
@@ -716,7 +718,7 @@ async fn proxied_credentials_relay_media_through_the_proxy() {
 #[tokio::test]
 async fn session_close_closes_unclaimed_tunnels() {
     let fixtures: serde_json::Value =
-        serde_json::from_str(include_str!("../../tests/fixtures/codex_live_tunnel_go.json")).unwrap();
+        serde_json::from_str(include_str!("../../tests/fixtures/tunnel_inputs.json")).unwrap();
     let case = fixtures["prepare"]
         .as_array()
         .unwrap()

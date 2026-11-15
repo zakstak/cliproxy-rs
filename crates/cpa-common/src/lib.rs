@@ -1,33 +1,6 @@
-//! Provider-neutral request helpers used by both translators and executors. Pure
-//! transforms only: no networking, no clocks, no global mutable state beyond what Go keeps
-//! (signature caches are passed in by the caller).
-//!
-//! Modules and their single owner while the port is in progress:
-//! - `thinking`: internal/thinking (suffix parsing, the canonical ApplyThinking pipeline,
-//!   validation, conversion, every provider applier under internal/thinking/provider).
-//! - `signature`: internal/signature (thought-signature detection, validation and
-//!   sanitizing for Claude, Gemini, GPT, Grok and Kimi).
-//! - `payload`: executor/helps/payload_helpers.go and codex_tool_schema.go (config payload
-//!   rules applied to the final provider body; owner: server).
-//! - `headers`: util/header_helpers.go (custom `header:*` attributes and `$Header`
-//!   references copied from the client request; owner: server).
-//! - `json`: Go-exact tidwall/gjson, tidwall/sjson and encoding/json behaviour, used by
-//!   every crate that edits JSON on the wire (owner: translators).
-//! - `rawjson`: the same port behind `&str` signatures, for the executors and the
-//!   Responses WebSocket handler (owner: translators).
-//! - `codex_client`: executor/helps/codex_multi_agent_v2.go (Codex-client request rewrites
-//!   shared by every executor that serves Codex clients; owner: Codex).
-//! - `codex_catalog`: the Codex client model catalog and store (client/codex/models,
-//!   registry/codex_client_models.go; owner: Codex).
-//! - `schema_refs`: util/gemini_schema.go `InlineLocalRefs` (local `$ref` inlining for tool
-//!   schemas; owner: xAI).
-//! - `session`: sdk/cliproxy/session (session identity, parent/child relationships and the
-//!   derived identity executors key provider sessions on; owner: server).
-//! - `gostr`: Go's `strings.ToLower`, `strings.EqualFold`, `strings.TrimSpace` and
-//!   `strconv.Quote` on Go's own Unicode tables (owner: Google).
-//!
-//! The proxy-aware HTTP client (executor/helps/proxy_helpers.go) touches the network and
-//! lives in cpa-exec instead.
+//! Shared request and response helpers for the supported client and provider formats.
+//! Transformations preserve untouched wire bytes. Tests use explicit behavior contracts
+//! and independent JSON models rather than another implementation's recorded output.
 
 pub mod codex_body;
 pub mod codex_catalog;
@@ -37,7 +10,7 @@ pub mod headers;
 pub mod idle;
 pub mod json;
 #[cfg(test)]
-mod json_go_vectors;
+mod json_edit_tests;
 pub mod payload;
 pub mod rawjson;
 pub mod schema;
@@ -45,41 +18,3 @@ pub mod schema_refs;
 pub mod session;
 pub mod signature;
 pub mod thinking;
-
-/// Calls recorded from Go's own test suites at v8.0.27, where the recorded thinking
-/// functions are unchanged since 6fecc6e, one JSON object per line
-/// (tests/reference/record/README.md).
-#[cfg(test)]
-pub(crate) fn go_calls() -> impl Iterator<Item = &'static str> {
-    use std::io::Read;
-    static CALLS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        let gz = include_bytes!("../tests/fixtures/go_calls.jsonl.gz");
-        let mut text = String::new();
-        flate2::read::GzDecoder::new(&gz[..]).read_to_string(&mut text).unwrap();
-        text
-    });
-    CALLS.lines()
-}
-
-/// A recorded Go string: plain JSON text, or `{"b64": ...}` for bytes that are not UTF-8.
-#[cfg(test)]
-pub(crate) fn recorded_bytes(v: &serde_json::Value) -> Vec<u8> {
-    use base64::Engine;
-    match v {
-        serde_json::Value::String(s) => s.as_bytes().to_vec(),
-        serde_json::Value::Object(m) if m.contains_key("b64") => base64::engine::general_purpose::STANDARD
-            .decode(m["b64"].as_str().unwrap())
-            .unwrap(),
-        other => panic!("not a recorded string: {other}"),
-    }
-}
-
-/// Encodes bytes the way the recorder does, for comparison with recorded outputs.
-#[cfg(test)]
-pub(crate) fn recorded_value(b: &[u8]) -> serde_json::Value {
-    use base64::Engine;
-    match std::str::from_utf8(b) {
-        Ok(s) => serde_json::Value::String(s.into()),
-        Err(_) => serde_json::json!({"b64": base64::engine::general_purpose::STANDARD.encode(b)}),
-    }
-}

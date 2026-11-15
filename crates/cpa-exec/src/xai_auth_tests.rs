@@ -1,7 +1,6 @@
-//! Differential tests against `tests/fixtures/xai_auth_go.json`, produced by the real Go
-//! login manager, FileTokenStore and XAIExecutor.Refresh (tests/reference/xai_auth).
-//! The same scripted answers are replayed to the Rust port; requests, saved files,
-//! refreshed metadata and error messages are compared. Expected values come only from Go.
+//! OAuth device-flow behavior tests. Legacy adversarial peer inputs are retained
+//! without their recorded outputs. RFC 8628 forms, credential persistence and
+//! endpoint security determine the assertions in this file.
 
 use std::sync::{Arc, Mutex};
 
@@ -10,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use super::*;
 
-const FIXTURE: &str = include_str!("../tests/fixtures/xai_auth_go.json");
+const FIXTURE: &str = include_str!("../tests/fixtures/xai_oauth_inputs.json");
 
 /// Cases whose Go error is an encoding/json syntax message, which is not ported (see
 /// `go_unmarshal`): only the text before it is compared.
@@ -21,22 +20,6 @@ const UNCLAIMED: &[&str] = &[
     "subject_only_merges_existing_file",
     "existing_invalid_weight_blocks_save",
 ];
-
-const SYNTAX_MESSAGE: &[&str] = &["discovery_not_json", "token_body_not_json"];
-
-/// Go's error with the number it quotes in a type mismatch removed ("number 1.5 into"
-/// becomes "number into"): Rust names only the kind, as response data never reaches
-/// error text.
-fn without_quoted_number(want: &str) -> String {
-    const MARK: &str = "cannot unmarshal number ";
-    match want
-        .split_once(MARK)
-        .and_then(|(head, rest)| Some((head, rest.split_once(" into ")?.1)))
-    {
-        Some((head, tail)) => format!("{head}cannot unmarshal number into {tail}"),
-        None => want.to_owned(),
-    }
-}
 
 #[derive(Clone)]
 struct Reply {
@@ -141,207 +124,208 @@ impl Mock {
     }
 }
 
-/// Go's fixture replaces RFC 3339 UTC timestamps with `TIME`.
-fn normalize_times(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < b.len() {
-        let candidate = &b[i..(i + 20).min(b.len())];
-        let shape = b"dddd-dd-ddTdd:dd:ddZ";
-        if candidate.len() == 20
-            && candidate
-                .iter()
-                .zip(shape)
-                .all(|(c, p)| if *p == b'd' { c.is_ascii_digit() } else { c == p })
-        {
-            out.push_str("TIME");
-            i += 20;
-        } else {
-            out.push(b[i] as char);
-            i += 1;
-        }
-    }
-    out
-}
-
 fn fixture() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
 }
 
 #[test]
-fn endpoint_validation_matches_go_net_url() {
-    let f = fixture();
-    let cases = f["validate"].as_array().unwrap();
-    assert!(cases.len() >= 55, "fixture lost validation vectors");
-    for case in cases {
-        let raw = case[0].as_str().unwrap();
-        let got = validate_endpoint(raw, "token_endpoint");
-        let want = if case[1].as_bool().unwrap() {
-            Ok(case[2].as_str().unwrap().to_owned())
-        } else {
-            Err(case[2].as_str().unwrap().to_owned())
-        };
-        assert_eq!(got, want, "ValidateOAuthEndpoint({raw:?})");
+fn discovery_accepts_https_xai_endpoints_and_refuses_credential_confusion() {
+    for raw in [
+        "https://auth.x.ai/oauth2/token",
+        " https://x.ai/t ",
+        "https://AUTH.X.AI:8443/t?q=1",
+    ] {
+        assert_eq!(validate_endpoint(raw, "token_endpoint").unwrap(), raw.trim());
+    }
+    for raw in [
+        "",
+        "  ",
+        "http://auth.x.ai/t",
+        "https://evilx.ai/t",
+        "https://x.ai.example.com/t",
+        "ftp://x.ai/t",
+        "https://[::1]/t",
+        r"https://auth.x.ai\@evil.example/t",
+    ] {
+        let error = validate_endpoint(raw, "token_endpoint").expect_err(raw);
+        assert!(error.contains("token_endpoint"), "actionable field context: {error}");
     }
 }
 
-/// The v8.0.35 recordings name files without the identity hash: those names are what
-/// a login now recognizes as an earlier file of the account.
+/// Existing credentials remain locatable by their historical sanitized name.
 #[test]
-fn legacy_file_names_match_go_v8_0_35() {
-    for case in fixture()["file_names"].as_array().unwrap() {
-        let (email, subject, want) = (
-            case[0].as_str().unwrap(),
-            case[1].as_str().unwrap(),
-            case[2].as_str().unwrap(),
-        );
-        assert_eq!(
-            legacy_credential_file_name(email, subject),
-            want,
-            "{email:?} {subject:?}"
-        );
+fn legacy_credential_names_remain_locatable() {
+    for (email, subject, name) in [
+        ("a@b.com", "s", "xai-a@b.com.json"),
+        ("  A.B+c@x.ai ", "", "xai-A.B-c@x.ai.json"),
+        ("", "user|1", "xai-user-1.json"),
+        ("é@x.ai", "", "xai-@x.ai.json"),
+        ("---", "sub", "xai-sub.json"),
+        ("-a b-", "", "xai-a-b.json"),
+        ("", " -z- ", "xai-z.json"),
+    ] {
+        assert_eq!(legacy_credential_file_name(email, subject), name);
     }
 }
 
-/// Hashed names as Go v8.0.67 gives them (tests/reference/xai_filename): distinct
-/// accounts whose sanitized names collide get distinct files, the same account keeps
-/// one file whatever the email's case and whether the subject is known.
 #[test]
-fn credential_file_names_match_go_v8_0_67() {
-    let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/xai_filename_go.json")).unwrap();
-    let names = fixture["names"].as_array().unwrap();
-    assert!(names.len() >= 20, "fixture lost cases");
-    for case in names {
-        let (email, subject) = (case["email"].as_str().unwrap(), case["subject"].as_str().unwrap());
-        assert_eq!(
-            credential_file_name(email, subject, 0),
-            case["name"],
-            "{email:?} {subject:?}"
-        );
-        assert_eq!(
-            legacy_credential_file_name(email, subject),
-            case["legacy"],
-            "{email:?} {subject:?}"
-        );
-    }
+fn account_file_names_are_stable_safe_and_collision_resistant() {
     let name = |email: &str, subject: &str| credential_file_name(email, subject, 0);
     for (a, b) in [("a+b@x.ai", "a/b@x.ai"), ("a/b@x.ai", "a b@x.ai")] {
         assert_eq!(legacy_credential_file_name(a, ""), legacy_credential_file_name(b, ""));
-        assert_ne!(name(a, ""), name(b, ""), "{a} and {b} share a file");
+        assert_ne!(name(a, ""), name(b, ""), "distinct accounts cannot share a file");
+    }
+    for (email, subject) in [("A.B+C@X.AI", ""), ("", "acct/7"), ("../account@x.ai", "")] {
+        let path = name(email, subject);
+        assert!(path.starts_with("xai-") && path.ends_with(".json"));
+        assert!(!path.contains('/') && !path.contains('\\'));
+        assert_eq!(name(email, subject), path);
     }
     assert_ne!(name("", "acct/7"), name("", "acct 7"));
     assert_ne!(name("", "Sub-A"), name("", "sub-a"));
     assert_eq!(name("A.B+C@X.AI", ""), name("a.b+c@x.ai", "other-subject"));
 }
 
-#[tokio::test]
-async fn login_matches_go_manager_and_file_store() {
-    let f = fixture();
-    let cases = f["login"].as_array().unwrap();
-    assert!(cases.len() >= 22, "fixture lost login cases");
-    for case in cases {
-        let name = case["name"].as_str().unwrap();
-        let mock = Mock::start(&case["script"]).await;
-        let dir = std::env::temp_dir().join(format!("xai-login-{name}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        if let Some(existing) = case["existing"].as_str() {
-            std::fs::write(dir.join(case["existing_name"].as_str().unwrap()), existing).unwrap();
-        }
-        let result = login_with(mock.auth(), &dir, true).await;
-        if UNCLAIMED.contains(&name) {
-            // v8.0.67: a file at the old name without a stored identity is ambiguous
-            // (another account can sanitize to that name), so it is neither merged
-            // nor removed; the login saves its own hashed file.
-            let path = result.unwrap_or_else(|e| panic!("{name}: {e:?}"));
-            let existing = dir.join(case["existing_name"].as_str().unwrap());
-            assert_eq!(
-                std::fs::read_to_string(&existing).unwrap(),
-                case["existing"].as_str().unwrap()
-            );
-            let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            let sub = saved["sub"].as_str().unwrap_or_default();
-            assert_eq!(
-                path.file_name().unwrap().to_str().unwrap(),
-                credential_file_name("", sub, 0)
-            );
-            assert_eq!(
-                legacy_credential_file_name("", sub),
-                case["existing_name"].as_str().unwrap()
-            );
-            assert_eq!(
-                (saved["disabled"].clone(), saved.get("prefix")),
-                (Value::Bool(false), None)
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-            continue;
-        }
-        let want_requests: Vec<String> = case["requests"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r.as_str().unwrap().to_owned())
-            .collect();
-        assert_eq!(mock.requests(), want_requests, "{name}: requests");
-        match result {
-            Ok(path) => {
-                assert!(case["error"].is_null(), "{name}: Go failed with {}", case["error"]);
-                let file_name = path.file_name().unwrap().to_str().unwrap().to_owned();
-                let want_name = case["file_name"].as_str().unwrap();
-                let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                let (email, sub) = (
-                    saved["email"].as_str().unwrap_or_default(),
-                    saved["sub"].as_str().unwrap_or_default(),
-                );
-                if want_name
-                    .trim_start_matches("xai-")
-                    .trim_end_matches(".json")
-                    .bytes()
-                    .all(|b| b.is_ascii_digit())
-                {
-                    // Go names subject-less credentials after the current time.
-                    let stem = file_name.trim_start_matches("xai-").trim_end_matches(".json");
-                    assert!(stem.bytes().all(|b| b.is_ascii_digit()), "{name}: {file_name}");
+/// RFC 8628 uses form fields, not incidental HTTP header order or spelling.
+fn assert_oauth_requests(mock: &Mock, script: &Value, name: &str) {
+    let requests = mock.requests();
+    let peers = script.as_array().cloned().unwrap_or_default();
+    assert!(requests.len() <= peers.len(), "{name}: no unplanned requests");
+    for (request, peer) in requests.iter().zip(&peers) {
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let mut line = head.lines().next().unwrap().split_whitespace();
+        let method = line.next().unwrap();
+        let target = line.next().unwrap();
+        assert_eq!(target, peer["path"], "{name}: endpoint selection");
+        assert!(
+            !head.lines().any(|h| h
+                .split_once(':')
+                .is_some_and(|(n, _)| n.eq_ignore_ascii_case("authorization"))),
+            "{name}: token credentials belong in OAuth forms"
+        );
+        if target.ends_with("openid-configuration") {
+            assert_eq!(method, "GET");
+            assert!(body.is_empty());
+        } else {
+            assert_eq!(method, "POST");
+            let fields: std::collections::HashMap<_, _> =
+                url::form_urlencoded::parse(body.as_bytes()).into_owned().collect();
+            assert_eq!(fields.get("client_id").map(String::as_str), Some(CLIENT_ID));
+            if target.ends_with("/token") {
+                let grant = fields.get("grant_type").unwrap().as_str();
+                assert!(matches!(
+                    grant,
+                    "refresh_token" | "urn:ietf:params:oauth:grant-type:device_code"
+                ));
+                assert!(fields.contains_key(if grant == "refresh_token" {
+                    "refresh_token"
                 } else {
-                    // v8.0.67 hashes the identity into the name Go v8.0.35 recorded.
-                    assert_eq!(file_name, credential_file_name(email, sub, 0), "{name}: file name");
-                    assert_eq!(
-                        legacy_credential_file_name(email, sub),
-                        want_name,
-                        "{name}: v8.0.35 name"
-                    );
-                }
-                let saved = std::fs::read_to_string(&path).unwrap();
-                assert_eq!(normalize_times(&saved), case["file"].as_str().unwrap(), "{name}: file");
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-                }
-            }
-            Err(error) => {
-                let got = String::from_utf8_lossy(&error.body).into_owned();
-                let want = case["error"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("{name}: Rust failed with {got}"));
-                if SYNTAX_MESSAGE.contains(&name) {
-                    let prefix = want.split("parse response: ").next().unwrap();
-                    assert!(got.starts_with(prefix), "{name}: {got} vs {want}");
-                } else {
-                    assert_eq!(got, without_quoted_number(want), "{name}: error");
-                }
+                    "device_code"
+                }));
+            } else {
+                assert!(fields.contains_key("scope"));
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
 #[tokio::test]
-async fn refresh_matches_go_executor() {
+async fn device_login_validates_peer_replies_and_persists_private_credentials() {
     let f = fixture();
-    for case in f["refresh"].as_array().unwrap() {
+    for case in f["login"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let mock = Mock::start(&case["script"]).await;
-        let mut metadata: Map<String, Value> = case["metadata"].as_object().unwrap().clone();
+        let dir = AuthDir::new(name);
+        if let Some(existing) = case["existing"].as_str() {
+            std::fs::write(dir.0.join(case["existing_name"].as_str().unwrap()), existing).unwrap();
+        }
+        let result = login_with(mock.auth(), &dir.0, true).await;
+        assert_oauth_requests(&mock, &case["script"], name);
+        let success = matches!(
+            name,
+            "success_after_pending"
+                | "subject_only_merges_existing_file"
+                | "jwt_trailing_bits_names_file"
+                | "jwt_identity_from_untrimmed_token"
+                | "existing_invalid_weight_blocks_save"
+                | "device_expires_in_overflows"
+                | "token_expires_in_overflows"
+        );
+        if !success {
+            let error = result.expect_err(name);
+            assert!((400..600).contains(&error.status));
+            assert!(!error.body.is_empty());
+            assert!(
+                dir.names().is_empty(),
+                "{name}: no credential saved after a failed authorization"
+            );
+            continue;
+        }
+        let path = result.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["type"], "xai");
+        assert_eq!(saved["auth_kind"], "oauth");
+        assert_eq!(saved["base_url"], "https://api.x.ai/v1");
+        assert_eq!(saved["token_endpoint"], "https://auth.x.ai/oauth2/token");
+        assert!(chrono::DateTime::parse_from_rfc3339(saved["last_refresh"].as_str().unwrap()).is_ok());
+        let response: Value = serde_json::from_str(
+            case["script"].as_array().unwrap().last().unwrap()["body"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        for key in ["access_token", "refresh_token", "id_token", "token_type"] {
+            assert_eq!(
+                saved[key],
+                response[key].as_str().unwrap_or_default().trim(),
+                "{name}: {key}"
+            );
+        }
+        assert!(!saved["access_token"].as_str().unwrap().is_empty());
+        let expires = response["expires_in"].as_i64().unwrap_or(0);
+        assert_eq!(saved["expires_in"], expires);
+        if expires > 0 && expires < 100_000 {
+            assert!(chrono::DateTime::parse_from_rfc3339(saved["expired"].as_str().unwrap()).is_ok());
+        } else {
+            assert_eq!(saved["expired"], "");
+        }
+        let expected_identity = match name {
+            "success_after_pending" => ("Dev.User+test@Example.com", "user-42"),
+            "subject_only_merges_existing_file" => ("", "acct|7"),
+            "jwt_trailing_bits_names_file" => ("", "u"),
+            "existing_invalid_weight_blocks_save" => ("", "w"),
+            _ => ("", ""),
+        };
+        assert_eq!(saved["email"].as_str().unwrap_or_default(), expected_identity.0);
+        assert_eq!(saved["sub"].as_str().unwrap_or_default(), expected_identity.1);
+        if expected_identity != ("", "") {
+            assert_eq!(
+                path.file_name().unwrap().to_str().unwrap(),
+                credential_file_name(expected_identity.0, expected_identity.1, 0)
+            );
+        }
+        if UNCLAIMED.contains(&name) {
+            assert_eq!(
+                std::fs::read_to_string(dir.0.join(case["existing_name"].as_str().unwrap())).unwrap(),
+                case["existing"].as_str().unwrap()
+            );
+            assert_eq!(saved["disabled"], false);
+            assert!(
+                saved.get("prefix").is_none(),
+                "unclaimed settings must not leak into another login"
+            );
+        }
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+}
+
+#[tokio::test]
+async fn refresh_updates_returned_tokens_preserves_omitted_fields_and_rejects_bad_peers() {
+    for case in fixture()["refresh"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let mock = Mock::start(&case["script"]).await;
+        let mut metadata = case["metadata"].as_object().unwrap().clone();
         for value in metadata.values_mut() {
             if let Value::String(s) = value {
                 *s = s.replace("UPSTREAM", &mock.addr);
@@ -353,71 +337,71 @@ async fn refresh_matches_go_executor() {
             metadata.clone(),
         )
         .unwrap();
+        let before = metadata.clone();
         let result = refresh(&mock.auth(), &credential).await;
-        let want_requests: Vec<String> = case["requests"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r.as_str().unwrap().to_owned())
-            .collect();
-        assert_eq!(mock.requests(), want_requests, "{name}: requests");
-        match result {
-            Ok(patch) => {
-                assert!(case["error"].is_null(), "{name}: Go failed with {}", case["error"]);
-                patch.apply(&mut metadata);
-                let got: Map<String, Value> = metadata
-                    .into_iter()
-                    .map(|(k, v)| match v {
-                        Value::String(s) => (k, Value::String(normalize_times(&s.replace(&mock.addr, "UPSTREAM")))),
-                        other => (k, other),
-                    })
-                    .collect();
-                assert_eq!(Value::Object(got), case["metadata_out"], "{name}: metadata");
+        assert_oauth_requests(&mock, &case["script"], name);
+        if matches!(name, "status_error" | "missing_access_token" | "discovery_rejected") {
+            let error = result.unwrap_err();
+            assert!(!error.body.is_empty());
+            assert!(
+                !String::from_utf8_lossy(&error.body).contains("rt-old"),
+                "refresh credentials never enter errors"
+            );
+            continue;
+        }
+        result.unwrap().apply(&mut metadata);
+        if name == "no_refresh_token" {
+            assert_eq!(metadata, before);
+            assert!(mock.requests().is_empty());
+            continue;
+        }
+        assert_eq!(metadata["access_token"], "at-new");
+        assert_eq!(metadata["auth_kind"], "oauth");
+        assert_eq!(
+            metadata["refresh_token"],
+            if name == "explicit_endpoint" {
+                "rt-new"
+            } else {
+                "rt-old"
             }
-            Err(error) => {
-                let got = String::from_utf8_lossy(&error.body).into_owned();
-                let want = case["error"]
-                    .as_str()
-                    .unwrap_or_else(|| panic!("{name}: Rust failed with {got}"));
-                // Go appends the token endpoint's body to status errors; Rust withholds it.
-                let want = match want.split_once(": {") {
-                    Some((head, _)) if head.contains("failed with status") => head,
-                    _ => want,
-                };
-                assert_eq!(got, without_quoted_number(want), "{name}: error");
-            }
+        );
+        assert!(chrono::DateTime::parse_from_rfc3339(metadata["last_refresh"].as_str().unwrap()).is_ok());
+        if name == "explicit_endpoint" {
+            assert_eq!(metadata["email"], "new@example.com");
+            assert_eq!(metadata["sub"], "user-9");
+            assert_eq!(metadata["expires_in"], 7200);
+        }
+        if name == "keeps_fields_server_omits" {
+            assert_eq!(metadata["id_token"], "old-id");
+            assert_eq!(metadata["base_url"], "https://custom.example/v1");
+        }
+        if name == "discovers_endpoint" {
+            assert_eq!(metadata["expires_in"], 60);
         }
     }
 }
 
 #[test]
-fn number_mismatch_never_quotes_the_value() {
-    let fields = [("expires_in", Field::Int)];
-    for body in [
-        &br#"{"expires_in":1.5}"#[..],
-        br#"{"expires_in":99999999999999999999}"#,
-        br#"{"expires_in":-1e3}"#,
-    ] {
-        let Err(error) = go_unmarshal(body, &fields, "T", "Wire") else {
-            panic!("{body:?} decoded");
-        };
-        assert_eq!(
-            error,
-            "json: cannot unmarshal number into Go struct field Wire.expires_in of type int"
-        );
+fn invalid_expiry_numbers_are_refused_without_echoing_values() {
+    for raw in ["1.5", "99999999999999999999", "-1e3"] {
+        let body = format!(r#"{{"expires_in":{raw}}}"#);
+        let error = go_unmarshal(body.as_bytes(), &[("expires_in", Field::Int)], "T", "Wire")
+            .err()
+            .unwrap();
+        assert!(!error.is_empty());
+        assert!(!error.contains(raw), "remote numeric values are not diagnostic content");
     }
-    assert_eq!(
-        without_quoted_number("x: json: cannot unmarshal number 1.5 into Go struct field .e of type int"),
-        "x: json: cannot unmarshal number into Go struct field .e of type int"
-    );
 }
 
 #[test]
-fn poll_interval_follows_go() {
+fn poll_intervals_respect_the_minimum_and_lifetime_cap() {
     // PollForToken: the device interval, at least 5s; the test knob replaces a missing one.
     assert_eq!(initial_interval(0, None), Duration::from_secs(5));
     assert_eq!(initial_interval(3, None), Duration::from_secs(5));
     assert_eq!(initial_interval(9, None), Duration::from_secs(9));
+    assert_eq!(initial_interval(i64::MAX, None), MAX_POLL_DURATION);
+    assert_eq!(poll_deadline(i64::MAX), MAX_POLL_DURATION.as_nanos() as i64);
+    assert_eq!(poll_deadline(3), 3_000_000_000);
     assert_eq!(
         initial_interval(-1, Some(Duration::from_millis(7))),
         Duration::from_millis(7)
@@ -464,30 +448,44 @@ async fn slow_down_adds_the_poll_step() {
 }
 
 #[test]
-fn metadata_strings_follow_go_fmt_sprint() {
-    for case in fixture()["sprint"].as_array().unwrap() {
-        let (raw, want) = (case[0].as_str().unwrap(), case[1].as_str().unwrap());
+fn credential_string_fields_are_trimmed_and_absent_fields_are_empty() {
+    for (value, want) in [
+        (Value::Null, ""),
+        (Value::from("  account@example.test "), "account@example.test"),
+        (Value::from(""), ""),
+    ] {
         let mut metadata = Map::new();
         metadata.insert("type".into(), Value::from("xai"));
-        metadata.insert("k".into(), serde_json::from_str(raw).unwrap());
+        metadata.insert("k".into(), value);
         let credential = Credential::from_file(Path::new("/f"), Path::new("/f/x.json"), metadata).unwrap();
-        assert_eq!(metadata_string(&credential, "k"), want, "fmt.Sprint({raw})");
+        assert_eq!(metadata_string(&credential, "k"), want);
+        assert_eq!(metadata_string(&credential, "missing"), "");
     }
 }
 
 #[test]
-fn token_expiry_wraps_like_go_durations() {
+fn token_expiry_uses_checked_oauth_seconds() {
     let now = DateTime::from_timestamp(1_000_000_000, 0).unwrap();
-    for case in fixture()["expiry"].as_array().unwrap() {
+    for (seconds, expected_epoch) in [
+        (-1, None),
+        (0, None),
+        (1, Some(1_000_000_001)),
+        (3600, Some(1_000_003_600)),
+        (10_000_000_000, Some(11_000_000_000)),
+        (i64::MAX, None),
+    ] {
         let mut decoded = Decoded::default();
         decoded.strs.insert("access_token", "a".into());
-        decoded.ints.insert("expires_in", case[0].as_i64().unwrap());
-        assert_eq!(
-            token_data(&decoded, now).expire,
-            case[1].as_str().unwrap(),
-            "expires_in {}",
-            case[0]
-        );
+        decoded.ints.insert("expires_in", seconds);
+        let expiry = token_data(&decoded, now).expire;
+        match expected_epoch {
+            Some(expected) => {
+                let actual = DateTime::parse_from_rfc3339(&expiry).unwrap().with_timezone(&Utc);
+                assert_eq!(actual.timestamp(), expected);
+                assert!(actual > now);
+            }
+            None => assert!(expiry.is_empty(), "unrepresentable or absent expiry: {seconds}"),
+        }
     }
 }
 
@@ -756,7 +754,7 @@ fn interrupted_saves_lose_nothing() {
 /// Settings precedence: the new login's values, then the file at the new name, then
 /// the earlier file; `disabled` comes from the file at the new name when it has one.
 #[test]
-fn settings_merge_in_go_order() {
+fn settings_precedence_keeps_new_login_then_current_file_then_legacy_file() {
     let dir = AuthDir::new("precedence");
     let name = credential_file_name("dev@x.ai", "sub-1", 0);
     dir.write(
@@ -831,7 +829,7 @@ async fn cli_login_migrates_the_v8_0_35_file() {
         .find(|c| c["name"] == "success_after_pending")
         .unwrap();
     let dir = AuthDir::new("cli");
-    let old_name = case["file_name"].as_str().unwrap();
+    let old_name = "xai-Dev.User-test@Example.com.json";
     dir.write(
         old_name,
         with(

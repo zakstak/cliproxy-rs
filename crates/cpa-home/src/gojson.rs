@@ -88,20 +88,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn matches_go_marshal() {
-        let mut map = BTreeMap::new();
-        map.insert("b".to_owned(), "2".to_owned());
-        map.insert("a".to_owned(), "<1>".to_owned());
-        let json = Object::new()
+    fn object_writer_preserves_json_values_and_omits_empty_options() {
+        let map = BTreeMap::from([("b".to_owned(), "2".to_owned()), ("a".to_owned(), "<1>".to_owned())]);
+        let encoded = Object::new()
             .str("s", "x&y")
             .str_opt("empty", "")
             .int("n", -3)
             .map_opt("m", &map)
             .strs("l", &["\u{2028}".to_owned()])
             .finish();
+        // Home consumes JSON values. Escaping and map iteration order are not wire requirements.
+        let actual: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(
-            String::from_utf8(json).unwrap(),
-            r#"{"s":"x\u0026y","n":-3,"m":{"a":"\u003c1\u003e","b":"2"},"l":["\u2028"]}"#
+            actual,
+            serde_json::json!({"s":"x&y", "n":-3, "m":{"a":"<1>","b":"2"}, "l":["\u{2028}"]})
         );
+        assert!(actual.get("empty").is_none());
     }
 }

@@ -302,6 +302,11 @@ pub(crate) fn convert(
     let choice = root.get("tool_choice");
     match choice.kind {
         Kind::String => match &*choice.s {
+            // Anthropic Messages tool_choice:none disables tools. Preserve the
+            // Responses client's intent rather than reverting to provider auto.
+            b"none" => {
+                gj::set_raw(&mut out, "tool_choice", r#"{"type":"none"}"#);
+            }
             b"auto" => {
                 gj::set_raw(&mut out, "tool_choice", r#"{"type":"auto"}"#);
             }

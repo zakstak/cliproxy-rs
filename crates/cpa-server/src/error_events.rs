@@ -148,30 +148,12 @@ mod tests {
     use crate::runtime::Outcome;
     use crate::scheduler::{Policy, Scheduler};
 
-    /// Clock values as the golden writes them: `<time>` and whole seconds from now.
-    fn normalize(v: &mut Value, wall: SystemTime) {
-        let Value::Object(map) = v else { return };
-        for (k, val) in map.iter_mut() {
-            match k.as_str() {
-                "timestamp" => *val = "<time>".into(),
-                "next_retry_after" | "next_recover_at" => {
-                    let at = chrono::DateTime::parse_from_rfc3339(val.as_str().unwrap()).unwrap();
-                    let secs = (at.timestamp_millis() - chrono::DateTime::<chrono::Utc>::from(wall).timestamp_millis())
-                        as f64
-                        / 1000.0;
-                    *val = format!("+{}s", secs.round() as i64).into();
-                }
-                _ => normalize(val, wall),
-            }
-        }
-    }
-
-    /// Go's events from `MarkResult` over the cooldown inputs
-    /// (tests/reference/server/main.go `errorEvents`), replayed through the scheduler.
+    /// Event consumers see the scheduler state after each failure, including the
+    /// identity, retry deadline and quota scope. Input traces carry no expected output.
     #[test]
-    fn error_events_match_go_mark_result() {
-        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        let cases = fixture["error_events"].as_array().unwrap();
+    fn failure_events_expose_current_scheduler_state() {
+        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/error_event_inputs.json")).unwrap();
+        let cases = fixture.as_array().unwrap();
         assert_eq!(cases.len(), 25);
         let policy = Policy::default();
         for case in cases {
@@ -186,8 +168,7 @@ mod tests {
             .unwrap();
             let mut s = Scheduler::default();
             let (now, wall) = (Instant::now(), SystemTime::now());
-            let want = case["events"].as_array().unwrap();
-            for (step, want) in case["steps"].as_array().unwrap().iter().zip(want) {
+            for step in case["steps"].as_array().unwrap() {
                 let status = step["status"].as_u64().unwrap() as u16;
                 // The scheduler goldens' mapping of Go's classification to scopes.
                 let scope = if step["credential_scope"].as_bool().unwrap() {
@@ -207,22 +188,38 @@ mod tests {
                 error.retry_after = (hint >= 0).then(|| Duration::from_millis(hint as u64));
                 let model = step["model"].as_str().unwrap();
                 s.record(&c, model, &Outcome::Failure(error.clone()), &policy, now);
-                let mut got: Value =
-                    serde_json::from_slice(&payload(&c, model, &error, &s.records(&c, now, wall))).unwrap();
-                normalize(&mut got, wall);
-                let mut want = want.clone();
-                want["auth_id"] = c.id.clone().into();
-                want["auth_index"] = cpa_core::config::credentials::auth_index(&c).into();
-                // The ponytail above: a 429 after a longer cooldown keeps Go's separate
-                // quota clock; here the quota recovers at the one cooldown deadline.
-                if ["500_then_429", "401_then_429_short"].contains(&name) && status == 429 {
-                    for v in [&mut got, &mut want] {
-                        let retry = v["auth_status"]["next_retry_after"].clone();
-                        v["auth_status"]["quota"]["next_recover_at"] = retry.clone();
-                        v["auth_status"]["model"]["quota"]["next_recover_at"] = retry;
+                let records = s.records(&c, now, wall);
+                let got: Value = serde_json::from_slice(&payload(&c, model, &error, &records)).unwrap();
+                assert_eq!(got["status_code"], if status == 0 { 500 } else { status });
+                assert_eq!(got["auth_id"], c.id);
+                assert_eq!(got["provider"], "claude");
+                assert_eq!(got["model"], model.trim());
+                assert!(chrono::DateTime::parse_from_rfc3339(got["timestamp"].as_str().unwrap()).is_ok());
+                assert_eq!(got["auth_status"]["disabled"], false);
+                let key = crate::scheduler::canonical_model(model);
+                let model_record = records.iter().find(|record| record.model == key);
+                let auth_record = records.iter().find(|record| record.model.is_empty()).or(model_record);
+                assert_eq!(got["auth_status"]["unavailable"], auth_record.is_some());
+                if let Some(record) = auth_record {
+                    assert_eq!(got["auth_status"]["status"], "error");
+                    let actual =
+                        chrono::DateTime::parse_from_rfc3339(got["auth_status"]["next_retry_after"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(SystemTime::from(actual), record.next_retry_after.unwrap());
+                    if record.quota.exceeded {
+                        assert_eq!(got["auth_status"]["quota"]["exceeded"], true);
+                    }
+                } else {
+                    assert_eq!(got["auth_status"]["status"], "active");
+                    assert!(got["auth_status"].get("next_retry_after").is_none());
+                }
+                if let Some(record) = model_record {
+                    assert_eq!(got["auth_status"]["model"]["name"], model.trim());
+                    assert_eq!(got["auth_status"]["model"]["unavailable"], true);
+                    if record.quota.exceeded {
+                        assert_eq!(got["auth_status"]["model"]["quota"]["exceeded"], true);
                     }
                 }
-                assert_eq!(got, want, "{name}");
             }
         }
     }

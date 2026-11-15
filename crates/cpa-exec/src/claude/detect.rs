@@ -747,7 +747,7 @@ mod tests {
     /// such as the measured 2.1.280 title helper, stay confirmed with their own versions,
     /// so the stabilized profile does not cloak them.
     #[test]
-    fn stabilized_profiles_keep_go_detection() {
+    fn stabilized_profiles_require_the_supported_native_identity() {
         let mut s = Settings::default();
         s.header_defaults.stabilize_device_profile = true;
         let body = format!(

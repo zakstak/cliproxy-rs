@@ -237,27 +237,57 @@ mod tests {
 
     /// Inputs and results recorded from godotenv.Unmarshal (main_fixture_test.go).
     #[test]
-    fn parses_like_godotenv() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/discovery_main_go.json")).unwrap();
-        let cases = fixture["dotenv"].as_array().unwrap();
-        assert!(cases.len() > 20);
-        for case in cases {
-            let input = case["in"].as_str().unwrap();
-            match parse(input) {
-                Ok(vars) => {
-                    let got: std::collections::BTreeMap<_, _> = vars.into_iter().collect();
-                    let want: std::collections::BTreeMap<String, String> =
-                        serde_json::from_value(case["out"].clone()).unwrap_or_default();
-                    assert_eq!(
-                        case["err"].as_str(),
-                        Some(""),
-                        "{input:?}: Go failed, Rust parsed {got:?}"
-                    );
-                    assert_eq!(got, want, "{input:?}");
-                }
-                Err(e) => assert_eq!(e, case["err"].as_str().unwrap(), "{input:?}"),
-            }
+    fn dotenv_supports_quoting_comments_prior_key_expansion_and_atomic_refusal() {
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            ("", &[]),
+            ("# comment\n", &[]),
+            ("A=one", &[("A", "one")]),
+            ("A=one\r\nB=two\r\n", &[("A", "one"), ("B", "two")]),
+            ("export A=one", &[("A", "one")]),
+            ("A = one ", &[("A", "one")]),
+            ("A: one", &[("A", "one")]),
+            ("A='one two'", &[("A", "one two")]),
+            ("A=\"one two\"", &[("A", "one two")]),
+            ("A=one # comment", &[("A", "one")]),
+            ("A=one#literal", &[("A", "one#literal")]),
+            ("A='literal # text'", &[("A", "literal # text")]),
+            ("A=\"line\\nbreak\"", &[("A", "line\nbreak")]),
+            ("A=\"line\\rreturn\"", &[("A", "line\rreturn")]),
+            ("A='literal\\n'", &[("A", "literal\\n")]),
+            ("A=one\nB=$A", &[("A", "one"), ("B", "one")]),
+            ("A=one\nB=${A}/two", &[("A", "one"), ("B", "one/two")]),
+            ("A=one\nB='$A'", &[("A", "one"), ("B", "$A")]),
+            ("A=one\nB=\"$A\"", &[("A", "one"), ("B", "one")]),
+            ("A=$UNDEFINED", &[("A", "")]),
+            ("A=one\nA=two\nB=$A", &[("A", "two"), ("B", "two")]),
+            (
+                "UNDER_SCORE=value\nA.B=value",
+                &[("UNDER_SCORE", "value"), ("A.B", "value")],
+            ),
+            ("A=", &[("A", "")]),
+            ("A=''\nB=\"\"", &[("A", ""), ("B", "")]),
+        ];
+        for (input, expected) in cases {
+            let actual = parse(input).unwrap();
+            assert_eq!(
+                actual,
+                expected
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect::<Vec<_>>(),
+                "{input:?}"
+            );
+        }
+        for input in [
+            "A='unterminated",
+            "A=\"unterminated",
+            "BAD-KEY=value",
+            "A=valid\nB='unterminated",
+        ] {
+            assert!(
+                parse(input).is_err(),
+                "{input:?}: an invalid file produces no partial variable map"
+            );
         }
     }
 }

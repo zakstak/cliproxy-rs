@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_go_redis_pubsub_shapes() {
+    fn resp_pubsub_decodes_subscription_and_message_variants() {
         assert_eq!(
             parse_event(Value::Array(vec![bulk("subscribe"), bulk("config"), Value::Int(1)])).unwrap(),
             Event::Subscription {

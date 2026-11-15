@@ -5,7 +5,7 @@
 //! field tags exactly, else case-insensitively (Go's fold, including `ſ` and the Kelvin
 //! sign); later duplicates win; `null` leaves a field unchanged; a value of the wrong
 //! type is skipped, decoding continues, and the first such error is returned. Unknown
-//! keys are ignored. Expected values come from tests/device_fixtures/meta/decode.json.
+//! keys are ignored. Tests specify typed response fields and invalid-type refusal directly.
 
 use cpa_common::json::{self as gj, Kind};
 

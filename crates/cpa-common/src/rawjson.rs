@@ -250,72 +250,43 @@ pub fn string(json: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The reader semantics the executors and the Responses WebSocket handler rely on
-    /// since the third-party gjson crate was removed.
+    use serde_json::{Value as Json, json};
     #[test]
-    fn reads_follow_go_gjson() {
-        // The first of duplicate keys wins; a path missing under it moves on to a later
-        // member, as Go's gjson does.
-        let dup = r#"{"type":"a","type":"b","error":{"x":1},"error":{"message":"second"}}"#;
-        assert_eq!(get(dup, "type").str(), "a");
-        assert_eq!(get(dup, "error").json(), r#"{"x":1}"#);
-        assert_eq!(get(dup, "error.message").str(), "second");
-        // Raw spelling survives in `json()`; `str()` is Go's `Result.String()`.
-        let nums = r#"{"a":12.50,"b":1e400,"c":123456789012345678901234567890,"d":7}"#;
-        assert_eq!(get(nums, "a").json(), "12.50");
-        assert_eq!(get(nums, "a").str(), "12.5");
-        assert_eq!(get(nums, "b").json(), "1e400");
-        assert_eq!(get(nums, "c").json(), "123456789012345678901234567890");
-        assert_eq!(get(nums, "c").kind(), Kind::Number);
-        assert_eq!(get(nums, "d").str(), "7");
-        // Go `Int()`: integer strings parse, other strings read 0, numbers truncate.
-        let ints = r#"{"s":"429","f":"429.5","n":429.9}"#;
-        assert_eq!(get(ints, "s").i64(), 429);
-        assert_eq!(get(ints, "f").i64(), 0);
-        assert_eq!(get(ints, "n").i64(), 429);
-        // `items()` is the elements of an array and nothing else; `array()` is Go's.
-        let doc = r#"{"list":[1,{"k":2}],"obj":{"k":1},"null":null}"#;
-        let items = get(doc, "list").items();
-        assert_eq!(items.iter().map(Value::json).collect::<Vec<_>>(), ["1", r#"{"k":2}"#]);
-        assert!(get(doc, "obj").items().is_empty());
-        assert_eq!(get(doc, "obj").array().len(), 1);
-        assert!(get(doc, "missing").items().is_empty());
-        assert!(get(doc, "null").array().is_empty());
-        // Escapes decode in `str()` only; a lone surrogate becomes U+FFFD; an escaped key
-        // matches its decoded name.
-        let esc = r#"{"k\u0065y":"a\ud800b","t":"\u0068i"}"#;
-        assert_eq!(get(esc, "key").str(), "a\u{fffd}b");
-        assert_eq!(get(esc, "t").str(), "hi");
-        assert_eq!(get(esc, "t").json(), r#""\u0068i""#);
-        // Go's lookup starts at the first `{` or `[`, also after leading text.
-        assert_eq!(
-            get(r#"upstream: {"error":{"message":"m"}}"#, "error.message").str(),
-            "m"
-        );
+    fn reads_typed_fields_without_changing_numeric_or_string_wire_spelling() {
+        let body = r#"{"type":"response.completed","n":9007199254740993,"fraction":1.2300e+04,"name":"u\u0031","items":[1,{"id":"two"}],"nil":null}"#;
+        assert_eq!(get(body, "type").str(), "response.completed");
+        assert_eq!(get(body, "n").json(), "9007199254740993");
+        assert_eq!(get(body, "fraction").json(), "1.2300e+04");
+        assert_eq!(get(body, "name").str(), "u1");
+        assert_eq!(get(body, "name").json(), r#""u\u0031""#);
+        assert_eq!(get(body, "items.1.id").str(), "two");
+        assert_eq!(get(body, "items").items().len(), 2);
+        assert!(get(body, "nil").exists());
+        assert!(!get(body, "missing").exists());
+        assert!(get(body, "type").items().is_empty());
     }
-
     #[test]
-    fn set_and_delete_match_sjson_byte_layout() {
-        // Expected bytes from sjson v1.2.5 (see tests/reference fixtures for the
-        // generated cross-check; these are the hand-traced core cases).
-        assert_eq!(set_raw(r#"{"a":1 }"#, "b", "2"), r#"{"a":1 ,"b":2}"#);
-        assert_eq!(set_raw("{}", "b", "2"), r#"{"b":2}"#);
-        assert_eq!(set_raw(r#"{"a":{"x":1}}"#, "a.x", "true"), r#"{"a":{"x":true}}"#);
-        assert_eq!(
-            set_raw(r#"{"a":1}"#, "m.user_id", r#""u""#),
-            r#"{"a":1,"m":{"user_id":"u"}}"#
-        );
-        assert_eq!(set_raw(r#"{"a":[1,2]}"#, "a.3", "9"), r#"{"a":[1,2,null,9]}"#);
-        assert_eq!(set_raw(r#"{"a":[]}"#, "a.1", "9"), r#"{"a":[null,9]}"#);
-        assert_eq!(delete(r#"{"a":1, "b":2,"c":3}"#, "b"), r#"{"a":1,"c":3}"#);
-        assert_eq!(delete(r#"{"a":1, "b":2}"#, "a"), r#"{ "b":2}"#);
-        assert_eq!(delete(r#"{ "a" : 1 }"#, "a"), r#"{ }"#);
-        assert_eq!(delete(r#"{"a":[1,2,3]}"#, "a.0"), r#"{"a":[2,3]}"#);
-        assert_eq!(delete(r#"{"a":[1,2,3]}"#, "a.2"), r#"{"a":[1,2]}"#);
-        assert_eq!(delete(r#"{"a":1}"#, "zz"), r#"{"a":1}"#);
-        assert_eq!(set_str(r#"{"a":1}"#, "t", "x<y"), r#"{"a":1,"t":"x<y"}"#);
-        assert_eq!(set_str(r#"{"a":1}"#, "t", "é<"), r#"{"a":1,"t":"é\u003c"}"#);
-        assert_eq!(js_string("a\u{2028}<\u{1}"), "\"a\\u2028<\\u0001\"");
+    fn edits_target_fields_preserve_other_spans_and_keep_valid_json() {
+        let input = r#"{ "keep" : {"n":9007199254740993,"s":"\u0061"}, "a":{"x":1}, "items":[1,2,3] }"#;
+        for (path, replacement) in [
+            ("a.x", json!(true)),
+            ("new.nested", json!("é<&>")),
+            ("items.1", json!({"k":3})),
+        ] {
+            let output = set_raw(input, path, &replacement.to_string());
+            let parsed: Json = serde_json::from_str(&output).unwrap();
+            assert!(parsed.is_object());
+            assert_eq!(
+                serde_json::from_str::<Json>(get(&output, path).json()).unwrap(),
+                replacement
+            );
+            assert_eq!(get(&output, "keep").json(), get(input, "keep").json());
+        }
+        let output = delete(input, "items.1");
+        assert_eq!(serde_json::from_str::<Json>(&output).unwrap()["items"], json!([1, 3]));
+        assert_eq!(delete(input, "missing"), input);
+        assert_eq!(get(&set_str(input, "text", "é<&>\n\""), "text").str(), "é<&>\n\"");
+        let encoded = js_string("a\u{2028}<\u{1}");
+        assert_eq!(serde_json::from_str::<String>(&encoded).unwrap(), "a\u{2028}<\u{1}");
     }
 }

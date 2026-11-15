@@ -9,8 +9,6 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-mod forward_port;
-
 struct Fixture {
     dir: PathBuf,
     state: Arc<Management>,
@@ -1565,73 +1563,98 @@ async fn credential_models_come_from_registrations() {
     server.abort();
 }
 
-/// Go v8.0.35 `GetStaticModelDefinitionsByChannel` renders the live static catalog with
-/// the Codex and xAI built-ins. Every channel answers Go's bytes, recorded by
-/// `reference/manage` (its second output), with the GPT Image 2.6 forward port in the
-/// Codex built-ins (docs/DIFFERENCES-FROM-GO.md).
+/// Supported channels expose the shipped catalog with stable model identities;
+/// aliases select the same channel and removed providers remain unavailable.
 #[tokio::test]
-async fn model_definitions_match_go_by_channel() {
-    let mut go: serde_json::Map<String, Value> =
-        serde_json::from_str(include_str!("fixtures/model_definitions_go.json")).unwrap();
-    forward_port::gpt_image_26::definitions_list(go.get_mut("codex").expect("codex channel"));
-    forward_port::grok_video_lite::definitions_list(go.get_mut("xai").expect("xai channel"));
-    for (channel, models) in go.iter_mut() {
-        forward_port::k1_catalog::definitions_list(channel, models);
-    }
-    // The removed providers' channels (issue #49) are unknown here.
-    let removed: Vec<String> = go
-        .keys()
-        .filter(|c| !matches!(c.as_str(), "claude" | "codex" | "xai" | "meta"))
-        .cloned()
-        .collect();
-    go.retain(|c, _| !removed.contains(c));
-    let f = Fixture::from_yaml("definitions-go", |auth, hash| {
+async fn model_definitions_expose_supported_catalogs_and_aliases() {
+    let f = Fixture::from_yaml("definitions-contract", |auth, hash| {
         format!(
             "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\n",
             auth.display()
         )
     });
     let (base, server) = f.server().await;
-    let get = |channel: String| {
-        wreq::Client::new()
+    let mut canonical = std::collections::BTreeMap::new();
+    for channel in ["claude", "codex", "xai", "meta"] {
+        let response = wreq::Client::new()
             .get(format!("{base}/v8/management/routing/model-definitions/{channel}"))
             .bearer_auth("fake-management-only")
             .send()
-    };
-    // Aliases answer their canonical section under the requested (lowercased) name.
-    let aliases = [("x-ai", "xai"), ("GROK", "xai"), ("muse", "meta")];
-    let requests = go.keys().map(|c| (c.as_str(), c.as_str())).chain(aliases);
-    let mut compared = 0;
-    for (channel, section) in requests {
-        let r = get(channel.to_owned()).await.unwrap();
-        assert_eq!(r.status(), 200, "{channel}");
-        let want = format!(
-            r#"{{"channel":{},"models":{}}}"#,
-            Value::from(channel.go_lower()),
-            serde_json::to_string(&go[section]).unwrap()
-        );
-        assert_eq!(r.text().await.unwrap(), want, "{channel}");
-        compared += 1;
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let value: Value = response.json().await.unwrap();
+        assert_eq!(value["channel"], channel);
+        let models = value["models"].as_array().unwrap();
+        assert!(!models.is_empty());
+        let ids: std::collections::BTreeSet<_> = models.iter().map(|model| model["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), models.len());
+        // The shipped catalog is input data, not a recorded endpoint response.
+        // Check every public metadata field as JSON meaning; UI capability displays
+        // depend on token limits, modalities and thinking, not merely model IDs.
+        for model in cpa_core::registry::dynamic::static_definitions(channel).unwrap() {
+            let returned = models.iter().find(|value| value["id"] == model.id).unwrap();
+            let mut expected = model.raw.clone();
+            expected.remove("native_capabilities");
+            expected.remove("support_configuration_update");
+            for (key, default) in [
+                ("object", json!("")),
+                ("created", json!(0)),
+                ("owned_by", json!("")),
+                ("type", json!("")),
+            ] {
+                expected.entry(key).or_insert(default);
+            }
+            fn empty(value: &Value) -> bool {
+                value.is_null()
+                    || value == ""
+                    || value == false
+                    || value == 0
+                    || value.as_array().is_some_and(Vec::is_empty)
+            }
+            expected.retain(|key, value| {
+                matches!(key.as_str(), "id" | "object" | "created" | "owned_by" | "type") || !empty(value)
+            });
+            if let Some(Value::Object(thinking)) = expected.get_mut("thinking") {
+                thinking.retain(|_, value| !empty(value));
+            }
+            assert_eq!(returned, &Value::Object(expected), "{channel}: {} metadata", model.id);
+            if let Some(thinking) = &model.thinking {
+                assert_eq!(returned["thinking"]["min"].as_i64().unwrap_or(0), thinking.min);
+                assert_eq!(returned["thinking"]["max"].as_i64().unwrap_or(0), thinking.max);
+            }
+        }
+        canonical.insert(channel, value["models"].clone());
     }
-    assert_eq!(compared, 7);
-    for channel in removed {
-        let r = get(channel.clone()).await.unwrap();
-        assert_eq!(r.status(), 400, "{channel}");
+    for (alias, channel) in [("x-ai", "xai"), ("GROK", "xai"), ("muse", "meta")] {
+        let response = wreq::Client::new()
+            .get(format!("{base}/v8/management/routing/model-definitions/{alias}"))
+            .bearer_auth("fake-management-only")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let value: Value = response.json().await.unwrap();
+        assert_eq!(value["channel"], alias.to_ascii_lowercase());
+        assert_eq!(value["models"], canonical[channel]);
+    }
+    for channel in ["gemini", "interactions", "vertex", "openai-compatibility", "unknown"] {
+        let response = wreq::Client::new()
+            .get(format!("{base}/v8/management/routing/model-definitions/{channel}"))
+            .bearer_auth("fake-management-only")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
     }
     server.abort();
 }
 
-/// Go v8.0.35 `injectV8APIKeyAuthIndexesLocked` (`0fb50a18`): JSON reads of
-/// `api-keys` carry each key's `auth_index` (fixture recorded from Go), and writes drop
-/// echoed `auth_index`/`auth-index` fields instead of saving them.
+/// JSON config reads expose the credential store's stable identities; YAML and
+/// echoed writes never persist those generated fields.
 #[tokio::test]
 async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
-    let mut fixture: Value = serde_json::from_str(include_str!("fixtures/config_v8_auth_index_go.json")).unwrap();
-    // The removed providers' groups go (issue #49).
-    for family in ["gemini", "interactions", "vertex", "openai-compatibility"] {
-        fixture["response"].as_object_mut().unwrap().remove(family);
-    }
-    let config = cpa_core::removed::strip_settings(fixture["config"].as_str().unwrap());
+    let config = include_str!("fixtures/auth_index_input.yaml");
     let f = Fixture::from_yaml("authindex", |auth, hash| {
         config.replace(
             "config-version: 8\n",
@@ -1652,7 +1675,31 @@ async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
     };
     let read = send(wreq::Method::GET, "/api-keys", String::new()).await.unwrap();
     let read: Value = read.json().await.unwrap();
-    assert_eq!(read, fixture["response"]);
+    let expected = Config::parse(config).unwrap();
+    let credentials = cpa_core::config::credentials::from_config(&expected);
+    let mut found = std::collections::BTreeSet::new();
+    for family in ["claude", "codex", "xai", "meta"] {
+        for group in read[family].as_array().unwrap() {
+            for key in group["keys"].as_array().unwrap() {
+                if let Some(index) = key["auth_index"].as_str() {
+                    assert_eq!(index.len(), 16);
+                    assert!(index.bytes().all(|b| b.is_ascii_hexdigit()));
+                    assert!(found.insert(index.to_owned()));
+                    let credential = credentials
+                        .iter()
+                        .find(|credential| {
+                            credential
+                                .attributes
+                                .get("api_key")
+                                .is_some_and(|value| value == key["api-key"].as_str().unwrap())
+                        })
+                        .unwrap();
+                    assert_eq!(index, cpa_core::config::credentials::auth_index(credential));
+                }
+            }
+        }
+    }
+    assert_eq!(found.len(), credentials.len());
     // `TestConfigV8APIKeysExposeAuthIndex_Issue6287`: a provider sub-path and the root
     // carry the same indexes; the YAML document carries none.
     let codex: Value = send(wreq::Method::GET, "/api-keys/codex", String::new())
@@ -1661,14 +1708,14 @@ async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
         .json()
         .await
         .unwrap();
-    assert_eq!(codex, fixture["response"]["codex"]);
+    assert_eq!(codex, read["codex"]);
     let root: Value = send(wreq::Method::GET, "", String::new())
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(root["api-keys"], fixture["response"]);
+    assert_eq!(root["api-keys"], read);
     let yaml = client
         .get(format!("{base}/v8/management/config.yaml"))
         .bearer_auth("fake-management-only")
@@ -1686,7 +1733,7 @@ async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    let r = send(wreq::Method::PATCH, "", json!({"api-keys": read}).to_string())
+    let r = send(wreq::Method::PATCH, "", json!({"api-keys": read.clone()}).to_string())
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
@@ -1698,7 +1745,7 @@ async fn v8_api_keys_carry_auth_indexes_and_writes_drop_them() {
         .json()
         .await
         .unwrap();
-    assert_eq!(again, fixture["response"]);
+    assert_eq!(again, read);
     server.abort();
 }
 
@@ -1931,9 +1978,8 @@ async fn latest_version_is_anonymous_cached_and_explicit() {
     release_server.abort();
 }
 
-/// Go v8.0.35 `TestGitHubTokenConfigRoundTrip` (7c41cd05): `server.github-token` never
-/// reaches the v0 config JSON (`json:"-"`), whichever spelling holds it. The v8 reads
-/// and writes are the `server_github_token` scenario in `manage_go.json`.
+/// The legacy config view never exposes the GitHub token. The authenticated v8
+/// field view remains available to the operator in both supported layouts.
 #[tokio::test]
 async fn github_token_stays_out_of_the_v0_config_json() {
     for (name, layout) in [
@@ -1965,12 +2011,8 @@ async fn github_token_stays_out_of_the_v0_config_json() {
     }
 }
 
-/// Go v8.0.35 `TestModelCatalogConfigRoundTrip` with `migrate` false: a v0 save keeps
-/// the `models` sources, which load back unchanged. `models` is a v8 root that Go's
-/// `IsV8ConfigLayout` does not share with the legacy layout, so the save writes v8. The
-/// v8 saves (`migrate` true), clearing and the refusals are the `model_catalog_sources`
-/// scenario in `manage_go.json`; the load refusals are its `load_errors`. Unix only:
-/// `/abs/models.json` is not absolute on Windows.
+/// A legacy management save preserves model catalog sources and their meaning on
+/// reload. The absolute-path example uses Unix path semantics.
 #[tokio::test]
 async fn model_catalog_sources_survive_a_legacy_save() {
     let raw = "models:\n  catalog: /abs/models.json\n  codex-catalog: 'https://codex.example.invalid/codex.json'\n";
@@ -3273,9 +3315,9 @@ async fn removed_oauth_maps_refuse_writes_and_keep_the_running_config_on_reload(
 }
 
 /// The removed providers' logins, imports and key lists answer 410, and a failed Codex
-/// exchange reports Go's "token exchange failed" text in the session.
+/// exchange exposes its status without disclosing the upstream error body.
 #[tokio::test]
-async fn removed_provider_operations_fail_and_codex_exchange_errors_read_like_go() {
+async fn removed_provider_operations_fail_and_codex_exchange_errors_hide_secrets() {
     let (fake, _seen, fake_server) = fake_logins().await;
     let f = Fixture::new("loginselect");
     let (base, _state, server) = login_server(&f, &fake).await;
@@ -3343,11 +3385,11 @@ async fn removed_provider_operations_fail_and_codex_exchange_errors_read_like_go
     );
     // Go appends the upstream body; session errors are readable by anyone holding
     // the state, so cliproxy-rs stops at the status (deliberate hardening).
-    assert_eq!(
-        final_status(&base, &state, 10).await,
-        json!({"status": "error", "error":
-            "Failed to exchange authorization code for tokens: token exchange failed with status 400"})
-    );
+    let failed = final_status(&base, &state, 10).await;
+    assert_eq!(failed["status"], "error");
+    let error = failed["error"].as_str().unwrap();
+    assert!(error.contains("400"));
+    assert!(!error.contains("invalid_grant") && !error.contains("fake-code"));
     server.abort();
     bad_server.abort();
     fake_server.abort();
@@ -3563,12 +3605,12 @@ async fn legacy_migration_with_shared_upstream_moves_keeps_other_comments() {
     }
 }
 
-/// Go v8.0.35 Sign in with ChatGPT binding (`d50a1995`, `ae3ee3be`) against a local
-/// token endpoint: start validation, the legacy-callback refusal, callback forms and
+/// Sign in with ChatGPT binding against a private local token endpoint:
+/// product policy covers start validation, the legacy-callback refusal, callback forms and
 /// conflicts, the bound file, the v8 summary, failures, cancellation, and the v8-only
 /// invalidation by a credential upload.
 #[tokio::test]
-async fn siwc_binding_flows_follow_go() {
+async fn siwc_binding_preserves_credentials_and_invalidates_stale_exchanges() {
     use base64::Engine;
     use sha2::{Digest, Sha256};
     use std::time::Duration;
@@ -4849,9 +4891,9 @@ async fn json_numbers_in_string_settings_keep_their_text() {
     server.abort();
 }
 
-/// The v8 JSON views write a YAML float as Go's `json.Marshal` writes a float64.
+/// Configuration views preserve numeric values independently of JSON number spelling.
 #[tokio::test]
-async fn v8_views_write_floats_as_go() {
+async fn v8_views_preserve_configured_numeric_values() {
     let f = Fixture::from_yaml("view-floats", |auth, hash| {
         format!(
             "config-version: 8\nmanagement:\n  secret-key: '{hash}'\noauth:\n  auth-dir: {}\nrequests:\n  payload:\n    override:\n      - models: [{{name: m}}]\n        params: {{a: 1.0, b: -0.0, c: 1e20, d: 1.5, e: 1e21, f: 0.0000001, g: 7}}\n",
@@ -4867,10 +4909,19 @@ async fn v8_views_write_floats_as_go() {
     )
     .await;
     assert_eq!(status, 200, "{view}");
-    assert_eq!(
-        view,
-        r#"[{"models":[{"name":"m"}],"params":{"a":1,"b":-0,"c":100000000000000000000,"d":1.5,"e":1e+21,"f":1e-7,"g":7}}]"#
-    );
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap();
+    assert_eq!(view[0]["models"], serde_json::json!([{"name":"m"}]));
+    for (name, expected) in [
+        ("a", 1.0),
+        ("b", 0.0),
+        ("c", 1e20),
+        ("d", 1.5),
+        ("e", 1e21),
+        ("f", 1e-7),
+        ("g", 7.0),
+    ] {
+        assert_eq!(view[0]["params"][name].as_f64(), Some(expected), "{name}");
+    }
     server.abort();
 }
 

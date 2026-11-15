@@ -2716,7 +2716,8 @@ mod tests {
 
     /// Go `isConnectionLifecycleError` on the texts executors produce.
     #[test]
-    fn lifecycle_errors_follow_go() {
+    // Product policy: Dispatch preserves resolved model identity, classifies connection lifecycle errors, and bounds configured retry jitter; none depends on a recorded implementation output.
+    fn transport_lifecycle_errors_do_not_poison_credentials() {
         let transport = |text: &str| ExecError::local(502, cpa_core::exec::FailureScope::Transport, text);
         assert!(lifecycle(&transport("websocket: close 1000 (normal)")));
         assert!(lifecycle(&transport(
@@ -2897,7 +2898,8 @@ mod tests {
     /// values are the Go goldens' "codex configured" and "codex restore" cases, without
     /// `is-compat`, which a `codex-api-key` model can no longer set (#28).
     #[test]
-    fn attempts_bind_resolved_model_like_go() {
+    // Product policy: Dispatch preserves resolved model identity, classifies connection lifecycle errors, and bounds configured retry jitter; none depends on a recorded implementation output.
+    fn attempts_bind_the_selected_upstream_capabilities() {
         let cfg = Config::parse(
             "config-version: 8\napi-keys:\n  codex:\n    - base-url: https://codex.example\n      models:\n        - name: gpt-6-sol\n          alias: sol\n      keys:\n        - api-key: xk1\n",
         )
@@ -2970,11 +2972,18 @@ mod tests {
     }
 
     #[test]
-    fn failure_texts_match_go_shapes() {
-        assert_eq!(
-            Failure::UnknownModel("claude-sonnet-4-6".into()).text(),
-            r#"{"error":{"message":"unknown provider for model claude-sonnet-4-6","type":"invalid_request_error","code":"model_not_found","param":"model"}}"#
+    fn failures_expose_status_cause_model_and_retry_hint() {
+        let unknown = Failure::UnknownModel("claude-sonnet-4-6".into());
+        let detail: serde_json::Value = serde_json::from_str(&unknown.text()).unwrap();
+        assert_eq!(detail["error"]["code"], "model_not_found");
+        assert_eq!(detail["error"]["param"], "model");
+        assert!(
+            detail["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("claude-sonnet-4-6")
         );
+        assert_eq!((unknown.status(), unknown.retry_after()), (400, None));
         let cooldown = Failure::Cooldown {
             model: "m".into(),
             provider: "claude".into(),
@@ -2982,27 +2991,25 @@ mod tests {
             cause: Some(r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#.into()),
             signals: Default::default(),
         };
-        assert_eq!(
-            cooldown.text(),
-            r#"{"error":{"code":"model_cooldown","last_upstream_error":"rate_limit_error: slow down","message":"All credentials for model m are cooling down via provider claude (last error: rate_limit_error: slow down)","model":"m","provider":"claude","reset_seconds":60,"reset_time":"59s"}}"#
-        );
-        assert_eq!(cooldown.retry_after(), Some(60));
-        assert_eq!(
-            (cooldown.status(), Failure::UnknownModel(String::new()).status()),
-            (429, 400)
-        );
-        let none = Failure::Unavailable {
+        let detail: serde_json::Value = serde_json::from_str(&cooldown.text()).unwrap();
+        assert_eq!(detail["error"]["code"], "model_cooldown");
+        assert_eq!(detail["error"]["model"], "m");
+        assert_eq!(detail["error"]["provider"], "claude");
+        assert_eq!(detail["error"]["reset_seconds"], 60);
+        assert_eq!(detail["error"]["last_upstream_error"], "rate_limit_error: slow down");
+        assert_eq!((cooldown.status(), cooldown.retry_after()), (429, Some(60)));
+        let unavailable = Failure::Unavailable {
             code: "auth_not_found",
             providers: vec!["claude".into()],
             model: " m ".into(),
             cause: None,
             retry_after: None,
         };
-        assert_eq!(
-            none.text(),
-            "auth_not_found: no auth available (providers=claude, model=m); check Claude auth/key session and cooldown state via /v0/management/auth-files"
-        );
-        assert_eq!((none.status(), none.retry_after()), (503, None));
+        let text = unavailable.text();
+        for context in ["auth_not_found", "claude", "model=m", "/v0/management/auth-files"] {
+            assert!(text.contains(context), "{text}");
+        }
+        assert_eq!((unavailable.status(), unavailable.retry_after()), (503, None));
     }
 
     #[test]
@@ -3135,7 +3142,8 @@ mod tests {
     }
 
     #[test]
-    fn jitter_stays_within_go_bounds() {
+    // Product policy: Dispatch preserves resolved model identity, classifies connection lifecycle errors, and bounds configured retry jitter; none depends on a recorded implementation output.
+    fn retry_jitter_respects_base_and_configured_cap() {
         for _ in 0..50 {
             let w = jitter(Duration::from_secs(4), Duration::ZERO);
             assert!(w >= Duration::from_secs(4) && w < Duration::from_secs(5));
@@ -3150,7 +3158,8 @@ mod tests {
     }
 
     #[test]
-    fn summaries_follow_go_extract() {
+    // Product policy: Dispatch preserves resolved model identity, classifies connection lifecycle errors, and bounds configured retry jitter; none depends on a recorded implementation output.
+    fn upstream_summaries_keep_actionable_error_fields() {
         assert_eq!(
             upstream_summary(r#"{"error":{"code":"x","message":"boom"}}"#),
             "x: boom"

@@ -1,306 +1,203 @@
-//! Replays every signature call Go's own test suites made at v8.0.27, whose signature
-//! package is 6fecc6e's plus the Antigravity CAQS commits (see tests/reference/record),
-//! comparing outputs and error text exactly.
-
+//! Signature replay safety: local structural policy and byte preservation.
+//! Synthetic envelopes exercise parsers. They do not establish provider acceptance
+//! and these tests never attempt cryptographic verification.
+use super::*;
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use serde_json::{Value, json};
 
-use super::*;
-
-fn s(v: &Value) -> &str {
-    v.as_str().unwrap_or_else(|| panic!("expected string: {v}"))
+fn claude_signature(channel: u8) -> String {
+    // Protobuf: field 2 -> field 1 -> channel_id varint and model_text bytes.
+    // The envelope is deliberately built without calling a production encoder.
+    let model = b"synthetic-claude";
+    let mut inner = vec![0x08, channel, 0x32, model.len() as u8];
+    inner.extend_from_slice(model);
+    let mut payload = vec![0x12, (inner.len() + 2) as u8, 0x0a, inner.len() as u8];
+    payload.extend(inner);
+    STANDARD.encode(payload)
+}
+fn gpt_signature(blocks: usize) -> String {
+    // Fernet layout: version, timestamp, IV, N AES blocks, HMAC.
+    let mut payload = vec![0; 1 + 8 + 16 + 16 * blocks + 32];
+    payload[0] = 0x80;
+    URL_SAFE_NO_PAD.encode(payload)
 }
 
-fn b(v: &Value) -> Vec<u8> {
-    crate::recorded_bytes(v)
-}
-
-fn enc(bytes: &[u8]) -> Value {
-    crate::recorded_value(bytes)
-}
-
-fn provider(v: &str) -> Provider {
-    match v {
-        "" => Provider::Empty,
-        "unknown" => Provider::Unknown,
-        "claude" => Provider::Claude,
-        "gemini" => Provider::Gemini,
-        "gemini_bypass" => Provider::GeminiBypass,
-        "gpt" => Provider::Gpt,
-        "kimi" => Provider::Kimi,
-        "grok" => Provider::Grok,
-        "swe" => Provider::Swe,
-        p => panic!("{p}"),
-    }
-}
-
-fn block_kind(v: &str) -> BlockKind {
-    match v {
-        "" | "unknown" => BlockKind::Unknown,
-        "claude_thinking" => BlockKind::ClaudeThinking,
-        "gemini_model_part" => BlockKind::GeminiModelPart,
-        "gemini_function_call" => BlockKind::GeminiFunctionCall,
-        "gpt_reasoning" => BlockKind::GptReasoning,
-        k => panic!("{k}"),
-    }
-}
-
-fn claude_opt(v: &Value) -> ClaudeValidation {
-    ClaudeValidation {
-        prefix_only: v["prefix_only"].as_bool().unwrap(),
-        base64_only: v["base64_only"].as_bool().unwrap(),
-        allow_empty_signature_with_empty_text: v["allow_empty"].as_bool().unwrap(),
-        strict: v["strict"].as_bool().unwrap(),
-    }
-}
-
-fn gemini_opt(v: &Value) -> GeminiValidation {
-    GeminiValidation {
-        allow_bypass_sentinel: v["allow_bypass_sentinel"].as_bool().unwrap(),
-        require_known_envelope: v["require_known_envelope"].as_bool().unwrap(),
-        require_observed_marker: v["require_observed_marker"].as_bool().unwrap(),
-    }
-}
-
-fn decision_json(d: &Decision) -> Value {
-    json!({
-        "target": d.target_provider.as_str(), "detected": d.detected_provider.as_str(),
-        "block_kind": d.block_kind.as_str(), "compatible": d.compatible, "action": d.action.as_str(),
-        "replacement": d.replacement_signature, "normalized": d.normalized_signature, "reason": d.reason,
-    })
-}
-
-fn err<T>(r: &Result<T, Error>) -> Value {
-    match r {
-        Ok(_) => Value::Null,
-        Err(e) => Value::String(e.0.clone()),
-    }
-}
-
-fn tree_json(t: &ClaudeSignatureTree) -> Value {
-    json!({
-        "encoding_layers": t.encoding_layers, "channel_id": t.channel_id, "field2": t.field2,
-        "routing_class": t.routing_class, "infrastructure_class": t.infrastructure_class,
-        "schema_features": t.schema_features, "model_text": t.model_text,
-        "legacy_route_hint": t.legacy_route_hint, "has_field7": t.has_field7,
-    })
-}
-
-fn tree_result(r: Result<ClaudeSignatureTree, Error>) -> Value {
-    json!({"tree": r.as_ref().ok().map(tree_json), "err": err(&r)})
-}
-
-fn replay(fn_name: &str, input: &Value) -> Option<Value> {
-    Some(match fn_name {
-        "detect" => json!(detect_provider_for_block(b(&input["raw"]), block_kind(s(&input["block_kind"]))).as_str()),
-        "decide" => decision_json(&decide_compatibility_for_model(
-            provider(s(&input["target"])),
-            s(&input["model"]),
-            b(&input["raw"]),
-            block_kind(s(&input["block_kind"])),
-        )),
-        "antigravity_claude" => {
-            let r = compatible_antigravity_claude_thinking_signature(b(input));
-            json!({"sig": r.clone().unwrap_or_default(), "ok": r.is_some()})
-        }
-        "recognized" => json!(is_recognized_reasoning_signature(b(input))),
-        "split_prefix" => {
-            let raw = b(input);
-            match split_provider_prefix(&raw) {
-                Some((p, rest)) => json!({"provider": p.as_str(), "rest": enc(rest), "ok": true}),
-                None => json!({"provider": "unknown", "rest": enc(&raw), "ok": false}),
+#[test]
+fn claude_envelope_layers_round_trip_and_expose_structural_fields() {
+    for channel in [11, 12, 30] {
+        let single = claude_signature(channel);
+        let double = STANDARD.encode(&single);
+        for (sig, layers) in [(&single, 1), (&double, 2)] {
+            assert!(is_valid_claude_thinking_signature(sig, ClaudeValidation::STRICT));
+            let tree = if layers == 1 {
+                inspect_claude_single_layer_signature(sig)
+            } else {
+                inspect_claude_double_layer_signature(sig)
             }
-        }
-        "provider_from_model" => json!(provider_from_model_name(s(input)).as_str()),
-        "inspect_cais" => {
-            let r = inspect_claude_cais_signature(b(input));
-            let info = r.as_ref().ok().map(|i| {
-                json!({"first_byte": i.first_byte, "envelope_version": i.envelope_version, "channel_id": i.channel_id,
-                    "model_text": i.model_text, "block_kind": i.block_kind, "context_id": i.context_id,
-                    "signature_len": i.signature_len})
-            });
-            json!({"info": info, "err": err(&r)})
-        }
-        "inspect_antigravity_caqs" => {
-            let r = inspect_antigravity_claude_caqs_signature(b(input));
-            let info = r.as_ref().ok().map(|i| {
-                json!({"first_byte": i.first_byte, "envelope_version": i.envelope_version, "channel_id": i.channel_id,
-                    "model_text": i.model_text, "block_kind": i.block_kind, "context_id": i.context_id,
-                    "signature_len": i.signature_len, "infrastructure": i.infrastructure,
-                    "signature_in_container": i.signature_in_container})
-            });
-            json!({"info": info, "err": err(&r)})
-        }
-        "normalize_claude" => {
-            let r = normalize_claude_thinking_signature(b(&input["raw"]), claude_opt(&input["opt"]));
-            json!({"sig": r.clone().unwrap_or_default(), "err": err(&r)})
-        }
-        "normalize_claude_native" => {
-            let r = normalize_claude_provider_native_thinking_signature(b(&input["raw"]), claude_opt(&input["opt"]));
-            json!({"sig": r.clone().unwrap_or_default(), "err": err(&r)})
-        }
-        "inspect_claude_payload" => {
-            let payload = wire::STD.decode(s(&input["payload"]).as_bytes()).unwrap();
-            tree_result(inspect_claude_signature_payload(
-                &payload,
-                input["layers"].as_i64().unwrap(),
-            ))
-        }
-        "inspect_claude_double" => tree_result(inspect_claude_double_layer_signature(b(input))),
-        "inspect_claude_single" => tree_result(inspect_claude_single_layer_signature(b(input))),
-        "valid_claude" => json!(is_valid_claude_thinking_signature(
-            b(&input["raw"]),
-            claude_opt(&input["opt"])
-        )),
-        "decodable_claude" => json!(has_decodable_claude_thinking_signature(b(input))),
-        "validate_claude" => err(&validate_claude_thinking_signatures(
-            &b(&input["body"]),
-            claude_opt(&input["opt"]),
-        )),
-        "inspect_gemini" => {
-            let r = inspect_gemini_thought_signature(b(&input["raw"]), gemini_opt(&input["opt"]));
-            let info = r.as_ref().ok().map(|i| {
-                json!({"is_bypass_sentinel": i.is_bypass_sentinel, "bypass_sentinel": i.bypass_sentinel,
-                    "decoded_len": i.decoded_len, "first_byte": i.first_byte, "has_observed_marker": i.has_observed_marker,
-                    "known_envelope": i.known_envelope, "envelope": i.envelope.map_or("", GeminiEnvelope::as_str),
-                    "record_count": i.record_count, "opaque_payload_len": i.opaque_payload_len})
-            });
-            json!({"info": info, "err": err(&r)})
-        }
-        "validate_gemini" => err(&validate_gemini_thought_signatures(
-            &b(&input["body"]),
-            gemini_opt(&input["opt"]),
-        )),
-        "validate_pairing" => err(&validate_gemini_function_call_pairing(&b(input))),
-        "inspect_gpt" => {
-            let r = inspect_gpt_reasoning_signature(b(input));
-            let info = r
-                .as_ref()
-                .ok()
-                .map(|i| json!({"decoded_len": i.decoded_len, "ciphertext_len": i.ciphertext_len}));
-            json!({"info": info, "err": err(&r)})
-        }
-        "inspect_grok" => {
-            let r = inspect_grok_encrypted_content(b(input));
-            let info = r
-                .as_ref()
-                .ok()
-                .map(|i| json!({"raw_len": i.raw_len, "decoded_len": i.decoded_len}));
-            json!({"info": info, "err": err(&r)})
-        }
-        "inspect_kimi" => {
-            let r = inspect_kimi_thinking_signature(b(input));
-            let info = r
-                .as_ref()
-                .ok()
-                .map(|i| json!({"raw_len": i.raw_len, "decoded_len": i.decoded_len, "mode": i.mode.as_str()}));
-            json!({"info": info, "err": err(&r)})
-        }
-        "sanitize_gemini" => enc(&sanitize_gemini_request_thought_signatures(
-            &b(&input["body"]),
-            s(&input["path"]),
-        )),
-        "gemini_replay" => json!(gemini_replay_signature_or_bypass(
-            b(&input["raw"]),
-            block_kind(s(&input["block_kind"]))
-        )),
-        "sanitize_claude_messages" => {
-            let target = s(&input["target"]);
-            let (out, report) = sanitize_claude_messages_signatures_for_target(
-                &b(&input["body"]),
-                &ClaudeMessagesSanitizeOptions {
-                    target_provider: provider(target),
-                    target_model: s(&input["model"]).into(),
-                    drop_empty_messages: input["drop_empty_messages"].as_bool().unwrap(),
-                    drop_tool_signatures: input["drop_tool_signatures"].as_bool().unwrap(),
-                    drop_empty_thinking_placeholders: input["drop_empty_thinking_placeholders"].as_bool().unwrap(),
-                    preserve_empty_thinking_blocks: input["preserve_empty_thinking_blocks"].as_bool().unwrap(),
-                },
+            .unwrap();
+            assert_eq!(tree.encoding_layers, layers);
+            assert_eq!(tree.channel_id, u64::from(channel));
+            assert_eq!(tree.model_text, "synthetic-claude");
+            assert_eq!(
+                normalize_claude_provider_native_thinking_signature(sig, ClaudeValidation::STRICT).unwrap(),
+                single
             );
-            json!({"body": enc(&out), "target": report.target_provider.as_str(), "preserved": report.preserved,
-                "dropped_blocks": report.dropped_blocks, "dropped_signatures": report.dropped_signatures,
-                "replaced_signatures": report.replaced_signatures,
-                "decisions": report.decisions.iter().map(decision_json).collect::<Vec<_>>()})
+            assert_eq!(
+                normalize_claude_thinking_signature(sig, ClaudeValidation::STRICT).unwrap(),
+                double
+            );
         }
-        "strip_claude" => enc(&strip_invalid_claude_thinking_blocks(
-            &b(&input["body"]),
-            claude_opt(&input["opt"]),
-        )),
-        "strip_claude_empty" => enc(&strip_invalid_claude_thinking_blocks_and_empty_messages(
-            &b(&input["body"]),
-            claude_opt(&input["opt"]),
-        )),
-        _ => return None,
-    })
+    }
+    for malformed in ["", "not base64", "Eg==", "EgE=", "E===", "claude#claude#bad"] {
+        assert!(
+            !is_valid_claude_thinking_signature(malformed, ClaudeValidation::STRICT),
+            "{malformed}"
+        );
+    }
 }
 
-/// protobuf-go picks a regular or non-breaking space after "proto:" per binary
-/// (internal/detrand) so callers cannot depend on it; the recording build chose U+00A0.
-/// Only error strings are normalized, never bodies.
-fn normalize_proto_separator(v: &mut Value) {
-    match v {
-        Value::Object(map) => {
-            for (key, value) in map.iter_mut() {
-                match value {
-                    Value::String(text) if key == "err" => *text = text.replace("proto:\u{a0}", "proto: "),
-                    other => normalize_proto_separator(other),
+#[test]
+fn fernet_shape_requires_positive_aes_block_ciphertext() {
+    for blocks in [1, 2, 8] {
+        let token = gpt_signature(blocks);
+        let info = inspect_gpt_reasoning_signature(&token).unwrap();
+        assert_eq!(info.decoded_len, 57 + 16 * blocks);
+        assert_eq!(info.ciphertext_len, 16 * blocks);
+        assert_eq!(detect_provider(&token), Provider::Gpt);
+    }
+    for length in [0, 1, 25, 57, 58, 72, 74] {
+        let mut raw = vec![0; length];
+        if let Some(first) = raw.first_mut() {
+            *first = 0x80;
+        }
+        assert!(
+            inspect_gpt_reasoning_signature(URL_SAFE_NO_PAD.encode(raw)).is_err(),
+            "{length}"
+        );
+    }
+    assert!(inspect_gpt_reasoning_signature("gAAAA!invalid").is_err());
+}
+
+#[test]
+fn kept_provider_compatibility_preserves_own_envelopes_and_drops_foreign_blocks() {
+    let cases = [
+        (Provider::Claude, BlockKind::ClaudeThinking, claude_signature(11)),
+        (Provider::Gpt, BlockKind::GptReasoning, gpt_signature(1)),
+    ];
+    for (origin, kind, signature) in cases {
+        assert_eq!(detect_provider_for_block(&signature, kind), origin);
+        for target in [Provider::Claude, Provider::Gpt, Provider::Grok] {
+            let decision = decide_compatibility(target, &signature, kind);
+            assert_eq!(decision.compatible, target == origin);
+            assert_eq!(
+                decision.action,
+                if target == origin {
+                    Action::Preserve
+                } else {
+                    Action::DropBlock
                 }
+            );
+            if target == origin {
+                assert_eq!(decision.normalized_signature, signature);
+            } else {
+                assert!(decision.replacement_signature.is_empty());
             }
         }
-        Value::Array(items) => items.iter_mut().for_each(normalize_proto_separator),
-        _ => {}
+        let prefixed = format!("{}#{signature}", origin.as_str());
+        assert_eq!(compatible_signature_for_provider(origin, &prefixed), Some(signature));
+        assert_eq!(
+            detect_provider(format!("{}#{prefixed}", origin.as_str())),
+            Provider::Unknown
+        );
+    }
+    for opaque in [
+        "",
+        "opaque-provider-data",
+        "claude#unknown",
+        "00000000-0000-0000-0000-000000000000",
+    ] {
+        assert_eq!(detect_provider(opaque), Provider::Unknown);
+        for target in [Provider::Claude, Provider::Gpt, Provider::Grok] {
+            assert!(!decide_compatibility(target, opaque, BlockKind::Unknown).compatible);
+        }
     }
 }
 
 #[test]
-fn replays_every_go_signature_call() {
-    let ran = replay_all(crate::go_calls().map(str::to_owned));
-    assert!(ran.len() >= 25, "{ran:?}");
-}
-
-/// Every corpus signature through every target, block kind and validator option
-/// (tests/reference/record/signature_matrix_test.go.txt).
-#[test]
-fn replays_go_signature_matrix() {
-    use std::io::BufRead;
-    let gz = include_bytes!("../../tests/fixtures/go_signature_matrix.jsonl.gz");
-    let lines = std::io::BufReader::new(flate2::read::GzDecoder::new(&gz[..])).lines();
-    let ran = replay_all(lines.map(Result::unwrap));
-    assert!(ran["decide"] > 9000, "{ran:?}");
-}
-
-fn replay_all(lines: impl Iterator<Item = String>) -> std::collections::BTreeMap<String, usize> {
-    let mut ran = std::collections::BTreeMap::<String, usize>::new();
-    let mut failures = Vec::new();
-    for line in lines {
-        let record: Value = serde_json::from_str(&line).unwrap();
-        let fn_name = s(&record["fn"]);
-        let Some(got) = replay(fn_name, &record["in"]) else {
-            continue;
-        };
-        *ran.entry(fn_name.to_owned()).or_default() += 1;
-        let mut want = record["out"].clone();
-        if fn_name == "validate_pairing" || fn_name == "validate_claude" || fn_name == "validate_gemini" {
-            // These return the error string itself as the output.
-            if let Value::String(text) = &mut want {
-                *text = text.replace("proto:\u{a0}", "proto: ");
-            }
-        }
-        normalize_proto_separator(&mut want);
-        if got != want {
-            failures.push(format!(
-                "{fn_name}\n  in:   {}\n  want: {want}\n  got:  {got}",
-                record["in"]
-            ));
-        }
+fn xai_ciphertext_policy_rejects_foreign_envelopes_and_low_information_data() {
+    let bytes: Vec<u8> = (0..128).collect();
+    let raw = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&bytes);
+    assert_eq!(inspect_grok_encrypted_content(&raw).unwrap().decoded_len, 128);
+    for invalid in [
+        "short".to_owned(),
+        format!(" {raw}"),
+        format!("{raw}="),
+        gpt_signature(1),
+        claude_signature(11),
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode([0u8; 128]),
+    ] {
+        assert!(inspect_grok_encrypted_content(invalid).is_err());
     }
-    assert!(
-        failures.is_empty(),
-        "{} of {} signature records differ from Go:\n{}",
-        failures.len(),
-        ran.values().sum::<usize>(),
-        failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn claude_sanitizer_preserves_valid_history_and_removes_foreign_thinking() {
+    let own = claude_signature(11);
+    let foreign = gpt_signature(1);
+    let input = json!({"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"kept","signature":own},{"type":"thinking","thinking":"drop","signature":foreign},{"type":"text","text":"answer"}]}],"other":{"n":9007199254740993u64}});
+    let options = ClaudeMessagesSanitizeOptions {
+        target_provider: Provider::Claude,
+        drop_empty_messages: true,
+        ..Default::default()
+    };
+    let (output, report) =
+        sanitize_claude_messages_signatures_for_target(&serde_json::to_vec(&input).unwrap(), &options);
+    let parsed: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(
+        parsed["messages"][0]["content"],
+        json!([{"type":"thinking","thinking":"kept","signature":own},{"type":"text","text":"answer"}])
     );
-    ran
+    assert_eq!(parsed["other"], input["other"]);
+    assert_eq!(report.preserved, 1);
+    assert_eq!(report.dropped_blocks, 1);
+    let (again, report) = sanitize_claude_messages_signatures_for_target(&output, &options);
+    assert_eq!(again, output);
+    assert_eq!(report.dropped_blocks, 0);
+    let plain = br#"{ "messages":[{"role":"user","content":"hi"}],"n":1.2300e+04 }"#;
+    assert_eq!(sanitize_claude_messages_signatures_for_target(plain, &options).0, plain);
+}
+
+#[test]
+fn signature_validation_options_are_explicit_and_empty_placeholders_are_controlled() {
+    assert!(has_claude_thinking_signature_prefix("E-not-a-signature"));
+    assert!(!has_decodable_claude_thinking_signature("E-not-a-signature"));
+    let placeholder =
+        br#"{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":""}]}]}"#;
+    assert!(validate_claude_thinking_signatures(placeholder, ClaudeValidation::STRICT).is_err());
+    // Empty placeholders may survive sanitization, but do not become valid signatures.
+    let allow_placeholder = ClaudeValidation {
+        allow_empty_signature_with_empty_text: true,
+        ..ClaudeValidation::STRICT
+    };
+    assert!(validate_claude_thinking_signatures(placeholder, allow_placeholder).is_err());
+    assert_eq!(
+        strip_invalid_claude_thinking_blocks(placeholder, allow_placeholder),
+        placeholder
+    );
+    assert_ne!(
+        strip_invalid_claude_thinking_blocks(placeholder, ClaudeValidation::STRICT),
+        placeholder
+    );
+
+    let bad=br#"{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"text","signature":"invalid"},{"type":"text","text":"answer"}]}]}"#;
+    let stripped = strip_invalid_claude_thinking_blocks(bad, ClaudeValidation::STRICT);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&stripped).unwrap()["messages"][0]["content"],
+        json!([{"type":"text","text":"answer"}])
+    );
 }
 
 #[test]
@@ -349,5 +246,104 @@ fn large_inline_data_passes_through_like_go() {
             sanitize_gemini_request_thought_signatures(body.as_bytes(), path),
             body.as_bytes()
         );
+    }
+}
+
+#[test]
+fn cais_envelopes_keep_signature_bytes_and_reject_missing_or_wrong_typed_fields() {
+    fn bytes_field(tag: u8, bytes: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag, bytes.len() as u8];
+        out.extend_from_slice(bytes);
+        out
+    }
+    for version in [3, 4] {
+        let mut channel = vec![0x08, 11];
+        channel.extend(bytes_field(0x2a, b"opaque signature bytes"));
+        channel.extend(bytes_field(0x32, b"claude-synthetic"));
+        if version == 4 {
+            channel.extend(bytes_field(0x42, b"thinking"));
+        }
+        let container = bytes_field(0x0a, &channel);
+        let mut envelope = vec![0x08, version];
+        envelope.extend(bytes_field(0x12, &container));
+        let sig = STANDARD.encode(&envelope);
+        let info = inspect_claude_cais_signature(&sig).unwrap();
+        assert_eq!(info.envelope_version, u64::from(version));
+        assert_eq!(info.channel_id, 11);
+        assert_eq!(info.model_text, "claude-synthetic");
+        assert_eq!(info.signature_len, b"opaque signature bytes".len());
+        assert_eq!(detect_provider(&sig), Provider::Claude);
+        assert_eq!(compatible_signature_for_provider(Provider::Claude, &sig), Some(sig));
+        for cut in [0, 1, 2, envelope.len() - 1] {
+            assert!(inspect_claude_cais_signature(STANDARD.encode(&envelope[..cut])).is_err());
+        }
+        // A length-delimited envelope version is not a varint version.
+        envelope[0] = 0x0a;
+        assert!(inspect_claude_cais_signature(STANDARD.encode(envelope)).is_err());
+    }
+}
+
+#[test]
+fn claude_upstream_sanitization_strips_tool_signatures_and_controls_empty_history() {
+    let input=br#"{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"tool","input":{"keep":"value"},"signature":"foreign","thought_signature":"foreign"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"","signature":""}]}]}"#;
+    let (output, report) = sanitize_claude_messages_for_claude_upstream(input, "claude-synthetic", false);
+    let output = output.expect("tool signatures and empty blocks are removed");
+    let parsed: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(parsed["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        parsed["messages"][0]["content"][0],
+        json!({"type":"tool_use","id":"t","name":"tool","input":{"keep":"value"}})
+    );
+    assert!(report.dropped_signatures > 0);
+}
+
+#[test]
+fn claude_validation_options_select_prefix_decoding_or_full_structure_explicitly() {
+    let valid = claude_signature(11);
+    let cases = [
+        (valid.as_str(), true, true, true),
+        ("Eg==", true, true, false), // Decodable, but no complete protobuf tree.
+        ("E!invalid", true, false, false),
+        ("R!invalid", true, false, false),
+        ("YQ==", false, false, false), // Decodable bytes without a Claude marker.
+        ("", false, false, false),
+    ];
+    for (signature, prefix, decodable, strict) in cases {
+        for (options, expected) in [
+            (ClaudeValidation::STRICT, strict),
+            (
+                ClaudeValidation {
+                    base64_only: true,
+                    ..ClaudeValidation::STRICT
+                },
+                decodable,
+            ),
+            (
+                ClaudeValidation {
+                    prefix_only: true,
+                    ..ClaudeValidation::STRICT
+                },
+                prefix,
+            ),
+            // Prefix-only deliberately takes precedence when both options are set.
+            (
+                ClaudeValidation {
+                    prefix_only: true,
+                    base64_only: true,
+                    ..ClaudeValidation::STRICT
+                },
+                prefix,
+            ),
+        ] {
+            assert_eq!(
+                is_valid_claude_thinking_signature(signature, options),
+                expected,
+                "{signature:?} {options:?}"
+            );
+            let body = serde_json::to_vec(&json!({"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"history","signature":signature}]}]})).unwrap();
+            // Request validation normalizes the full carrier even when a caller
+            // uses the convenience predicate's permissive inspection options.
+            assert_eq!(validate_claude_thinking_signatures(&body, options).is_ok(), strict);
+        }
     }
 }

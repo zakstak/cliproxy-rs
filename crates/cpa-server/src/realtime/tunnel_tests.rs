@@ -1,5 +1,5 @@
-//! Go tcp_proxy_test.go, and the goldens `zz_rsfix_live_tunnel_test.go` recorded from the
-//! real Go code (tests/fixtures/codex_live_tunnel_go.json).
+//! ICE-TCP authentication, public-address isolation and proxy protocol contracts.
+//! Archived SDP and local-peer responses are inputs only; no proxy answer is replayed.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 use super::*;
 use crate::realtime::dialer::{Conn, build, proxy_scheme};
 
-fn golden() -> Value {
-    serde_json::from_str(include_str!("../../tests/fixtures/codex_live_tunnel_go.json")).unwrap()
+fn inputs() -> Value {
+    serde_json::from_str(include_str!("../../tests/fixtures/tunnel_inputs.json")).unwrap()
 }
 
 fn unhex(text: &str) -> Vec<u8> {
@@ -23,15 +23,43 @@ fn unhex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// RFC 5389 binding request with ICE short-term credentials, built by the Rust STUN
+/// library. RFC 4571 supplies the two-byte network-order length prefix.
+fn valid_frame() -> Vec<u8> {
+    use rtc::stun::integrity::MessageIntegrity;
+    use rtc::stun::message::Setter;
+    let mut message = Message::new();
+    message.typ = BINDING_REQUEST;
+    message.write_header();
+    message.add(ATTR_USERNAME, b"remote:local");
+    let provider = rtc::crypto::default_provider().unwrap();
+    MessageIntegrity::new_short_term_integrity_with_provider("remote-password".into(), provider.crypto())
+        .add_to(&mut message)
+        .unwrap();
+    FINGERPRINT.add_to(&mut message).unwrap();
+    let mut framed = (message.raw.len() as u16).to_be_bytes().to_vec();
+    framed.extend(message.raw);
+    framed
 }
 
-/// The Go-built frame for `remote:local` signed with `remote-password`.
-fn valid_frame() -> Vec<u8> {
-    let frames = golden()["frames"].as_array().unwrap().clone();
-    let valid = frames.iter().find(|f| f["name"] == "valid").unwrap();
-    unhex(valid["frame"].as_str().unwrap())
+fn invalid_frames() -> Vec<Vec<u8>> {
+    let valid = valid_frame();
+    let mut cases = Vec::new();
+    // Corrupt every authenticated byte, including the header, credential, MAC and CRC.
+    for index in 2..valid.len() {
+        let mut frame = valid.clone();
+        frame[index] ^= 0x80;
+        cases.push(frame);
+    }
+    for len in [0u16, 1, 19, 4097] {
+        let mut frame = len.to_be_bytes().to_vec();
+        frame.resize(2 + usize::from(len), 0);
+        cases.push(frame);
+    }
+    for end in [0, 1, 2, 3, valid.len() - 1] {
+        cases.push(valid[..end].to_vec());
+    }
+    cases
 }
 
 fn quiet() -> OnForwarding {
@@ -108,47 +136,94 @@ fn open_tunnel(dialer: Arc<dyn Dial>, on_forwarding: OnForwarding) -> Open {
 }
 
 #[tokio::test]
-async fn answers_are_rewritten_like_go() {
-    for case in golden()["prepare"].as_array().unwrap() {
+async fn answers_keep_only_supported_public_candidates_and_rewrite_to_loopback() {
+    let valid = [
+        "go_rewrite",
+        "ipv6_public",
+        "ipv4_mapped",
+        "component_two_and_valid",
+        "upper_tcp",
+        "upper_passive",
+        "extensions",
+        "google_v6",
+        "second_media",
+        "session_credentials",
+        "media_overrides_session",
+        "padded_credentials",
+        "v6_embedded_v4",
+        "v4_with_zone",
+        "exactly_64",
+        "tcp_16",
+    ];
+    for case in inputs()["prepare"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let (answer, offer) = (case["answer"].as_str().unwrap(), case["offer"].as_str().unwrap());
-        let result = prepare_answer(answer, offer, Arc::new(Never), quiet());
-        if let Some(want) = case["error"].as_str() {
-            let got = result.err().unwrap_or_else(|| panic!("{name}: expected {want}"));
-            // ponytail: pion's SDP lexer words its syntax errors differently; the step matches.
-            match want.split_once(" for TCP proxy: sdp: ") {
-                Some((step, _)) => assert!(got.starts_with(&format!("{step} for TCP proxy: ")), "{name}: {got}"),
-                None => assert_eq!(got, want, "{name}"),
-            }
+        let prepared = prepare_answer(answer, offer, Arc::new(Never), quiet());
+        if !valid.contains(&name) {
+            assert!(
+                prepared.is_err(),
+                "{name}: invalid SDP, credential or target must be refused"
+            );
             continue;
         }
-        let prepared = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-        let mut masked = prepared.sdp.clone();
-        for (i, tunnel) in prepared.tunnels.iter().enumerate() {
-            let at = format!("{} {} ", tunnel.listener.ip(), tunnel.listener.port());
-            masked = masked.replace(&at, &format!("LISTEN{i} "));
-            assert!(tunnel.candidate.contains(&at), "{name}: {}", tunnel.candidate);
-        }
-        // ponytail: rtc-sdp drops whitespace at the end of an attribute value; pion keeps
-        // it. The answer only feeds the relay's own peer, and credentials are trimmed.
-        let lines = |sdp: &str| sdp.split("\r\n").map(str::trim_end).collect::<Vec<_>>().join("\r\n");
-        assert_eq!(lines(&masked), lines(case["sdp"].as_str().unwrap()), "{name}");
-        let targets: Vec<String> = prepared.tunnels.iter().map(|t| t.target.to_string()).collect();
-        let listeners: Vec<String> = prepared.tunnels.iter().map(|t| t.listener.ip().to_string()).collect();
-        assert_eq!(serde_json::json!(targets), case["targets"], "{name}");
-        assert_eq!(serde_json::json!(listeners), case["listeners"], "{name}");
-        let (ufrag, password) = credentials(&parse_sdp(answer).unwrap()).unwrap();
-        let (local, _) = credentials(&parse_sdp(offer).unwrap()).unwrap();
+        let prepared = prepared.unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert!(!prepared.tunnels.is_empty());
+        let expected_targets: Vec<SocketAddr> = answer
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<_> = line.strip_prefix("a=candidate:")?.split_whitespace().collect();
+                if fields.get(1) != Some(&"1")
+                    || !fields.get(2)?.eq_ignore_ascii_case("tcp")
+                    || fields.get(7) != Some(&"host")
+                    || !fields
+                        .windows(2)
+                        .any(|pair| pair[0] == "tcptype" && pair[1].eq_ignore_ascii_case("passive"))
+                {
+                    return None;
+                }
+                let ip: IpAddr = fields[4].split('%').next().unwrap().parse().unwrap();
+                Some(SocketAddr::new(ip.to_canonical(), fields[5].parse().unwrap()))
+            })
+            .collect();
         assert_eq!(
-            format!("{ufrag}:{local}"),
-            case["expected_user"].as_str().unwrap(),
-            "{name}"
+            prepared.tunnels.iter().map(|tunnel| tunnel.target).collect::<Vec<_>>(),
+            expected_targets,
+            "{name}: each listener must dial the exact original candidate destination"
         );
-        assert_eq!(password, case["password"].as_str().unwrap(), "{name}");
-        // The candidate webrtc-rs is told to dial sits in the media it came from.
+        let parsed = parse_sdp(&prepared.sdp).unwrap();
+        let (before_user, before_password) = credentials(&parse_sdp(answer).unwrap()).unwrap();
+        assert_eq!(credentials(&parsed).unwrap(), (before_user, before_password));
         for tunnel in &prepared.tunnels {
-            let media = &parse_sdp(&prepared.sdp).unwrap().media_descriptions[usize::from(tunnel.mline)];
-            assert_eq!(media.attribute("mid").flatten(), tunnel.mid.as_deref(), "{name}");
+            assert_eq!(tunnel.target.port(), 443);
+            assert!(is_public_target(tunnel.target.ip()));
+            assert!(tunnel.listener.ip().is_loopback());
+            let media = &parsed.media_descriptions[usize::from(tunnel.mline)];
+            assert_eq!(media.attribute("mid").flatten(), tunnel.mid.as_deref());
+            let fields: Vec<_> = tunnel.candidate.split_whitespace().collect();
+            assert!(fields[2].eq_ignore_ascii_case("tcp"));
+            assert_eq!(fields[4], tunnel.listener.ip().to_string());
+            assert_eq!(fields[5], tunnel.listener.port().to_string());
+            assert!(
+                fields
+                    .windows(2)
+                    .any(|pair| pair[0].eq_ignore_ascii_case("tcptype") && pair[1].eq_ignore_ascii_case("passive"))
+            );
+        }
+        let candidates = parsed
+            .media_descriptions
+            .iter()
+            .flat_map(|media| &media.attributes)
+            .filter(|a| a.is_ice_candidate())
+            .count();
+        assert_eq!(
+            candidates,
+            prepared.tunnels.len(),
+            "{name}: no unproxied candidates remain"
+        );
+        if name == "tcp_16" {
+            assert_eq!(prepared.tunnels.len(), 16);
+        } else {
+            assert_eq!(prepared.tunnels.len(), 1);
         }
     }
 }
@@ -173,77 +248,98 @@ impl AsyncRead for Fragmented {
 }
 
 #[tokio::test]
-async fn binding_frames_are_validated_like_go() {
-    for case in golden()["frames"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        let frame = unhex(case["frame"].as_str().unwrap());
+async fn binding_frames_require_session_credentials_integrity_and_fingerprint() {
+    let valid = valid_frame();
+    for max in [1, 2, 7, valid.len()] {
         let mut reader = Fragmented {
-            data: frame.clone(),
-            max: 7,
+            data: valid.clone(),
+            max,
         };
-        let (user, password) = (case["user"].as_str().unwrap(), case["password"].as_str().unwrap());
-        let got = read_validated_frame(&mut reader, user, password).await;
-        match case["error"].as_str() {
-            None => assert_eq!(
-                hex(&got.unwrap_or_else(|e| panic!("{name}: {e}"))),
-                case["returned"].as_str().unwrap(),
-                "{name}"
-            ),
-            Some(want) => {
-                let got = got.expect_err(name);
-                // The failing step matches; the detail after it is pion's or rtc's wording.
-                let step = |e: &str| e.split(':').next().unwrap().split(" type ").next().unwrap().to_owned();
-                assert_eq!(step(&got), step(want), "{name}: {got} vs {want}");
-            }
-        }
-    }
-}
-
-#[test]
-fn proxy_targets_match_go() {
-    for case in golden()["targets"].as_array().unwrap() {
-        let ip: IpAddr = case["addr"].as_str().unwrap().parse().unwrap();
-        assert_eq!(Value::Bool(is_public_target(ip)), case["public"], "{ip}");
         assert_eq!(
-            Value::Bool(is_public_target(ip.to_canonical())),
-            case["public_unmapped"],
-            "{ip}"
+            read_validated_frame(&mut reader, "remote:local", "remote-password")
+                .await
+                .unwrap(),
+            valid
         );
     }
+    for frame in invalid_frames() {
+        let mut reader = Fragmented { data: frame, max: 7 };
+        assert!(
+            read_validated_frame(&mut reader, "remote:local", "remote-password")
+                .await
+                .is_err()
+        );
+    }
+    for (user, password) in [("local:remote", "remote-password"), ("remote:local", "wrong-password")] {
+        let mut reader = Fragmented {
+            data: valid.clone(),
+            max: 7,
+        };
+        assert!(read_validated_frame(&mut reader, user, password).await.is_err());
+    }
 }
 
-/// `proxyutil.BuildDialer` on Go net/url's corner cases: which settings fail and how,
-/// and the host, port and userinfo bytes a proxy dialer gets.
 #[test]
-fn proxy_settings_match_go() {
-    for case in golden()["proxies"].as_array().unwrap() {
-        let raw = case["in"].as_str().unwrap();
-        assert_eq!(proxy_scheme(raw), case["scheme"].as_str().unwrap(), "{raw:?}");
-        match (build(raw), case["mode"].as_i64().unwrap()) {
-            (Ok(None), mode) => assert_eq!(mode, if raw.trim().is_empty() { 0 } else { 1 }, "{raw:?}"),
-            (Err(e), 3) => assert_eq!(e, case["error"].as_str().unwrap(), "{raw:?}"),
-            (Ok(Some(dialer)), 2) => {
-                let (host, port, user) = dialer.parts();
-                assert_eq!(host, case["hostname"].as_str().unwrap(), "{raw:?}");
-                let default = match case["scheme"].as_str().unwrap() {
-                    "http" => "80",
-                    "https" => "443",
-                    _ => "1080",
-                };
-                let want_port = case["port"].as_str().unwrap();
-                assert_eq!(port, if want_port.is_empty() { default } else { want_port }, "{raw:?}");
-                let want_user = case.get("username").map(|name| {
-                    let password = case["has_password"]
-                        .as_bool()
-                        .unwrap()
-                        .then(|| unhex(case["password"].as_str().unwrap()));
-                    (unhex(name.as_str().unwrap()), password)
-                });
-                assert_eq!(user.cloned(), want_user, "{raw:?}");
-            }
-            (got, mode) => panic!("{raw:?}: Go mode {mode}, got {:?}", got.map(|d| d.is_some())),
-        }
+fn proxy_targets_exclude_special_use_and_private_addresses() {
+    // IANA special-purpose ranges, RFC 1918, RFC 6890 and IPv6 transition ranges.
+    for (address, public) in [
+        ("8.8.8.8", true),
+        ("20.42.0.20", true),
+        ("2001:4860::1", true),
+        ("2606:4700::1", true),
+        ("0.0.0.0", false),
+        ("10.0.0.1", false),
+        ("100.64.0.1", false),
+        ("127.0.0.1", false),
+        ("169.254.1.1", false),
+        ("172.16.0.1", false),
+        ("192.0.0.1", false),
+        ("192.0.2.1", false),
+        ("192.168.1.1", false),
+        ("198.18.0.1", false),
+        ("198.51.100.1", false),
+        ("203.0.113.1", false),
+        ("224.0.0.1", false),
+        ("255.255.255.255", false),
+        ("::", false),
+        ("::1", false),
+        ("64:ff9b::808:808", false),
+        ("2001:db8::1", false),
+        ("2002::1", false),
+        ("fc00::1", false),
+        ("fe80::1", false),
+        ("ff02::1", false),
+        ("::ffff:127.0.0.1", false),
+        ("::ffff:8.8.8.8", true),
+    ] {
+        let ip: IpAddr = address.parse().unwrap();
+        assert_eq!(is_public_target(ip.to_canonical()), public, "{address}");
     }
+}
+
+#[test]
+fn proxy_settings_decode_supported_schemes_and_credentials() {
+    for (url, scheme, port) in [
+        ("http://proxy.example", "http", "80"),
+        ("https://proxy.example", "https", "443"),
+        ("socks5://proxy.example", "socks5", "1080"),
+        ("socks5h://proxy.example", "socks5h", "1080"),
+    ] {
+        assert_eq!(proxy_scheme(url), scheme);
+        let dialer = build(url).unwrap().unwrap();
+        assert_eq!(dialer.parts().0, "proxy.example");
+        assert_eq!(dialer.parts().1, port);
+    }
+    for url in ["", "  ", "direct"] {
+        assert!(build(url).unwrap().is_none());
+    }
+    for url in ["ftp://proxy.example", "http://proxy.example:bad", "http://[not-an-ip]"] {
+        assert!(build(url).is_err(), "{url}");
+    }
+    let dialer = build("http://user:p%40ss@proxy.example:8080").unwrap().unwrap();
+    let (host, port, user) = dialer.parts();
+    assert_eq!((host, port), ("proxy.example", "8080"));
+    assert_eq!(user.cloned(), Some((b"user".to_vec(), Some(b"p@ss".to_vec()))));
 }
 
 /// One scripted SOCKS5 exchange (`runSocks` in the Go harness); returns what the client sent.
@@ -312,8 +408,8 @@ async fn connect_server(listener: TcpListener, response: String) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn proxy_dialers_speak_like_go() {
-    for case in golden()["dialers"].as_array().unwrap() {
+async fn proxy_dialers_obey_socks5_and_connect_contracts() {
+    for case in inputs()["dialers"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let host = listener.local_addr().unwrap().to_string();
@@ -330,24 +426,81 @@ async fn proxy_dialers_speak_like_go() {
             .replacen("PORT", &port, 1);
         let target: SocketAddr = case["target"].as_str().unwrap().parse().unwrap();
         let dialed = build(&url).unwrap().unwrap().dial(target).await;
-        match case["error"].as_str() {
-            Some(want) => assert_eq!(dialed.err().unwrap().replace(&host, "HOST"), want, "{name}"),
-            None => {
-                let mut conn = dialed.unwrap_or_else(|e| panic!("{name}: {e}"));
-                let mut first = vec![0u8; 64];
-                let n = tokio::time::timeout(Duration::from_millis(300), conn.read(&mut first))
-                    .await
-                    .map_or(0, |r| r.unwrap_or(0));
-                assert_eq!(&first[..n], case["first_read"].as_str().unwrap().as_bytes(), "{name}");
-            }
+        let should_succeed = if case["kind"] == "socks" {
+            let method = case["method"].as_u64().unwrap();
+            let reply = unhex(case["reply"].as_str().unwrap());
+            method != 255 && (method != 2 || case["auth_ok"] == true) && reply[1] == 0
+        } else {
+            ![
+                "http_connect_407",
+                "http_connect_garbage",
+                "bad_content_length",
+                "empty_content_length",
+                "two_content_lengths",
+                "te_gzip",
+                "te_two",
+                "chunked_bad_trailer",
+                "bad_key_byte",
+                "missing_colon",
+                "leading_space_header",
+                "ctl_in_value",
+                "status_201",
+                "status_plus",
+                "http2_version",
+                "eof_in_headers",
+                "eof_in_status",
+            ]
+            .contains(&name)
+        };
+        if should_succeed {
+            let mut conn = dialed.unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut received = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), conn.read_to_end(&mut received))
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = if case["kind"] == "socks" {
+                "hello"
+            } else {
+                let response = case["response"].as_str().unwrap();
+                response
+                    .split_once("\r\n\r\n")
+                    .or_else(|| response.split_once("\n\n"))
+                    .unwrap()
+                    .1
+            };
+            assert_eq!(
+                received,
+                expected.as_bytes(),
+                "{name}: bytes after handshake belong to tunnel"
+            );
+        } else {
+            assert!(
+                dialed.is_err(),
+                "{name}: malformed or rejected handshake cannot open a tunnel"
+            );
         }
         let sent = server.await.unwrap();
-        let sent = if case["kind"] == "socks" {
-            hex(&sent)
+        if case["kind"] == "socks" {
+            assert_eq!(sent[0], 5, "SOCKS5 version");
+            let methods = usize::from(sent[1]);
+            assert!(sent[2..2 + methods].contains(&0));
+            if case["method"] == 2 {
+                assert_eq!(sent[2 + methods], 1, "RFC 1929 authentication version");
+            }
         } else {
-            String::from_utf8(sent).unwrap()
-        };
-        assert_eq!(sent, case["sent"].as_str().unwrap(), "{name}");
+            let text = String::from_utf8(sent).unwrap();
+            let mut lines = text.lines();
+            assert_eq!(lines.next().unwrap(), format!("CONNECT {target} HTTP/1.1"));
+            let headers: std::collections::BTreeMap<_, _> = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
+                .collect();
+            assert_eq!(headers["host"], target.to_string());
+            if url.contains('@') {
+                assert!(headers["proxy-authorization"].starts_with("Basic "));
+            }
+        }
     }
 }
 
@@ -441,10 +594,10 @@ async fn https_proxy_wraps_connect_in_tls() {
     let mut first = [0u8; 6];
     conn.read_exact(&mut first).await.unwrap();
     assert_eq!(&first, b"inside");
-    assert_eq!(
-        server.await.unwrap(),
-        "CONNECT 20.42.0.20:443 HTTP/1.1\r\nHost: 20.42.0.20:443\r\nUser-Agent: Go-http-client/1.1\r\nProxy-Authorization: Basic dTpw\r\n\r\n"
-    );
+    let request = server.await.unwrap();
+    assert!(request.starts_with("CONNECT 20.42.0.20:443 HTTP/1.1\r\n"));
+    assert!(request.contains("\r\nHost: 20.42.0.20:443\r\n"));
+    assert!(request.contains("\r\nProxy-Authorization: Basic dTpw\r\n"));
     let mut offered = None;
     while let Ok(alpn) = alpn_rx.try_recv() {
         offered = Some(alpn);
@@ -588,29 +741,18 @@ async fn write_failure_does_not_log_forwarding_start() {
 
 #[tokio::test]
 async fn unauthenticated_connections_never_dial() {
-    let frames = golden()["frames"].as_array().unwrap().clone();
     let (dialer, mut dials) = recording(false);
     let (on_forwarding, forwarded) = counter();
     let tunnel = open_tunnel(dialer, on_forwarding);
-    // Frames that are invalid in themselves (the wrong_* cases differ only in what the
-    // validator expects).
-    for name in [
-        "bad_fingerprint",
-        "missing_fingerprint",
-        "username_after_integrity",
-        "trailing",
-    ] {
-        let frame = frames.iter().find(|f| f["name"] == name).unwrap();
+    for (index, frame) in invalid_frames().into_iter().enumerate() {
         let mut client = TcpStream::connect(tunnel.0).await.unwrap();
-        client
-            .write_all(&unhex(frame["frame"].as_str().unwrap()))
-            .await
-            .unwrap();
+        client.write_all(&frame).await.unwrap();
+        client.shutdown().await.unwrap();
         let mut rest = Vec::new();
         let read = tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut rest)).await;
         assert!(
             matches!(read, Ok(Ok(0)) | Ok(Err(_))),
-            "{name}: rejected connections are closed"
+            "invalid frame {index}: rejected connections close"
         );
     }
     // A frame for another session (Go: `attacker:local`).

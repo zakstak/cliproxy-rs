@@ -335,17 +335,20 @@ mod tests {
 
     /// Go `TestConcurrencyReleaseFrameFixture`.
     #[test]
-    fn frame_matches_go_fixture() {
-        // internal/home/testdata/concurrency_release.json
-        let frame = ReleaseFrame {
-            credential_id: "cred-1".into(),
-            model: "gpt".into(),
-            release_seq: 1,
-        };
-        let fixture = include_str!("../tests/fixtures/concurrency_release.json");
-        assert_eq!(String::from_utf8(frame.to_json()).unwrap(), fixture.trim());
+    fn release_frame_carries_identity_model_and_cumulative_sequence() {
+        for sequence in [1, 3, i64::MAX] {
+            let frame = ReleaseFrame {
+                credential_id: "credential<&>".into(),
+                model: "gpt".into(),
+                release_seq: sequence,
+            };
+            let actual: serde_json::Value = serde_json::from_slice(&frame.to_json()).unwrap();
+            assert_eq!(
+                actual,
+                serde_json::json!({"credential_id":"credential<&>", "model":"gpt", "release_seq":sequence})
+            );
+        }
     }
-
     #[test]
     fn invalid_marks_have_no_ticket() {
         let flusher = ReleaseFlusher::new();

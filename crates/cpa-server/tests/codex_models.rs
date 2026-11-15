@@ -9,10 +9,10 @@ use cpa_exec::Executors;
 use cpa_server::router;
 use serde_json::Value;
 
-mod forward_port;
-
 async fn get(path: &str, cfg: &str) -> (u16, String, Value) {
-    let cfg = Config::parse(cfg).unwrap();
+    let dir = std::env::temp_dir().join(format!("cpa-catalog-contract-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = Config::parse(&format!("{cfg}\noauth: {{auth-dir: {}}}\n", dir.display())).unwrap();
     let credentials = cpa_core::config::credentials::from_config(&cfg);
     let executors = Executors {
         claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
@@ -32,6 +32,7 @@ async fn get(path: &str, cfg: &str) -> (u16, String, Value) {
         .map(|v| v.to_str().unwrap().to_owned())
         .unwrap_or_default();
     let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
     (status, content_type, body)
 }
 
@@ -75,125 +76,148 @@ async fn client_version_selects_the_codex_catalog() {
     assert_eq!(body["object"], "list");
 }
 
-/// The same config through Go's synthesis, registration and handler
-/// (tests/reference/codex_models): every client version's catalog must match byte for
-/// byte, including what config models declare (explicit thinking and input modalities)
-/// and the native web-search capability CPA clients see.
+/// Configured aliases, capability bounds and first-party catalog templates are separate contracts.
 #[tokio::test]
-async fn catalog_matches_go_for_config_models() {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/codex_models_go.json")).unwrap();
-    // The recorded OpenAI-compatible group and its models went with that provider
-    // (issue #49).
-    let cfg = cpa_core::removed::strip_settings(fixture["config"].as_str().unwrap());
+async fn configured_models_expose_aliases_reasoning_and_client_capabilities() {
+    let config = format!("{CONFIG}    # model catalog contract\n");
+    let config = config.replace("        max-context-length: 150000", "        max-context-length: 150000\n      - name: claude-opus-4-6\n        alias: opus-think\n        thinking:\n          levels: [low, high]");
+    let templates: Value = serde_json::from_str(cpa_common::codex_client::CLIENT_MODELS_JSON).unwrap();
+    let template = templates["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "gpt-5.5")
+        .unwrap();
     for version in ["0.150.0", "cpa", "0.143.0"] {
-        let (status, _, body) = get(&format!("/v1/models?client_version={version}"), &cfg).await;
+        let (status, _, body) = get(&format!("/v1/models?client_version={version}"), &config).await;
         assert_eq!(status, 200);
-        let want: Value = serde_json::from_str(fixture[version].as_str().unwrap()).unwrap();
-        let want: Vec<Value> = want["models"]
+        let models = body["models"].as_array().unwrap();
+        let mut slugs = models.iter().map(|m| m["slug"].as_str().unwrap()).collect::<Vec<_>>();
+        slugs.sort_unstable();
+        assert_eq!(slugs, ["gpt-5.5", "opus-think", "sonnet-long"]);
+        let find = |slug: &str| models.iter().find(|m| m["slug"] == slug).unwrap();
+        let codex = find("gpt-5.5");
+        // This static template is the shipped first-party catalog, not recorded proxy output.
+        for field in [
+            "base_instructions",
+            "model_messages",
+            "input_modalities",
+            "context_window",
+            "supported_reasoning_levels",
+        ] {
+            assert_eq!(codex[field], template[field], "{version}: {field}");
+        }
+        assert_eq!(codex["multi_agent_version"], "v2");
+        if version == "cpa" {
+            assert_eq!(codex["cpa_capabilities"]["web_search"], true);
+        } else {
+            assert!(codex.get("cpa_capabilities").is_none());
+        }
+        let opus = find("opus-think");
+        let efforts = opus["supported_reasoning_levels"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|m| !m["slug"].as_str().unwrap().starts_with("acme-"))
-            .cloned()
-            .collect();
-        let (got, want) = (body["models"].as_array().unwrap(), &want);
-        let slugs = |m: &[Value]| {
-            m.iter()
-                .map(|e| e["slug"].as_str().unwrap().to_owned())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(slugs(got), slugs(want), "{version}: models and order");
-        // A synthesized entry's priority follows its position, which the removed group's
-        // models no longer take; the order of priorities still matches Go's.
-        let priorities = |m: &[Value]| m.iter().map(|e| e["priority"].as_i64()).collect::<Vec<_>>();
-        let order = |p: Vec<Option<i64>>| {
-            let mut idx: Vec<usize> = (0..p.len()).collect();
-            idx.sort_by_key(|&i| p[i]);
-            idx
-        };
+            .map(|e| e["effort"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(efforts, ["low", "high"]);
+        let sonnet = find("sonnet-long");
+        assert_eq!(sonnet["context_window"], 150000);
+        assert_eq!(sonnet["max_context_window"], 150000);
+        for model in models {
+            assert!(model["display_name"].is_string());
+            assert!(model["priority"].is_i64());
+            assert_eq!(model["multi_agent_version"], "v2");
+            assert!(model["supported_in_api"].as_bool().unwrap());
+        }
         assert_eq!(
-            order(priorities(got)),
-            order(priorities(want)),
-            "{version}: priority order"
+            models[0]["slug"], "gpt-5.5",
+            "first-party templates precede synthesized entries"
         );
-        for (g, w) in got.iter().zip(want) {
-            let (mut g, mut w) = (g.clone(), w.clone());
-            g.as_object_mut().unwrap().remove("priority");
-            w.as_object_mut().unwrap().remove("priority");
-            let (g, w) = (&g, &w);
-            // Go's `gpt-5.5` entry took the recorded OpenAI-compatible group's config model
-            // (text only, low and xhigh effort, no apply_patch). Codex alone serves it now,
-            // so it is the Codex catalog template.
-            if w["slug"] == "gpt-5.5" {
-                let catalog: Value = serde_json::from_str(cpa_common::codex_client::CLIENT_MODELS_JSON).unwrap();
-                let mut expected = catalog["models"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|m| m["slug"] == "gpt-5.5")
-                    .unwrap()
-                    .clone();
-                expected.as_object_mut().unwrap().remove("priority");
-                // The configured Codex model keeps its pinned template plus the
-                // configured name and explicitly enabled client flag.
-                expected["display_name"] = serde_json::json!("gpt-5.5");
-                expected["multi_agent_version"] = serde_json::json!("v2");
-                if version == "cpa" {
-                    expected["cpa_capabilities"] = serde_json::json!({"web_search":true});
-                }
-                let mut got_keys: Vec<_> = g.as_object().unwrap().keys().collect();
-                let mut want_keys: Vec<_> = expected.as_object().unwrap().keys().collect();
-                got_keys.sort();
-                want_keys.sort();
-                assert_eq!(got_keys, want_keys, "{version}: full template keys");
-                for (key, value) in expected.as_object().unwrap() {
-                    assert_eq!(g.get(key), Some(value), "{version}: template field {key}");
-                }
-                continue;
-            }
-            assert_eq!(g, w, "{version}: {}", w["slug"]);
+    }
+}
+
+/// Native search requires every serving credential to support it, including mixed pools.
+#[tokio::test]
+async fn tool_search_catalog_requires_a_uniformly_capable_credential_pool() {
+    let config = r#"
+claude:
+  tool-search: true
+claude-api-key:
+  - api-key: sk-FAKE-origin
+    models:
+      - {name: claude-sonnet-4-6, alias: sonnet-native}
+      - {name: claude-sonnet-4-0, alias: sonnet-legacy}
+  - api-key: sk-FAKE-trusted
+    base-url: http://127.0.0.1:1
+    native-tool-search: true
+    models:
+      - {name: claude-opus-4-6, alias: opus-trusted}
+      - {name: claude-opus-4-6, alias: opus-mixed}
+  - api-key: sk-FAKE-gateway
+    base-url: http://127.0.0.1:1
+    models:
+      - {name: claude-haiku-4-5, alias: haiku-gateway}
+      - {name: claude-opus-4-6, alias: opus-mixed}
+"#;
+    for enabled in [true, false] {
+        let config = config.replace("tool-search: true", &format!("tool-search: {enabled}"));
+        let (status, _, body) = get("/v1/models?client_version=0.150.0", &config).await;
+        assert_eq!(status, 200);
+        let models = body["models"].as_array().unwrap();
+        assert_eq!(models.len(), 5);
+        for (slug, capable) in [
+            ("sonnet-native", true),
+            ("sonnet-legacy", false),
+            ("opus-trusted", true),
+            ("opus-mixed", false),
+            ("haiku-gateway", false),
+        ] {
+            let model = models.iter().find(|m| m["slug"] == slug).unwrap();
+            assert_eq!(
+                model["supports_search_tool"],
+                enabled && capable,
+                "{slug}, enabled={enabled}"
+            );
         }
     }
 }
 
-/// upstream.claude.tool-search on (tests/reference/codex_models `TestRSFixCodexToolSearch`):
-/// a Claude model advertises the search tool only when every credential serving it has
-/// native tool search for its execution model (Anthropic's origin, a trusted key, not a
-/// legacy model).
+/// Unconfigured Codex credentials advertise the supported catalog and image built-ins.
 #[tokio::test]
-async fn tool_search_catalog_matches_go() {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/codex_tool_search_go.json")).unwrap();
-    let (status, _, body) = get("/v1/models?client_version=0.150.0", fixture["config"].as_str().unwrap()).await;
+async fn codex_builtin_catalog_has_unique_client_model_records() {
+    let (status, _, body) = get(
+        "/v1/models",
+        "codex-api-key:\n  - api-key: sk-FAKE-builtins\n    base-url: http://127.0.0.1:1\n",
+    )
+    .await;
     assert_eq!(status, 200);
-    let want: Value = serde_json::from_str(fixture["0.150.0"].as_str().unwrap()).unwrap();
-    let (got, want) = (body["models"].as_array().unwrap(), want["models"].as_array().unwrap());
-    assert_eq!(got.len(), want.len());
-    for (g, w) in got.iter().zip(want) {
-        assert_eq!(g, w, "{}", w["slug"]);
+    assert_eq!(body["object"], "list");
+    let entries = body["data"].as_array().unwrap();
+    let ids = entries
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(ids.len(), entries.len(), "one record per model");
+    for id in [
+        "gpt-5.5",
+        "gpt-6-sol",
+        "gpt-6-luna",
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "gpt-6.1-terra",
+        "gpt-image-1.5",
+        "gpt-image-2",
+        "gpt-image-2.6-flare",
+        "gpt-image-2.6-sunburst",
+    ] {
+        assert!(ids.contains(id), "missing supported built-in {id}");
     }
-}
-
-/// A Codex API key without configured models serves the Pro catalog plus the gpt-image-*
-/// built-ins (Go `WithCodexBuiltins`), as Go's `/v1/models` lists them
-/// (tests/reference/codex_models `TestRSFixCodexBuiltins`). Compared as a set: list order
-/// is the registry's concern. GPT Image 2.6 and GPT-6.1 Terra (K1, #68) are forward
-/// ports past Go's recording (docs/DIFFERENCES-FROM-GO.md).
-#[tokio::test]
-async fn codex_builtins_match_go_models_list() {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/codex_builtins_go.json")).unwrap();
-    let (status, _, body) = get("/v1/models", fixture["config"].as_str().unwrap()).await;
-    assert_eq!(status, 200);
-    let mut want: Value = serde_json::from_str(fixture["models"].as_str().unwrap()).unwrap();
-    forward_port::gpt_image_26::openai_models(&mut want);
-    forward_port::k1_catalog::codex_openai_models(&mut want);
-    let sorted = |list: &Value| {
-        let mut entries = list["data"].as_array().unwrap().clone();
-        entries.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-        entries
-    };
-    let (got, want) = (sorted(&body), sorted(&want));
-    assert!(want.iter().any(|m| m["id"] == "gpt-image-2"), "Go lists the built-ins");
-    assert_eq!(got, want);
+    for entry in entries {
+        assert_eq!(entry["object"], "model");
+        assert_eq!(entry["owned_by"], "openai");
+        assert!(entry["created"].as_i64().is_some_and(|t| t > 0));
+    }
 }
 
 /// M1-0128 `GET /v1/models/*model`: the entry from the catalog this client would list,

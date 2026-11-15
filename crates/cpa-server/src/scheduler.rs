@@ -2577,11 +2577,10 @@ mod tests {
         assert!(after.iter().all(Option::is_some));
     }
 
-    /// Which cooldowns the SIWC recovery clears: model keys match a 401 or
-    /// "unauthorized" in the error (Go's status-message check), the credential-wide key
-    /// only Go's `isUnauthorizedError`; other causes and other credentials stay.
+    /// Authorization recovery clears only relevant model or credential blocks.
+    /// Other error causes and other credentials retain their cooldowns.
     #[test]
-    fn clear_unauthorized_matches_go_per_key_kind() {
+    fn authorization_recovery_clears_only_matching_credential_and_error_categories() {
         let now = Instant::now();
         let cooldown = |status: u16, error: &str| Cooldown {
             deadline: now + Duration::from_secs(600),
@@ -2684,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn normalization_matches_go_runtime_not_example_config() {
+    fn routing_configuration_normalizes_supported_names_defaults_and_negative_limits() {
         for (raw, expected) in [
             (" WRR ", Strategy::WeightedRoundRobin),
             ("weightedroundrobin", Strategy::WeightedRoundRobin),
@@ -2758,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    fn go_duration_decimal_compound_units_and_overflow() {
+    fn duration_configuration_accepts_saved_units_fractions_and_refuses_overflow() {
         for (raw, expected) in [
             ("1h2m3.4s", 3_723_400_000_000),
             (".5s", 500_000_000),
@@ -4671,182 +4670,302 @@ mod tests {
         }
     }
 
-    /// Go `Manager.MarkResult` cooldowns: goldens from tests/reference/server/main.go,
-    /// replayed with upstream-shaped errors (headers present, executor scopes).
     #[test]
-    fn cooldowns_match_go_mark_result() {
-        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        let cases = fixture["cooldown"].as_array().unwrap();
-        assert_eq!(cases.len(), 25);
-        // Go trusts every stated reset (docs/DIFFERENCES-FROM-GO.md).
+    fn cooldown_policy_owns_status_hint_quota_and_expiry_transitions() {
+        let now = Instant::now();
+        let c = cred("local-policy", serde_json::json!({}));
         let policy = Policy {
             max_trusted_cooldown: Duration::ZERO,
             ..Policy::default()
         };
-        for case in cases {
-            let name = case["name"].as_str().unwrap();
-            let c = cred(&format!("{name}.json"), serde_json::json!({}));
+        // These are the proxy's local retry policy, not provider reset claims.
+        for (status, message, hint, scope, seconds, quota) in [
+            (400, "bad request", None, FailureScope::Request, 0, false),
+            (401, "unauthorized", None, FailureScope::Credential, 1800, false),
+            (402, "payment required", None, FailureScope::Credential, 1800, false),
+            (403, "forbidden", None, FailureScope::Credential, 1800, false),
+            (404, "not found", None, FailureScope::Request, 43200, false),
+            (404, "not found", Some(60), FailureScope::Request, 60, false),
+            (408, "timeout", None, FailureScope::Credential, 60, false),
+            (418, "unexpected status", None, FailureScope::Request, 60, false),
+            (429, "rate limited", None, FailureScope::Model, 1, true),
+            (429, "rate limited", Some(0), FailureScope::Model, 10, true),
+            (429, "rate limited", Some(3), FailureScope::Model, 10, true),
+            (429, "rate limited", Some(30), FailureScope::Model, 30, true),
+            (500, "upstream failure", None, FailureScope::Credential, 60, false),
+            (500, "upstream failure", Some(5), FailureScope::Credential, 5, false),
+            (503, "overloaded", None, FailureScope::Credential, 60, false),
+            (
+                400,
+                "The requested model is not supported",
+                None,
+                FailureScope::Request,
+                43200,
+                false,
+            ),
+            (404, "model_not_supported", Some(90), FailureScope::Request, 90, false),
+            (
+                400,
+                r#"{"error":"invalid_grant"}"#,
+                None,
+                FailureScope::Request,
+                1800,
+                false,
+            ),
+            (
+                403,
+                "<html>Just a moment... cloudflare</html>",
+                None,
+                FailureScope::Credential,
+                10,
+                true,
+            ),
+        ] {
             let mut s = Scheduler::default();
-            let now = Instant::now();
-            for step in case["steps"].as_array().unwrap() {
-                let status = step["status"].as_u64().unwrap() as u16;
-                let scope = if step["credential_scope"].as_bool().unwrap() {
-                    FailureScope::Credential
-                } else {
-                    match status {
-                        429 => FailureScope::Model,
-                        401..=403 | 408 | 500.. => FailureScope::Credential,
-                        _ => FailureScope::Request,
-                    }
-                };
-                let mut error = ExecError::local(status, scope, step["message"].as_str().unwrap());
-                error
-                    .headers
-                    .insert("content-type", "application/json".parse().unwrap());
-                let hint = step["retry_after_ms"].as_i64().unwrap();
-                error.retry_after = (hint >= 0).then(|| Duration::from_millis(hint as u64));
-                s.record(
-                    &c,
-                    step["model"].as_str().unwrap(),
-                    &Outcome::Failure(error),
-                    &policy,
-                    now,
-                );
-            }
-            for (model, seconds) in case["seconds"].as_object().unwrap() {
-                let wait = s.wait(&c, model, now).unwrap_or_default();
-                assert_eq!(
-                    wait.as_secs_f64().round() as u64,
-                    seconds.as_u64().unwrap(),
-                    "{name} {model} wait"
-                );
-                let quota = case["quota"][model].as_bool().unwrap();
-                // Go keeps `Quota.Exceeded` on an expired state; only a live one matters.
-                assert_eq!(
-                    s.quota_cooling(&c, model, now),
-                    quota && wait > Duration::ZERO,
-                    "{name} {model} quota"
-                );
-            }
+            let mut error = ExecError::local(status, scope, message);
+            error.retry_after = hint.map(Duration::from_secs);
+            error
+                .headers
+                .insert("content-type", "application/json".parse().unwrap());
+            let outcome = Outcome::Failure(error);
+            s.record(&c, "model-a", &outcome, &policy, now);
+            let expected = (seconds > 0).then(|| Duration::from_secs(seconds));
+            assert_eq!(s.wait(&c, "model-a", now), expected, "{status} {message} {hint:?}");
+            assert_eq!(s.quota_cooling(&c, "model-a", now), quota);
+            assert_eq!(
+                s.wait(&c, "unrelated", now),
+                None,
+                "model-local failure does not cool siblings"
+            );
+            // Simultaneous duplicate failures never shorten or multiply a live wait.
+            s.record(&c, "model-a", &outcome, &policy, now);
+            assert_eq!(s.wait(&c, "model-a", now), expected, "duplicate {status} {message}");
+            let expired = now + Duration::from_secs(seconds);
+            assert_eq!(s.wait(&c, "model-a", expired), None);
+            assert!(!s.quota_cooling(&c, "model-a", expired));
+        }
+        for (initial, hint) in [(500, None), (401, Some(5)), (429, Some(120))] {
+            let mut s = Scheduler::default();
+            let first_hint = (initial == 429).then(|| Duration::from_secs(120));
+            let mut first = ExecError::local(initial, FailureScope::Model, "initial failure");
+            first.retry_after = first_hint;
+            s.record(&c, "model-a", &Outcome::Failure(first), &policy, now);
+            let previous = s.wait(&c, "model-a", now).unwrap();
+            let mut quota = ExecError::local(429, FailureScope::Model, "rate limited");
+            quota.retry_after = hint.map(Duration::from_secs);
+            s.record(&c, "model-a", &Outcome::Failure(quota), &policy, now);
+            assert_eq!(
+                s.wait(&c, "model-a", now),
+                Some(previous.max(hint.map(Duration::from_secs).unwrap_or(Duration::from_secs(1))))
+            );
+            assert!(s.quota_cooling(&c, "model-a", now));
+        }
+        for (sibling_status, hint, sibling_expected) in [(500, 600, 600), (401, 20, 1800)] {
+            let mut s = Scheduler::default();
+            s.record(
+                &c,
+                "sibling",
+                &Outcome::Failure(ExecError::local(
+                    sibling_status,
+                    FailureScope::Credential,
+                    "previous failure",
+                )),
+                &policy,
+                now,
+            );
+            let mut quota = ExecError::local(429, FailureScope::Credential, "account quota");
+            quota.retry_after = Some(Duration::from_secs(hint));
+            s.record(&c, "model-a", &Outcome::Failure(quota), &policy, now);
+            assert_eq!(s.wait(&c, "model-a", now), Some(Duration::from_secs(hint)));
+            assert_eq!(s.wait(&c, "sibling", now), Some(Duration::from_secs(sibling_expected)));
+            assert!(s.quota_cooling(&c, "model-a", now));
+            assert!(s.quota_cooling(&c, "sibling", now));
         }
     }
-
-    /// Go `SessionAffinitySelector` (`Enrich`, `Pick` with fill-first, `OnResult`):
-    /// goldens from tests/reference/server/main.go.
     #[test]
-    fn session_affinity_matches_go_selector() {
-        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        let cases = fixture["affinity"].as_array().unwrap();
-        assert_eq!(cases.len(), 25);
-        for case in cases {
-            let name = case["name"].as_str().unwrap();
-            let lcp_case = case["lcp"].as_bool().unwrap_or_default();
-            let creds: Vec<Credential> = ["a", "b", "c"]
-                .iter()
-                .map(|id| {
-                    let mut c = cred(id, serde_json::json!({}));
-                    if let Some(p) = case["priorities"][*id].as_str() {
-                        c.attributes.insert("priority".into(), p.into());
-                    }
-                    c
-                })
-                .collect();
-            let policy = Policy {
-                strategy: Strategy::FillFirst,
-                session_affinity: true,
-                session_affinity_subagents: case["subagent_affinity"].as_bool().unwrap(),
-                ..Default::default()
-            };
+    fn session_affinity_transitions_preserve_bindings_until_a_relevant_failure() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let now = Instant::now();
+        let policy = affinity_policy(60);
+        let sel = Selection {
+            session: Some("header:conversation".into()),
+            caller: "caller".into(),
+            ..selection("m")
+        };
+        let mut scheduler = Scheduler::default();
+        assert_eq!(scheduler.pick(&tag(&[&b]), &sel, &policy, now).unwrap().id, "b");
+        assert_eq!(scheduler.pick(&tag(&[&a, &b]), &sel, &policy, now).unwrap().id, "b");
+        scheduler.session_result(&a, &sel, &Outcome::Success, &policy, None, now);
+        assert_eq!(
+            scheduler.pick(&tag(&[&a, &b]), &sel, &policy, now).unwrap().id,
+            "b",
+            "a delayed success on another credential does not rebind"
+        );
+        let request_error = Outcome::Failure(ExecError::local(400, FailureScope::Request, "bad request"));
+        scheduler.session_result(&b, &sel, &request_error, &policy, None, now);
+        assert_eq!(scheduler.pick(&tag(&[&a, &b]), &sel, &policy, now).unwrap().id, "b");
+        scheduler.session_result(
+            &b,
+            &sel,
+            &Outcome::Failure(ExecError::local(500, FailureScope::Credential, "upstream failure")),
+            &policy,
+            None,
+            now,
+        );
+        assert_eq!(scheduler.pick(&tag(&[&a, &b]), &sel, &policy, now).unwrap().id, "a");
+        // The explicit parent relationship is inherited only when the subagent policy allows it.
+        for (subagents, child_id, fork, expected) in [
+            (true, "claude:root:agent:worker", false, "b"),
+            (false, "claude:root:agent:worker", false, "a"),
+            (true, "claude:fork", true, "b"),
+        ] {
             let mut s = Scheduler::default();
-            let now = Instant::now();
-            for (i, step) in case["steps"].as_array().unwrap().iter().enumerate() {
-                let mut headers = axum::http::HeaderMap::new();
-                for pair in step["headers"].as_array().into_iter().flatten() {
-                    headers.append(
-                        axum::http::HeaderName::from_bytes(pair[0].as_str().unwrap().as_bytes()).unwrap(),
-                        pair[1].as_str().unwrap().parse().unwrap(),
-                    );
-                }
-                let payload = step["payload"].as_str().unwrap_or_default().as_bytes();
-                // Gemini and Interactions clients were removed (issue #49).
-                let Some(format) = cpa_core::format::Format::parse(case["format"].as_str().unwrap_or("openai")) else {
-                    continue;
-                };
-                let caller = match step["caller"].as_str() {
-                    Some(c) => c,
-                    None => case["caller"].as_str().unwrap_or_default(),
-                };
-                let caller = if lcp_case { caller } else { "" };
-                let session = crate::session::resolve(format, &headers, payload, None, caller);
-                // dispatch::run's LCP step.
-                let lcp = (lcp_case && !session.explicit)
-                    .then(|| crate::lcp::Request::new(format.as_str(), payload, caller))
-                    .flatten()
-                    .map(std::sync::Arc::new);
-                let sel = Selection {
-                    session: session.id,
-                    session_parent: session.parent,
-                    session_fork: session.fork,
-                    lcp,
-                    ..selection("m")
-                };
-                let find = |id: &str| creds.iter().find(|c| c.id == id).unwrap();
-                let outcome = |op: &str| {
-                    if op.ends_with("ok") {
-                        Outcome::Success
-                    } else {
-                        let status = step["status"].as_u64().unwrap() as u16;
-                        let scope = if status >= 500 {
-                            FailureScope::Credential
-                        } else {
-                            FailureScope::Request
-                        };
-                        let mut e = ExecError::local(status, scope, step["message"].as_str().unwrap());
-                        e.headers.insert("content-type", "text/plain".parse().unwrap());
-                        Outcome::Failure(e)
-                    }
-                };
-                match step["op"].as_str().unwrap() {
-                    op @ ("pick" | "pick_ok" | "pick_fail") => {
-                        let available: Vec<&Credential> = step["available"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|id| find(id.as_str().unwrap()))
-                            .collect();
-                        let (picked, bound) = s
-                            .pick_session(&tag(&available), &sel, &policy, &|_| Windows::default(), now)
-                            .unwrap();
-                        assert_eq!(picked.id, step["picked"].as_str().unwrap(), "{name} step {i}");
-                        // The metadata Go's pickLCP wrote, as the attempt reports it.
-                        let got = bound.as_ref().map(|m| {
-                            let (node_kind, fork, compaction) = m.node();
-                            serde_json::json!({
-                                "session": m.session, "parent": m.parent, "node_kind": node_kind,
-                                "fork": fork, "compaction": compaction, "generation": m.access,
-                            })
-                        });
-                        assert_eq!(got.as_ref(), step.get("lcp"), "{name} step {i} lcp");
-                        if op != "pick" {
-                            let picked = picked.clone();
-                            s.session_result(&picked, &sel, &outcome(op), &policy, bound.as_ref(), now);
-                        }
-                    }
-                    op => {
-                        s.session_result(
-                            find(step["auth"].as_str().unwrap()),
-                            &sel,
-                            &outcome(op),
-                            &policy,
-                            None,
-                            now,
-                        );
-                    }
-                }
-            }
+            let policy = Policy {
+                session_affinity_subagents: subagents,
+                ..affinity_policy(60)
+            };
+            let parent = Selection {
+                session: Some("claude:root".into()),
+                caller: "caller".into(),
+                ..selection("m")
+            };
+            s.pick(&tag(&[&b]), &parent, &policy, now).unwrap();
+            let child = Selection {
+                session: Some(child_id.into()),
+                session_parent: parent.session.clone(),
+                session_fork: fork,
+                caller: "caller".into(),
+                ..selection("m")
+            };
+            assert_eq!(s.pick(&tag(&[&a, &b]), &child, &policy, now).unwrap().id, expected);
+            s.session_result(
+                &b,
+                &child,
+                &Outcome::Failure(ExecError::local(500, FailureScope::Credential, "child failed")),
+                &policy,
+                None,
+                now,
+            );
+            assert_eq!(
+                s.pick(&tag(&[&a, &b]), &parent, &policy, now).unwrap().id,
+                "b",
+                "child failure preserves the parent's binding"
+            );
         }
     }
 
+    #[test]
+    fn conversation_aliases_share_affinity_and_invalidate_together() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let now = Instant::now();
+        let policy = affinity_policy(60);
+        let mut s = Scheduler::default();
+        let sel = |key: &str| Selection {
+            session: Some(format!("pck:{key}")),
+            session_parent: Some("conv:shared".into()),
+            ..selection("m")
+        };
+        s.pick(&tag(&[&b]), &sel("first"), &policy, now).unwrap();
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel("next"), &policy, now).unwrap().id, "b");
+        s.session_result(
+            &b,
+            &sel("next"),
+            &Outcome::Failure(ExecError::local(500, FailureScope::Credential, "failed")),
+            &policy,
+            None,
+            now,
+        );
+        assert_eq!(s.pick(&tag(&[&a, &b]), &sel("next"), &policy, now).unwrap().id, "a");
+        assert_eq!(
+            s.pick(&tag(&[&a, &b]), &sel("first"), &policy, now).unwrap().id,
+            "a",
+            "credential failure invalidates all matching aliases"
+        );
+    }
+
+    #[test]
+    fn conversation_prefix_affinity_tracks_growth_forks_failures_and_caller_isolation() {
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let now = Instant::now();
+        let policy = affinity_policy(60);
+        let ranks = |_: &Credential| Windows::default();
+        let head = serde_json::json!({"messages":[{"role":"user","content":"question one"}]});
+        let grown = serde_json::json!({"messages":[{"role":"user","content":"question one"},{"role":"assistant","content":"answer"},{"role":"user","content":"question two"}]});
+        let fork = serde_json::json!({"messages":[{"role":"user","content":"question one"},{"role":"assistant","content":"answer"},{"role":"user","content":"different question"}]});
+        let request = |body: &Value, caller: &str| Selection {
+            lcp: Some(std::sync::Arc::new(
+                crate::lcp::Request::new("openai", &serde_json::to_vec(body).unwrap(), caller).unwrap(),
+            )),
+            ..selection("m")
+        };
+        let mut s = Scheduler::default();
+        let first = request(&head, "caller-a");
+        let (chosen, bound) = s.pick_session(&tag(&[&b]), &first, &policy, &ranks, now).unwrap();
+        assert_eq!(chosen.id, "b");
+        let first_match = bound.unwrap();
+        assert!(!first_match.session.is_empty());
+        assert!(first_match.parent.is_empty());
+        let next = request(&grown, "caller-a");
+        let (chosen, bound) = s.pick_session(&tag(&[&a, &b]), &next, &policy, &ranks, now).unwrap();
+        assert_eq!(chosen.id, "b");
+        let next_match = bound.unwrap();
+        assert_eq!(next_match.session, first_match.session);
+        assert!(next_match.access > first_match.access);
+        s.session_result(&b, &next, &Outcome::Success, &policy, Some(&next_match), now);
+        let branch = request(&fork, "caller-a");
+        let (chosen, bound) = s.pick_session(&tag(&[&a, &b]), &branch, &policy, &ranks, now).unwrap();
+        assert_eq!(chosen.id, "b");
+        let branch_match = bound.unwrap();
+        assert_ne!(branch_match.session, next_match.session);
+        assert!(!branch_match.parent.is_empty());
+        assert!(branch_match.node().1);
+        let outsider = request(&grown, "caller-b");
+        assert_eq!(
+            s.pick_session(&tag(&[&a, &b]), &outsider, &policy, &ranks, now)
+                .unwrap()
+                .0
+                .id,
+            "a"
+        );
+        // A served fork establishes its own sequence, separate from its shared prefix.
+        s.session_result(&b, &branch, &Outcome::Success, &policy, Some(&branch_match), now);
+        let (_, exact) = s.pick_session(&tag(&[&a, &b]), &branch, &policy, &ranks, now).unwrap();
+        let exact = exact.unwrap();
+        assert!(!exact.fork);
+        let request_failure = Outcome::Failure(ExecError::local(400, FailureScope::Request, "bad request"));
+        s.session_result(&b, &branch, &request_failure, &policy, Some(&exact), now);
+        let (chosen, bound) = s.pick_session(&tag(&[&a, &b]), &branch, &policy, &ranks, now).unwrap();
+        assert_eq!(chosen.id, "b");
+        let retained = bound.unwrap();
+        assert!(!retained.fork, "request errors preserve the exact branch binding");
+        s.session_result(
+            &b,
+            &branch,
+            &Outcome::Failure(ExecError::local(500, FailureScope::Credential, "failed")),
+            &policy,
+            Some(&retained),
+            now,
+        );
+        let (chosen, rebound) = s.pick_session(&tag(&[&a, &b]), &branch, &policy, &ranks, now).unwrap();
+        assert_eq!(chosen.id, "b");
+        assert!(
+            rebound.unwrap().fork,
+            "the failed exact branch is released and can inherit the surviving shared prefix"
+        );
+        assert_eq!(
+            s.pick_session(&tag(&[&a, &b]), &next, &policy, &ranks, now)
+                .unwrap()
+                .0
+                .id,
+            "b",
+            "a branch failure removes no sibling trajectory"
+        );
+        // Removing a bound credential from candidates moves just that conversation.
+        assert_eq!(
+            s.pick_session(&tag(&[&a]), &next, &policy, &ranks, now).unwrap().0.id,
+            "a"
+        );
+    }
     /// The failure of a request picked before a policy change removes nothing bound
     /// after it, though the change replaced the matcher.
     #[test]
@@ -5627,11 +5746,10 @@ mod tests {
         );
     }
 
-    /// OAuth request-scoped-error channels and the credential provider they are looked up
-    /// by are both Go `strings.ToLower` (U+0130 becomes a plain `i`): rules keyed `HİGH`
-    /// apply to a `"type":"HİGH"` file credential.
+    /// Configured channel names and credential providers share the saved-config
+    /// case-normalization policy, including U+0130.
     #[test]
-    fn oauth_rule_channels_lowercase_like_go() {
+    fn oauth_rule_channels_normalize_configured_provider_names() {
         let cfg = cpa_core::config::Config::parse(
             "oauth:\n  request-scoped-errors:\n    HİGH:\n      - {status: 503, match: [boom], action: stop}\n",
         )

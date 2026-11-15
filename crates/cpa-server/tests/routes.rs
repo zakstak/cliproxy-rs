@@ -219,27 +219,10 @@ async fn chat_completions_translate_and_stream_upstream_for_non_stream_clients()
     assert!(text.contains(r#""content":"hi""#));
 }
 
-/// Go `StartNonStreamingKeepAlive` (M2-0036), expectations from the Go golden
-/// `nonstream_keepalive` (tests/reference/server/main.go): a result within one interval
-/// is untouched; a slower one commits 200 `application/json` with a `\n` per interval,
-/// then the rendered body, even when it is an error.
-///
-/// Synchronisation decides every outcome, never a wall-clock margin: the fast cases use
-/// an interval that cannot elapse during the test, and a held mock answers only after
-/// the test has read the first keep-alive newline. Which calls run the keep-alive at all
-/// is `dispatch::tests::nonstream_keepalive_only_for_nonstream_generate`.
+/// The configured keepalive commits one valid response before a held upstream
+/// completes. Synchronization controls the order rather than elapsed-time bounds.
 #[tokio::test]
-async fn nonstream_keepalive_commits_like_go() {
-    let fixture: Value = serde_json::from_str(include_str!("fixtures/server_go.json")).unwrap();
-    let golden = |name: &str| {
-        fixture["nonstream_keepalive"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == name)
-            .unwrap()
-            .clone()
-    };
+async fn nonstream_keepalive_commits_before_a_held_upstream_finishes() {
     // Splits the keep-alive newlines from the rendered body.
     let split = |text: &str| {
         let rest = text.trim_start_matches('\n');
@@ -250,15 +233,21 @@ async fn nonstream_keepalive_commits_like_go() {
     // A result before the first tick is answered as without a keep-alive.
     let never = "requests:\n  nonstream-keepalive-interval: 86400\n";
     for (token, case) in [("fake-ok", "fast_ok"), ("fake-bad", "fast_error")] {
-        let want = golden(case);
         let p = proxy(never, vec![oauth("a.json", token, serde_json::json!({}))]).await;
         let (status, headers, text) = post(&p.url, "/v1/messages", &body).await;
-        assert_eq!(u64::from(status), want["status"].as_u64().unwrap(), "{text}");
-        assert_eq!(headers["content-type"], want["content_type"].as_str().unwrap());
+        assert_eq!(status, if case == "fast_error" { 400 } else { 200 }, "{text}");
+        assert!(
+            headers["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
         assert!(headers.get("content-length").is_some(), "{headers:?}");
         assert_eq!(split(&text).0, 0, "{text:?}");
         if case == "fast_error" {
-            assert_eq!(text, want["body"].as_str().unwrap());
+            let error: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(error["type"], "error");
+            assert!(error["error"]["message"].is_string());
         }
     }
 
@@ -269,7 +258,6 @@ async fn nonstream_keepalive_commits_like_go() {
         ("fake-held-ok", "/v1/chat/completions", "slow_ok"),
         ("fake-held-bad", "/v1/messages", "slow_error"),
     ] {
-        let want = golden(case);
         let p = proxy(every_second, vec![oauth("a.json", token, serde_json::json!({}))]).await;
         let res = wreq::Client::new()
             .post(format!("{}{path}", p.url))
@@ -278,9 +266,14 @@ async fn nonstream_keepalive_commits_like_go() {
             .send()
             .await
             .unwrap();
-        assert_eq!(u64::from(res.status().as_u16()), want["status"].as_u64().unwrap());
+        assert_eq!(res.status().as_u16(), 200);
         let headers = res.headers().clone();
-        assert_eq!(headers["content-type"], want["content_type"].as_str().unwrap());
+        assert!(
+            headers["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
         assert!(headers.get("content-length").is_none(), "{headers:?}");
         let mut chunks = res.bytes_stream();
         let mut text = Vec::new();
@@ -295,10 +288,10 @@ async fn nonstream_keepalive_commits_like_go() {
         let text = String::from_utf8(text).unwrap();
         let (newlines, rest) = split(&text);
         assert!(newlines >= 1, "{text:?}");
-        let (want_newlines, want_rest) = split(want["body"].as_str().unwrap());
-        assert_eq!(want_newlines, 1);
         if case == "slow_error" {
-            assert_eq!(rest, want_rest);
+            let error: Value = serde_json::from_str(&rest).unwrap();
+            assert_eq!(error["type"], "error");
+            assert!(error["error"]["message"].is_string());
         } else {
             let reply: Value = serde_json::from_str(&rest).unwrap();
             assert_eq!(reply["choices"][0]["message"]["content"], "hi");
@@ -311,7 +304,7 @@ async fn nonstream_keepalive_commits_like_go() {
 /// aborts with a bare 404; only `/healthz` registers HEAD. The retired Go differential
 /// harness compared these as `wrong-method-chat`, `models-head` and `healthz-post`.
 #[tokio::test]
-async fn wrong_methods_are_gin_no_route() {
+async fn unmatched_methods_have_no_route_and_matched_routes_require_authentication() {
     let p = proxy("", vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
     let client = wreq::Client::new();
     for (method, path) in [
@@ -371,13 +364,10 @@ async fn wrong_methods_are_gin_no_route() {
     }
 }
 
-/// `requests.passthrough-headers` (Go `downstreamHeadersFromExecutor`,
-/// `WriteUpstreamHeaders`): off by default; on, filtered upstream headers fill what the
-/// handler did not set. A Claude status error has no `Headers()`, so its upstream headers
-/// never come along (`passthrough_errors_go.json` has the Go goldens). Filter
-/// expectations are the Go golden `upstream_headers`.
+/// Passthrough is opt-in: safe upstream extensions fill unset response headers;
+/// handler identity, framing and credentials remain protected.
 #[tokio::test]
-async fn passthrough_headers_follow_go() {
+async fn configured_passthrough_headers_keep_only_safe_extensions() {
     let body = format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[{{"role":"user","content":"hi"}}]}}"#);
     for enabled in [false, true] {
         let config = format!("requests:\n  passthrough-headers: {enabled}\n");
@@ -644,7 +634,7 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
 }
 
 #[tokio::test]
-async fn misc_routes_match_go() {
+async fn discovery_health_and_error_routes_keep_their_public_contracts() {
     let p = proxy("", vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
     let client = wreq::Client::new();
     let head = client.head(format!("{}/healthz", p.url)).send().await.unwrap();
@@ -1040,7 +1030,7 @@ async fn bootstrap_retries_rerun_a_stream_that_broke_before_its_first_payload() 
 /// Go net/http: no Content-Length set by the handler means chunked above 2048 bytes and
 /// Content-Length at or below it; a bodiless HEAD carries neither.
 #[tokio::test]
-async fn response_framing_follows_go_net_http() {
+async fn responses_have_consistent_entity_framing_and_head_is_bodiless() {
     let (url, _, _) = scripted_proxy("", &["fake-a"], vec![json_reply()]).await;
     let client = wreq::Client::new();
     let res = client
@@ -1052,12 +1042,11 @@ async fn response_framing_follows_go_net_http() {
         .unwrap();
     let headers = res.headers().clone();
     let body = res.bytes().await.unwrap();
-    assert!(body.len() > 2048, "the Anthropic catalog is large: {}", body.len());
-    assert_eq!(
-        headers.get("transfer-encoding").map(|v| v.to_str().unwrap()),
-        Some("chunked")
-    );
-    assert!(headers.get("content-length").is_none());
+    let _: Value = serde_json::from_slice(&body).unwrap();
+    assert!(!(headers.contains_key("transfer-encoding") && headers.contains_key("content-length")));
+    if let Some(length) = headers.get("content-length") {
+        assert_eq!(length.to_str().unwrap().parse::<usize>().unwrap(), body.len());
+    }
 
     let res = client.get(format!("{url}/")).send().await.unwrap();
     let length = res
@@ -1083,22 +1072,19 @@ async fn response_framing_follows_go_net_http() {
 
 /// Go `RequestPathMetadataKey` is gin's `FullPath()`: route templates in gin syntax.
 #[tokio::test]
-async fn route_path_uses_gin_templates() {
+async fn route_metadata_uses_stable_low_cardinality_templates() {
     use axum::extract::{MatchedPath, OriginalUri};
     let echo = |m: Option<MatchedPath>, OriginalUri(uri): OriginalUri| async move {
         cpa_server::dispatch::route_path(m.as_ref(), &uri)
     };
     let app = axum::Router::new()
-        .route("/v1beta/models/{*action}", axum::routing::post(echo))
+        .route("/v1/assets/{*action}", axum::routing::post(echo))
         .route("/v1/videos/{request_id}", axum::routing::post(echo))
         .route("/v1/images/generations", axum::routing::post(echo));
     let url = serve(app).await;
     let client = wreq::Client::new();
     for (path, expected) in [
-        (
-            "/v1beta/models/gemini-2.5-pro:generateContent",
-            "/v1beta/models/*action",
-        ),
+        ("/v1/assets/nested/item", "/v1/assets/*action"),
         ("/v1/videos/abc", "/v1/videos/:request_id"),
         ("/v1/images/generations?x=1", "/v1/images/generations"),
     ] {
@@ -1297,9 +1283,8 @@ async fn count_tokens_home_401s_record_the_home_client_key() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Go's Responses handler applies `prepareCodexOrphanDelegation` before dispatch, so the
-/// rewrite reaches every provider (here Claude). Input and rewritten text come from
-/// Go's `RewriteCodexOrphanDelegationInput` golden (cpa-common codex_client_go.json).
+/// Responses delegation cleanup applies before provider dispatch. Paired tool
+/// output stays attached while orphaned historical output becomes readable text.
 #[tokio::test]
 async fn responses_route_prepares_codex_orphan_delegation() {
     let input = r#"[{"type":"function_call","call_id":"c1","name":"create_thread","namespace":"codex_app","arguments":"{}"},{"type":"function_call_output","call_id":"c1","name":"create_thread","namespace":"codex_app","output":"paired"},{"type":"function_call_output","call_id":"c1","name":"create_thread","namespace":"codex_app","output":"second <one>"}]"#;

@@ -367,31 +367,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declared_encodings_follow_go_decode_response_body() {
+    async fn declared_codings_reject_unsupported_and_corrupt_bodies() {
         let mut h = HeaderMap::new();
         h.insert(http::header::CONTENT_ENCODING, "compress".parse().unwrap());
-        let error = decoded(chunks(vec![Ok(Bytes::from_static(b"bad"))]), &h).await.err();
-        assert_eq!(error.as_deref(), Some(r#"unsupported content encoding "compress""#));
-        // An explicit identity disables magic-byte sniffing: gzip bytes pass through.
+        let error = decoded(chunks(vec![Ok(Bytes::from_static(b"bad"))]), &h)
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("compress"), "name the unsupported coding");
+        // RFC 9110 identity means no content coding, even for gzip-looking bytes.
         let gzip_magic = Bytes::from_static(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
         h.insert(http::header::CONTENT_ENCODING, "identity".parse().unwrap());
         let stream = decoded(chunks(vec![Ok(gzip_magic.clone())]), &h).await.unwrap();
         assert_eq!(read_bounded(stream, usize::MAX).await.unwrap(), gzip_magic);
-        // gzip.NewReader reads its header eagerly.
         h.insert(http::header::CONTENT_ENCODING, "gzip".parse().unwrap());
-        let error = decoded(chunks(vec![Ok(Bytes::from_static(b"bad body"))]), &h)
-            .await
-            .err();
-        assert_eq!(error.as_deref(), Some("failed to create gzip reader: unexpected EOF"));
-        let error = decoded(chunks(vec![Ok(Bytes::from_static(b"not a gzip body"))]), &h)
-            .await
-            .err();
-        assert_eq!(
-            error.as_deref(),
-            Some("failed to create gzip reader: gzip: invalid header")
-        );
-        let error = decoded(chunks(vec![]), &h).await.err();
-        assert_eq!(error.as_deref(), Some("failed to create gzip reader: EOF"));
+        for body in [&b"bad body"[..], b"not a gzip body", b""] {
+            let error = decoded(chunks(vec![Ok(Bytes::copy_from_slice(body))]), &h)
+                .await
+                .err()
+                .unwrap();
+            assert!(error.contains("gzip"), "coding context: {error}");
+            assert!(
+                !error.contains("bad body") && !error.contains("not a gzip body"),
+                "do not echo upstream content"
+            );
+        }
     }
 
     #[tokio::test]

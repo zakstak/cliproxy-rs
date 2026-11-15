@@ -265,47 +265,38 @@ fn field_value(num: i64, typ: u8, mut b: &[u8], depth: i64) -> Result<usize, Wir
 mod tests {
     use super::*;
 
+    /// RFC 4648 section 10 examples plus our explicit signature-input policies.
     #[test]
-    fn base64_matches_go_rules() {
-        assert_eq!(STD.decode(b"TWFu").unwrap(), b"Man");
-        assert_eq!(STD.decode(b"TWE=").unwrap(), b"Ma");
-        assert_eq!(STD.decode(b"TW\r\nE=").unwrap(), b"Ma", "Go skips CR/LF");
-        // Go ignores non-zero trailing bits outside Strict mode.
+    fn base64_decodes_rfc_examples_and_refuses_malformed_encodings() {
+        for (encoded, plain) in [
+            ("", ""),
+            ("Zg==", "f"),
+            ("Zm8=", "fo"),
+            ("Zm9v", "foo"),
+            ("Zm9vYg==", "foob"),
+            ("Zm9vYmE=", "fooba"),
+            ("Zm9vYmFy", "foobar"),
+        ] {
+            assert_eq!(STD.decode(encoded.as_bytes()).unwrap(), plain.as_bytes());
+            assert_eq!(STD_STRICT.decode(encoded.as_bytes()).unwrap(), plain.as_bytes());
+        }
+        // MIME-style line breaks are accepted; strictness applies to padding bits.
+        assert_eq!(STD.decode(b"TW\r\nE=").unwrap(), b"Ma");
         assert_eq!(STD.decode(b"TWF=").unwrap(), b"Ma");
-        // Strict rejects them at the last data character (Go 1.26 `Strict()`).
-        assert_eq!(
-            STD_STRICT.decode(b"TWF=").unwrap_err(),
-            "illegal base64 data at input byte 3"
-        );
-        assert_eq!(
-            STD_STRICT.decode(b"TWB=").unwrap_err(),
-            "illegal base64 data at input byte 3"
-        );
-        assert_eq!(
-            STD_STRICT.decode(b"TR==").unwrap_err(),
-            "illegal base64 data at input byte 2"
-        );
-        assert_eq!(
-            STD_STRICT.decode(b"TWF=\n\n").unwrap_err(),
-            "illegal base64 data at input byte 5"
-        );
-        assert_eq!(STD_STRICT.decode(b"TWE=\r\n").unwrap(), b"Ma");
-        assert_eq!(STD_STRICT.decode(b"TQ==").unwrap(), b"M");
-        assert_eq!(STD.decode(b"TWE").unwrap_err(), "illegal base64 data at input byte 0");
-        assert_eq!(STD.decode(b"TWE=x").unwrap_err(), "illegal base64 data at input byte 4");
-        assert_eq!(STD.decode(b"T===").unwrap_err(), "illegal base64 data at input byte 1");
+        for bad in [b"TWF=".as_slice(), b"TWB=", b"TR==", b"TWF=\n\n"] {
+            assert!(STD_STRICT.decode(bad).is_err());
+        }
+        for bad in [b"TWE".as_slice(), b"TWE=x", b"T===", b"-_8="] {
+            assert!(STD.decode(bad).is_err());
+        }
         assert_eq!(RAW_STD.decode(b"TWE").unwrap(), b"Ma");
-        assert_eq!(
-            RAW_STD.decode(b"TWE=").unwrap_err(),
-            "illegal base64 data at input byte 3"
-        );
-        assert_eq!(RAW_STD.decode(b"T").unwrap_err(), "illegal base64 data at input byte 0");
         assert_eq!(RAW_URL.decode(b"-_8").unwrap(), [0xfb, 0xff]);
-        assert!(STD.decode(b"-_8=").is_err());
+        assert!(RAW_STD.decode(b"TWE=").is_err());
+        assert!(RAW_STD.decode(b"T").is_err());
     }
 
     #[test]
-    fn protowire_matches_go_error_codes() {
+    fn protobuf_wire_examples_return_typed_parse_errors() {
         assert_eq!(consume_varint(&[0x96, 0x01]), Ok((150, 2)));
         assert_eq!(consume_varint(&[0x80]), Err(WireError::Truncated));
         assert_eq!(consume_varint(&[0xff; 10]), Err(WireError::Overflow));

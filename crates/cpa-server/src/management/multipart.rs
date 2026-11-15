@@ -802,7 +802,8 @@ mod tests {
     }
 
     #[test]
-    fn media_type_params_follow_go() {
+    // Product policy: RFC 7578 form-data and RFC 2231/5987 extended parameters carry filenames safely; contradictory parameters and malformed media types are refused.
+    fn multipart_parameters_decode_quoted_and_extended_filenames() {
         let (t, p) = parse_media_type("Form-Data; Name=\"a\\\"b\"; filename*=UTF-8''x%2Ey; k*0=p; k*1*=%41").unwrap();
         assert_eq!(t, "form-data");
         assert_eq!(p["name"], "a\"b");

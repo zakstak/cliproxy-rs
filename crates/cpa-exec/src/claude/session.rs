@@ -390,16 +390,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn harness_message_hash_identity_matches_go_capture() {
-        // From the Go differential capture: unconfirmed caller with an explicit (and
-        // therefore stripped) session header falls through to the message hash.
-        let body =
-            r#"{"model":"claude-sonnet-4-6","max_tokens":17,"messages":[{"role":"user","content":"Local question"}]}"#;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-claude-code-session-id",
-            "11111111-2222-4333-8444-555555555555".parse().unwrap(),
+    fn continuity_commits_completed_turns_in_order_and_keeps_the_session_date() {
+        let credential = format!("local-continuity-{}", uuid::Uuid::new_v4());
+        let first = begin(&credential, "session-a", true, "");
+        assert!(first.previous_message_id.is_empty());
+        assert!(uuid::Uuid::parse_str(&first.prompt_id).is_ok());
+        assert_eq!(pin_date(&first.key, "2026-10-01"), "2026-10-01");
+        let abandoned = begin(&credential, "session-a", false, "");
+        assert!(
+            abandoned.previous_message_id.is_empty(),
+            "begin alone must not commit a turn"
         );
+        commit(
+            &first.key,
+            first.sequence,
+            "message-1",
+            "req_completed-1",
+            &first.prompt_id,
+        );
+        let continuation = begin(&credential, "session-a", false, "");
+        assert_eq!(continuation.previous_message_id, "message-1");
+        assert_eq!(continuation.previous_request_id, "req_completed-1");
+        assert_eq!(continuation.prompt_id, first.prompt_id);
+        assert_eq!(pin_date(&continuation.key, "2026-10-02"), "2026-10-01");
+        let next = begin(&credential, "session-a", true, "");
+        assert_ne!(next.prompt_id, first.prompt_id);
+        commit(
+            &next.key,
+            next.sequence,
+            "message-2",
+            "req_completed-2",
+            &next.prompt_id,
+        );
+        commit(
+            &first.key,
+            first.sequence,
+            "stale-message",
+            "req_stale",
+            &first.prompt_id,
+        );
+        let latest = begin(&credential, "session-a", false, "");
+        assert_eq!(latest.previous_message_id, "message-2");
+        assert_eq!(latest.previous_request_id, "req_completed-2");
+        assert_eq!(latest.prompt_id, next.prompt_id);
+        let explicit = begin(&credential, "session-a", false, "83EC619F-AB81-4D70-9C67-44C3865291B9");
+        assert_eq!(explicit.prompt_id, "83ec619f-ab81-4d70-9c67-44c3865291b9");
+        for other in [
+            begin(&credential, "session-b", false, ""),
+            begin("other-local-credential", "session-a", false, ""),
+        ] {
+            assert!(other.previous_message_id.is_empty());
+            assert_ne!(other.key, first.key);
+            assert_eq!(pin_date(&other.key, "2026-10-02"), "2026-10-02");
+        }
+        assert!(begin("", "session-a", false, "").key.is_empty());
+        assert!(begin(&credential, "", false, "").key.is_empty());
+    }
+
+    #[test]
+    fn unconfirmed_sessions_derive_from_content_and_confirmed_sessions_keep_caller_identity() {
+        let body = r#"{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Local question"}]}"#;
+        let changed = body.replace("Local question", "Different question");
+        let explicit = "11111111-2222-4333-8444-555555555555";
+        let mut headers = HeaderMap::new();
+        headers.insert("x-claude-code-session-id", explicit.parse().unwrap());
         let inputs = Inputs {
             headers: &headers,
             original: body,
@@ -407,84 +461,92 @@ mod tests {
             derived: "",
             execution: "",
         };
-        assert_eq!(
-            agent_session_uuid(&inputs, false),
-            "dd01238e-cdb5-5572-8f27-a28d98fe9075"
-        );
-        assert_eq!(
-            agent_session_uuid(&inputs, true),
-            "11111111-2222-4333-8444-555555555555"
-        );
-        assert_eq!(
-            deterministic_prompt_id("cpa:prompt:Local question"),
-            "83ec619f-ab81-4d70-9c67-44c3865291b9"
-        );
+        let first = agent_session_uuid(&inputs, false);
+        assert!(uuid::Uuid::parse_str(&first).is_ok());
+        assert_ne!(first, explicit);
+        assert_eq!(agent_session_uuid(&inputs, false), first);
+        let other = Inputs {
+            original: &changed,
+            translated: &changed,
+            ..inputs
+        };
+        assert_ne!(agent_session_uuid(&other, false), first);
+        assert_eq!(agent_session_uuid(&other, true), explicit);
+        for seed in ["cpa:prompt:first", "cpa:prompt:second", ""] {
+            let id = deterministic_prompt_id(seed);
+            assert!(valid_prompt_id(&id));
+            assert_eq!(id, deterministic_prompt_id(seed));
+        }
+        assert_ne!(deterministic_prompt_id("first"), deterministic_prompt_id("second"));
     }
 
-    /// Go `CachedSessionIDRequired` / `CachedUserIDRequired` in Home mode, recorded by
-    /// the reference's zz_rustgolden_test.go: the KV calls in order (fresh UUIDs and
-    /// user IDs normalized), the value or error, and whether a new user ID carries
-    /// the session ID stored for the key.
+    /// Home stores one valid identity per client key. A losing NX writer re-reads
+    /// the winner, and invalid existing state fails closed instead of changing identity.
     #[tokio::test]
-    async fn home_kv_ids_match_go() {
+    async fn home_ids_are_shared_isolated_and_reject_corrupt_existing_values() {
         use std::sync::Arc;
-        const VALID_SESSION: &str = "11111111-2222-4333-8444-555555555555";
-        let valid_user = format!(
-            r#"{{"device_id":"{}","account_uuid":"","session_id":"{VALID_SESSION}"}}"#,
-            "ab".repeat(32)
-        );
-        let normalize = |v: &str| -> String {
-            if uuid::Uuid::parse_str(v).is_ok() && v.len() == 36 && v != VALID_SESSION {
-                "<uuid>".into()
-            } else if super::super::detect::valid_user_id(v) && v != valid_user {
-                "<user_id>".into()
-            } else {
-                v.to_owned()
-            }
-        };
-        let golden: serde_json::Value = serde_json::from_str(include_str!("testdata/go_claude_ids_home.json")).unwrap();
-        for case in golden["cases"].as_array().unwrap() {
-            let scenario = &case["scenario"];
-            let name = scenario["name"].as_str().unwrap();
-            let api_key = scenario["api_key"].as_str().unwrap();
-            let values = Arc::new(Mutex::new(HashMap::new()));
-            if let Some(preset) = scenario["preset"].as_object() {
-                for (k, v) in preset {
-                    values.lock().unwrap().insert(k.clone(), v.as_str().unwrap().to_owned());
-                }
-            }
-            let home = cpa_home::fake::FakeHome::start(super::super::kv_test::kv_home(values.clone())).await;
-            let client = home.client();
-            let got = match (scenario["kind"].as_str().unwrap(), api_key.is_empty()) {
-                ("session", true) => Ok(new_v4()),
-                ("session", false) => session_id_home(&client, api_key).await,
-                (_, true) => Ok(super::super::cloak::fake_user_id(&new_v4())),
-                (_, false) => user_id_home(&client, api_key).await,
-            };
-            let calls: Vec<serde_json::Value> = home
-                .commands()
-                .iter()
-                .filter_map(|c| super::super::kv_test::as_go_call(c))
-                .map(|mut call| {
-                    if call[0] == "setnx" {
-                        call[2] = normalize(call[2].as_str().unwrap()).into();
-                    }
-                    call
-                })
-                .collect();
-            assert_eq!(&calls, case["calls"].as_array().unwrap(), "{name}: calls");
-            match got {
-                Ok(value) => {
-                    assert_eq!(normalize(&value), case["value"].as_str().unwrap(), "{name}: value");
-                    if let Some(carries) = case["carries_stored_session"].as_bool() {
-                        let key = format!("cpa:claude:session-id:{}", cpa_home::kv::hash_key_part(api_key));
-                        let stored = values.lock().unwrap().get(&key).cloned().unwrap_or_default();
-                        let stored = stored.trim();
-                        assert_eq!(!stored.is_empty() && value.contains(stored), carries, "{name}: session");
-                    }
-                }
-                Err(error) => assert_eq!(error, case["error"].as_str().unwrap(), "{name}: error"),
-            }
+        let values = Arc::new(Mutex::new(HashMap::new()));
+        let home = cpa_home::fake::FakeHome::start(super::super::kv_test::kv_home(values.clone())).await;
+        let client = home.client();
+        let session_key = |key: &str| format!("cpa:claude:session-id:{}", cpa_home::kv::hash_key_part(key));
+        let user_key = |key: &str| format!("cpa:claude:user-id:{}", cpa_home::kv::hash_key_part(key));
+        let session = session_id_home(&client, "caller-a").await.unwrap();
+        assert!(uuid::Uuid::parse_str(&session).is_ok());
+        assert_eq!(session_id_home(&client, "caller-a").await.unwrap(), session);
+        assert_ne!(session_id_home(&client, "caller-b").await.unwrap(), session);
+        let user = user_id_home(&client, "caller-a").await.unwrap();
+        assert!(super::super::detect::valid_user_id(&user));
+        assert_eq!(user_id_home(&client, "caller-a").await.unwrap(), user);
+        let parsed: serde_json::Value = serde_json::from_str(&user).unwrap();
+        assert_eq!(parsed["session_id"], session);
+        assert_ne!(user_id_home(&client, "caller-b").await.unwrap(), user);
+        let existing = "11111111-2222-4333-8444-555555555555";
+        values
+            .lock()
+            .unwrap()
+            .insert(session_key("existing"), format!(" {existing} "));
+        assert_eq!(session_id_home(&client, "existing").await.unwrap(), existing);
+        let user = user_id_home(&client, "existing").await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&user).unwrap();
+        assert_eq!(parsed["session_id"], existing);
+        let existing_user = super::super::cloak::fake_user_id(existing);
+        values
+            .lock()
+            .unwrap()
+            .insert(user_key("stored-user"), existing_user.clone());
+        assert_eq!(user_id_home(&client, "stored-user").await.unwrap(), existing_user);
+        for invalid in ["", "  "] {
+            let key = format!("corrupt-session-{invalid}");
+            values.lock().unwrap().insert(session_key(&key), invalid.into());
+            assert!(session_id_home(&client, &key).await.is_err());
+            assert_eq!(
+                values.lock().unwrap()[&session_key(&key)],
+                invalid,
+                "do not overwrite another node's value after losing NX"
+            );
         }
+        // Existing shared sessions are opaque non-empty identifiers, not necessarily UUIDs.
+        values
+            .lock()
+            .unwrap()
+            .insert(session_key("opaque"), "legacy-session-id".into());
+        assert_eq!(session_id_home(&client, "opaque").await.unwrap(), "legacy-session-id");
+        values.lock().unwrap().insert(user_key("corrupt-user"), "nope".into());
+        assert!(user_id_home(&client, "corrupt-user").await.is_err());
+        // The shared storage protocol renews both records for their configured TTL.
+        let commands = home.commands();
+        for key in [session_key("caller-a"), user_key("caller-a")] {
+            assert!(
+                commands.iter().any(|c| c[0].eq_ignore_ascii_case("expire")
+                    && c[1] == key
+                    && c[2] == ID_TTL.as_secs().to_string())
+            );
+        }
+        assert!(
+            commands
+                .iter()
+                .filter(|c| c[0].eq_ignore_ascii_case("set"))
+                .all(|c| c.iter().any(|arg| arg == "NX"))
+        );
     }
 }

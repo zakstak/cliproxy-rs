@@ -438,9 +438,9 @@ mod tests {
         }
     }
 
-    /// Go 1.26.4 `TestIsAbs` (path/filepath/path_test.go): `isabstests`.
+    /// The supported Unix path policy follows Rust path classification.
     #[test]
-    fn absolute_paths_follow_go_filepath_is_abs() {
+    fn absolute_paths_follow_supported_unix_policy() {
         let unix = [
             ("", false),
             ("/", true),
@@ -453,13 +453,13 @@ mod tests {
         ];
         for (path, want) in unix {
             assert_eq!(go_is_abs(path), want, "{path:?}");
+            assert_eq!(go_is_abs(path), std::path::Path::new(path).is_absolute());
         }
     }
 
-    /// Go `TestCredentialInFlightConfigDurationBounds` and
-    /// `TestCredentialInFlightConfigRejectsUnsafeBounds`.
+    /// Snapshot staleness and byte ceilings reject unsafe configurations.
     #[test]
-    fn in_flight_bounds_follow_go() {
+    fn in_flight_limits_enforce_snapshot_safety() {
         let valid = |yaml: &str| in_flight(Some(&serde_yaml_ng::from_str::<Value>(yaml).unwrap())).is_ok();
         assert!(valid(""), "the defaults");
         assert!(
@@ -467,7 +467,7 @@ mod tests {
             "exactly three intervals"
         );
         assert!(!valid("snapshot-interval: 1s\nstale-after: 2999999999ns\n"));
-        // time.Duration(math.MaxInt64 / 2).String() and time.Duration(math.MaxInt64).String().
+        // The interval multiplication must refuse overflow at the i64 duration ceiling.
         assert!(!valid(
             "snapshot-interval: 1281023h53m38.427387903s\nstale-after: 2562047h47m16.854775807s\n"
         ));
@@ -493,11 +493,17 @@ mod tests {
     }
 
     #[test]
-    fn durations_parse_like_go() {
+    fn duration_units_and_overflow_have_explicit_bounds() {
         assert_eq!(parse_duration("1h1m0.5s"), Some(3_660_500_000_000));
         assert_eq!(parse_duration(".5us"), Some(500));
         assert_eq!(parse_duration("-1.5h"), Some(-5_400_000_000_000));
         assert_eq!(parse_duration("0"), Some(0));
+        for seconds in [1, 2, 60, 3600] {
+            assert_eq!(
+                parse_duration(&format!("{seconds}s")),
+                parse_duration(&format!("{}ms", seconds * 1000))
+            );
+        }
         assert_eq!(parse_duration("-2562047h47m16.854775808s"), Some(i64::MIN));
         assert_eq!(parse_duration("9223372036.854775807s"), Some(i64::MAX));
         for bad in [

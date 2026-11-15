@@ -13,9 +13,37 @@ becomes a name in its unsupported-type diagnostic; it is still refused locally.
 Other providers keep their Go readers.
 The remaining readers use `cpa_common::json` or `cpa_common::rawjson`; the native request boundary is defined in the [Codex contract](codex/CONTRACT.md#request-boundary).
 
+## xAI OAuth expiry limits
+
+Unrepresentable xAI token lifetimes now leave the saved expiry unknown instead of
+wrapping date arithmetic. Device authorization waits at most 30 minutes, and poll
+intervals are capped at 30 minutes. Ordinary provider lifetimes are unchanged;
+malformed or extreme values can no longer wrap into immediate expiry or overflow
+the local deadline. The device flow still observes cancellation and the provider's
+pending, slowdown, denial and expiry outcomes.
+
+## Responses tool choice on Claude
+
+A Responses request with `tool_choice: "none"` now reaches Claude with
+`tool_choice: {"type": "none"}`. Go v8.0.35 drops that choice during conversion,
+which lets Claude choose a tool from the retained declarations. The Rust mapping
+preserves the caller's instruction to disable tool use and follows Anthropic's
+[Messages API tool choice](https://platform.claude.com/docs/en/api/messages/create).
+Chat Completions requests already use this mapping.
+
+## IPv4-mapped trusted proxy addresses
+
+A bare IPv4-mapped address in `server.trusted-proxies`, such as
+`::ffff:192.0.2.1`, trusts exactly that host, including its canonical IPv4 form
+`192.0.2.1`. Go v8.0.35 treats the same literal as the broad IPv6 network
+`::/32`, which trusts unrelated IPv6 peers and fails to trust the intended IPv4
+host. Unrelated peers can no longer use that entry to supply a forwarded client
+address. Explicit CIDR entries keep their configured network boundaries; use an
+explicit CIDR when a range is intended.
+
 ## Compatibility policy
 
-This fork keeps four built-in upstreams: Claude (`claude`), Codex (`codex`), Grok (`xai`) and Muse (`meta`). Functional behaviour is the contract: supported clients, configs and credential files keep working, and provider documentation, first-party clients and verified wire behaviour decide provider behaviour. Go CLIProxyAPI is a source, not an oracle. Go-compatible behaviour stays where a real client, an operator's config or a saved credential needs it, and Go goldens stay as regression fixtures. Go parser quirks and Go's exact wire output are not requirements on their own, and no Go comparison or benchmark gates a change ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)). Codex follows its own [contract](codex/CONTRACT.md). A difference that an operator moving from Go would notice is listed on this page.
+This fork keeps four built-in upstreams: Claude (`claude`), Codex (`codex`), Grok (`xai`) and Muse (`meta`). Functional behaviour is the contract: supported clients, configs and credential files keep working, and provider documentation, first-party clients and verified wire behaviour decide provider behaviour. Go CLIProxyAPI is a source, not an oracle. Go-compatible behaviour stays where a real client, an operator's config or a saved credential needs it, and historical regression inputs retain their original provenance. Active tests specify expected behavior independently. Go parser quirks and Go's exact wire output are not requirements on their own, and no Go comparison or benchmark gates a change ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)). Codex follows its own [contract](codex/CONTRACT.md). A difference that an operator moving from Go would notice is listed on this page.
 
 ## Removed providers
 

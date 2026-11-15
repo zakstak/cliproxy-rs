@@ -436,8 +436,71 @@ mod tests {
         assert!(waited.is_err(), "native output waits for the blank line");
     }
 
+    /// A caller that abandons a stream releases its upstream stream immediately.
+    /// Cancellation must not claim a completed message or manufacture a provider error.
     #[tokio::test]
-    async fn crlf_terminal_and_truncation_follow_go() {
+    async fn dropping_a_partial_stream_releases_upstream_without_completion_or_failure() {
+        struct HeldStream(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl futures_util::Stream for HeldStream {
+            type Item = Result<Bytes, ExecError>;
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for HeldStream {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        for started in [false, true] {
+            let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let held = HeldStream(dropped.clone());
+            let start: Vec<_> = if started {
+                vec![Ok(Bytes::from_static(
+                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"partial\"}}\n\n",
+                ))]
+            } else {
+                Vec::new()
+            };
+            let upstream = futures_util::stream::iter(start).chain(held).boxed();
+            let usage = std::sync::Arc::new(crate::claude::tests::Usage::default());
+            let capture = std::sync::Arc::new(crate::claude::tests::Captured::default());
+            let mut output = relay(
+                upstream,
+                Arc::default(),
+                Box::new(|_| panic!("partial stream completed")),
+                cpa_core::exec::UsageSink::new(usage.clone()),
+                cpa_core::exec::CaptureSink::new(capture.clone()),
+            );
+            if started {
+                assert!(output.next().await.unwrap().is_ok());
+            }
+            drop(output);
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                !usage
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(kind, _, _)| kind.contains("failure"))
+            );
+            assert!(
+                !capture
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.starts_with("error "))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn split_crlf_streams_stop_at_the_terminal_event_and_report_truncation() {
         let done = std::sync::Arc::new(std::sync::Mutex::new(None));
         let seen = done.clone();
         let body = chunks(vec![

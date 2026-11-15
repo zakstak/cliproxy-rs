@@ -695,137 +695,241 @@ fn provider_changes(out: &mut Vec<String>, old: &Value, new: &Value, family: &st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    /// A Go change line for a removed provider's setting (issue #49): this build refuses
-    /// the setting, so it never reports a change to it. Exact setting prefixes, and the
-    /// provider-keyed OAuth map lines whose channel is a removed provider.
-    fn removed_line(line: &str) -> bool {
-        const PREFIXES: [&str; 11] = [
-            "ws-auth: ",
-            "quota-exceeded.antigravity-credits: ",
-            "antigravity.",
-            "devin.",
-            "gemini-api-key count: ",
-            "interactions-api-key count: ",
-            "vertex-api-key count: ",
-            "gemini[",
-            "interactions[",
-            "vertex[",
-            "openai-compatibility:",
-        ];
-        PREFIXES.iter().any(|p| line.starts_with(p))
-            || ["oauth-excluded-models[", "oauth-model-alias["].iter().any(|map| {
-                line.strip_prefix(map)
-                    .and_then(|rest| rest.split_once(']'))
-                    .is_some_and(|(channel, _)| cpa_core::removed::provider(channel).is_some())
-            })
+    fn configs(old: &str, new: &str) -> (Config, Config) {
+        let auth = std::env::temp_dir().join(format!("cpa-reload-contract-{}", uuid::Uuid::new_v4()));
+        let parse = |text: &str| Config::parse(&format!("auth-dir: {}\n{text}\n", auth.display())).unwrap();
+        (parse(old), parse(new))
+    }
+
+    fn changed_field(old: &str, new: &str, label: &str) -> Vec<String> {
+        let (old, new) = configs(old, new);
+        let lines = details(&old, &new);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with(&format!("{label}:")) || line.starts_with(&format!("{label} count:"))),
+            "{label}: {lines:?}"
+        );
+        assert!(
+            !lines.join("\n").contains("contract-private"),
+            "secret material must be redacted: {lines:?}"
+        );
+        lines
     }
 
     #[test]
-    fn removed_lines_are_exact() {
-        for line in [
-            "ws-auth: true -> false",
-            "antigravity.sensitive-words: 0 -> 2",
-            "gemini[0].models: updated (1 -> 1 entries)",
-            "oauth-excluded-models[gemini]: added (1 entries)",
-            "openai-compatibility:\n  provider updated: same (models 0 -> 1)",
+    fn reload_summaries_identify_changed_operator_settings() {
+        for (old, new, label) in [
+            ("port: 8317", "port: 9001", "port"),
+            ("debug: false", "debug: true", "debug"),
+            ("logging-to-file: false", "logging-to-file: true", "logging-to-file"),
+            (
+                "usage-statistics-enabled: false",
+                "usage-statistics-enabled: true",
+                "usage-statistics-enabled",
+            ),
+            ("disable-cooling: false", "disable-cooling: true", "disable-cooling"),
+            (
+                "save-cooldown-status: false",
+                "save-cooldown-status: true",
+                "save-cooldown-status",
+            ),
+            (
+                "transient-error-cooldown-seconds: 1",
+                "transient-error-cooldown-seconds: 2",
+                "transient-error-cooldown-seconds",
+            ),
+            ("request-log: false", "request-log: true", "request-log"),
+            (
+                "logs-max-total-size-mb: 1",
+                "logs-max-total-size-mb: 2",
+                "logs-max-total-size-mb",
+            ),
+            (
+                "error-logs-max-files: 1",
+                "error-logs-max-files: 2",
+                "error-logs-max-files",
+            ),
+            ("request-retry: 1", "request-retry: 2", "request-retry"),
+            (
+                "max-retry-credentials: 1",
+                "max-retry-credentials: 2",
+                "max-retry-credentials",
+            ),
+            ("max-retry-interval: 1", "max-retry-interval: 2", "max-retry-interval"),
+            (
+                "force-model-prefix: false",
+                "force-model-prefix: true",
+                "force-model-prefix",
+            ),
+            (
+                "nonstream-keepalive-interval: 1",
+                "nonstream-keepalive-interval: 2",
+                "nonstream-keepalive-interval",
+            ),
+            (
+                "quota-exceeded: {switch-project: false}",
+                "quota-exceeded: {switch-project: true}",
+                "quota-exceeded.switch-project",
+            ),
+            (
+                "routing: {strategy: round-robin}",
+                "routing: {strategy: fill-first}",
+                "routing.strategy",
+            ),
+            (
+                "claude: {tool-search: false}",
+                "claude: {tool-search: true}",
+                "claude.tool-search",
+            ),
+            (
+                "xai: {inject-x-search: false}",
+                "xai: {inject-x-search: true}",
+                "xai.inject-x-search",
+            ),
+            (
+                "remote-management: {allow-remote: false}",
+                "remote-management: {allow-remote: true}",
+                "remote-management.allow-remote",
+            ),
+            (
+                "remote-management: {disable-control-panel: false}",
+                "remote-management: {disable-control-panel: true}",
+                "remote-management.disable-control-panel",
+            ),
         ] {
-            assert!(removed_line(line), "{line}");
-        }
-        for line in [
-            "quota-exceeded.switch-project: false -> true",
-            "codex[0].models: updated (1 -> 1 entries)",
-            "oauth-excluded-models[claude]: removed",
-            "claude-api-key count: 0 -> 1",
-            "payload.override: updated (0 -> 0 rules)",
-        ] {
-            assert!(!removed_line(line), "{line}");
+            changed_field(old, new, label);
         }
     }
+
     #[test]
-    fn real_go_reload_summaries_and_redaction() {
-        let dir = std::env::temp_dir().join(format!("cpa-config-diff-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let private_paths = |value: &str| {
-            value
-                .replace("/tmp/cpa-diff-fixture-auth", &dir.join("auth").to_string_lossy())
-                .replace("/tmp/new-auth", &dir.join("next-auth").to_string_lossy())
-        };
-        let cases: Value = serde_json::from_str(include_str!("../tests/fixtures/config_diff_go.json")).unwrap();
-        let mut refused = 0;
-        let mut normalized = Vec::new();
-        let mut retired_lines = 0;
-        for (i, case) in list(&cases).iter().enumerate() {
-            // A case that sets a removed provider's settings is refused at load (issue #49).
-            // It replays without any removed setting, inert ones too, and Go's lines for
-            // them retire. A case with inert ones only loads and compares as recorded.
-            let (old, new) = (private_paths(text(&case["old"])), private_paths(text(&case["new"])));
-            let mut refused_case = false;
-            for side in [&old, &new] {
-                if cpa_core::removed::strip_settings(side) != *side {
-                    let error = Config::parse(side).map(drop).unwrap_err().to_string();
-                    assert!(error.contains(cpa_core::removed::GUIDANCE), "case {i}: {error}");
-                    refused_case = true;
-                }
-            }
-            let (old, new) = if refused_case {
-                normalized.push(i);
-                (
-                    cpa_core::removed::strip_every_setting(&old),
-                    cpa_core::removed::strip_every_setting(&new),
+    fn key_and_proxy_changes_report_identity_without_secret_values() {
+        for (old, new, label) in [
+            (
+                "api-keys: [contract-private-old]",
+                "api-keys: [contract-private-new]",
+                "api-keys",
+            ),
+            (
+                "api-keys: [contract-private-old]",
+                "api-keys: [contract-private-old, contract-private-new]",
+                "api-keys",
+            ),
+            (
+                "proxy-url: http://contract-private-old:password@old.example:8000",
+                "proxy-url: http://contract-private-new:password@new.example:8000",
+                "proxy-url",
+            ),
+            (
+                "remote-management: {secret-key: contract-private-old}",
+                "remote-management: {secret-key: contract-private-new}",
+                "remote-management.secret-key",
+            ),
+        ] {
+            changed_field(old, new, label);
+        }
+    }
+
+    #[test]
+    fn provider_updates_identify_changed_fields_and_redact_keys_headers_and_models() {
+        // Codex accepts only the settings in its endpoint contract; its credential
+        // settings are covered by the native contract suite.
+        for family in ["claude", "xai", "meta"] {
+            let config = |body: &str| {
+                let base = if body.starts_with("base-url:") {
+                    String::new()
+                } else {
+                    "      base-url: https://upstream.example\n".to_owned()
+                };
+                format!(
+                    "config-version: 8\napi-keys:\n  {family}:\n    - keys: [{{api-key: contract-private-key}}]\n{base}      {body}\n"
                 )
-            } else {
-                (old, new)
             };
-            let old = Config::parse(&old).unwrap();
-            // A `codex-api-key` model marked `is-compat` makes the reload invalid (#28); the
-            // running config stays, so there is no summary. Other providers keep the flag.
-            let new = match Config::parse(&new) {
-                Err(error) if error.to_string().contains("is-compat is no longer supported") => {
-                    assert!(text(&case["new"]).contains("codex-api-key"), "case {i}: {error}");
-                    if std::env::var_os("CPA_COVERAGE_INVENTORY").is_some() {
-                        eprintln!("coverage\tconfig_diff\tcase {i}\tcodex_is_compat_refusal");
-                    }
-                    refused += 1;
+            let old = config("base-url: https://old.example");
+            let new = config("base-url: https://new.example");
+            changed_field(&old, &new, &format!("{family}[0].base-url"));
+            for (before, after, field) in [
+                (
+                    "proxy-url: http://old.example",
+                    "proxy-url: http://new.example",
+                    "proxy-url",
+                ),
+                ("prefix: old", "prefix: new", "prefix"),
+                ("disable-cooling: false", "disable-cooling: true", "disable-cooling"),
+                ("request-retry: 1", "request-retry: 2", "request-retry"),
+                (
+                    "headers: {X-Private: contract-private-old}",
+                    "headers: {X-Private: contract-private-new}",
+                    "headers",
+                ),
+                (
+                    "models: [{name: m, alias: old}]",
+                    "models: [{name: m, alias: new}]",
+                    "models",
+                ),
+                ("excluded-models: [old]", "excluded-models: [new]", "excluded-models"),
+            ] {
+                if family == "codex" && field == "proxy-url" {
                     continue;
                 }
-                parsed => parsed.unwrap(),
-            };
-            let actual = details(&old, &new);
-            if refused_case {
-                assert!(!actual.iter().any(|l| removed_line(l)), "case {i}: {actual:?}");
+                changed_field(&config(before), &config(after), &format!("{family}[0].{field}"));
             }
-            let mut expected = Vec::new();
-            // The OpenAI-compatible summary continues on indented lines under its header.
-            let mut in_removed_block = false;
-            for line in list(&case["changes"]).iter().map(|value| private_paths(text(value))) {
-                in_removed_block = line == "openai-compatibility:" || (in_removed_block && line.starts_with("  "));
-                if refused_case && (removed_line(&line) || in_removed_block) {
-                    retired_lines += 1;
-                } else {
-                    expected.push(line);
-                }
-            }
-            assert_eq!(json!(actual), json!(expected), "case {i}");
-            if std::env::var_os("CPA_COVERAGE_INVENTORY").is_some() {
-                let class = if refused_case {
-                    "refused_then_retained"
-                } else {
-                    "compared"
-                };
-                eprintln!("coverage\tconfig_diff\tcase {i}\t{class}");
-            }
-            assert!(!actual.join("\n").contains("fixture-secret"));
+            changed_field(
+                "",
+                &config("base-url: https://upstream.example"),
+                &format!("{family}-api-key"),
+            );
+            changed_field(
+                &config("base-url: https://upstream.example"),
+                "",
+                &format!("{family}-api-key"),
+            );
+            let old = config("base-url: https://upstream.example");
+            let new = old.replace("contract-private-key", "contract-private-replacement");
+            changed_field(&old, &new, &format!("{family}[0].api-key"));
         }
-        assert_eq!(list(&cases).len(), 62);
-        assert_eq!(refused, 1, "the one Codex is-compat case");
-        assert_eq!(
-            normalized,
-            [1, 5, 6, 9, 13, 14, 15, 16, 17, 18, 19, 20, 21, 38, 39, 40, 41, 48],
-            "cases refused, then replayed without removed-provider settings"
-        );
-        assert_eq!(retired_lines, 35, "Go's lines for removed-provider settings");
-        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn oauth_maps_and_payload_rules_report_same_size_edits_without_exposing_contents() {
+        for section in ["default", "default-raw", "override", "override-raw", "filter"] {
+            let rule = |value: &str| {
+                if section == "filter" {
+                    format!("payload:\n  {section}:\n    - models: [{{name: m}}]\n      params: [{value}]\n")
+                } else if section.ends_with("-raw") {
+                    format!(
+                        "payload:\n  {section}:\n    - models: [{{name: m}}]\n      params: {{field: '\"{value}\"'}}\n"
+                    )
+                } else {
+                    format!("payload:\n  {section}:\n    - models: [{{name: m}}]\n      params: {{field: '{value}'}}\n")
+                }
+            };
+            changed_field(
+                &rule("contract-private-old"),
+                &rule("contract-private-new"),
+                &format!("payload.{section}"),
+            );
+        }
+        for (section, before, after) in [
+            ("oauth-excluded-models", "[old]", "[new]"),
+            (
+                "oauth-model-alias",
+                "[{name: m, alias: old}]",
+                "[{name: m, alias: new}]",
+            ),
+            ("oauth-settings", "[{name: m, alias: old}]", "[{name: m, alias: new}]"),
+            (
+                "oauth-request-scoped-errors",
+                "[{status: 400, match: [old], action: request}]",
+                "[{status: 400, match: [new], action: request}]",
+            ),
+        ] {
+            changed_field(
+                &format!("{section}: {{claude: {before}}}"),
+                &format!("{section}: {{claude: {after}}}"),
+                &format!("{section}[claude]"),
+            );
+        }
     }
 }

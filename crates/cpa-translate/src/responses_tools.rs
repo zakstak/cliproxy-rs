@@ -317,18 +317,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn colliding_sanitized_names_get_go_hash_suffixes() {
-        // "a b" and "a_b" both sanitize to "a_b" ("." is allowed and stays); Go suffixes
-        // every colliding name with sha256("<name>\x00<attempt>")[:6] in hex.
-        let names: [&[u8]; 3] = [b"a_b", b"a b", b"a.b"];
+    fn sanitized_names_are_valid_unique_and_reversible() {
+        let long = "x".repeat(90);
+        let names: [&[u8]; 5] = [b"a_b", b"a b", b"a.b", long.as_bytes(), b"9numeric"];
         let out = sanitize_names(&names);
+        let values: HashSet<&[u8]> = out.values().map(Vec::as_slice).collect();
+        assert_eq!(values.len(), names.len());
         assert_eq!(out[&b"a.b".to_vec()], b"a.b");
-        let expect = |name: &[u8]| {
-            let digest = Sha256::digest([name, b"\x000"].concat());
-            format!("a_b_{}", crate::common::hex(&digest[..6])).into_bytes()
-        };
-        assert_eq!(out[&b"a b".to_vec()], expect(b"a b"));
-        assert_eq!(out[&b"a_b".to_vec()], expect(b"a_b"));
-        assert_ne!(out[&b"a b".to_vec()], out[&b"a_b".to_vec()]);
+        for original in names {
+            let name = &out[original];
+            assert!(!name.is_empty() && name.len() <= 64);
+            assert!(name.iter().all(|c| c.is_ascii_alphanumeric() || b"_.:-".contains(c)));
+            let reverse: HashMap<Vec<u8>, Vec<u8>> = out
+                .iter()
+                .map(|(original, safe)| (safe.clone(), original.clone()))
+                .collect();
+            assert_eq!(map_sanitized_function_name(&reverse, name), original);
+        }
+        let reversed = sanitize_names(&names.iter().rev().copied().collect::<Vec<_>>());
+        assert_eq!(out, reversed, "declaration order must not change call identity");
     }
 }

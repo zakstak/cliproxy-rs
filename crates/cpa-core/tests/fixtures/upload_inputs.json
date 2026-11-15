@@ -1,0 +1,466 @@
+[
+  {
+    "name": "legacy layout",
+    "yaml": "# operator note\nport: 8317\nremote-management:\n  secret-key: upload-plaintext-secret\n"
+  },
+  {
+    "name": "v8 layout",
+    "yaml": "# operator note\nport: 8317\nmanagement:\n  secret-key: upload-plaintext-secret\n"
+  },
+  {
+    "name": "v8 secret spelled like its section",
+    "yaml": "management:\n  secret-key: management\n"
+  },
+  {
+    "name": "overridden legacy secret spelled like the v8 section",
+    "yaml": "remote-management:\n  secret-key: management\nmanagement:\n  secret-key: '$2a$04$mEj3NnAnfxZlmu72iOpKm.R5kkHzzHYAjYobmxNalaHfbiO7A8Mnu'\n"
+  },
+  {
+    "name": "yaml null beside string null secret",
+    "yaml": "proxy-url: null\nmanagement:\n  secret-key: 'null'\n"
+  },
+  {
+    "name": "duplicated plaintext",
+    "yaml": "remote-management:\n  secret-key: upload-plaintext-secret\nmanagement:\n  secret-key: upload-plaintext-secret\n"
+  },
+  {
+    "name": "stale legacy beside hashed v8",
+    "yaml": "remote-management:\n  secret-key: upload-plaintext-secret\nmanagement:\n  secret-key: '$2a$04$mEj3NnAnfxZlmu72iOpKm.R5kkHzzHYAjYobmxNalaHfbiO7A8Mnu'\n"
+  },
+  {
+    "name": "hashed legacy secret",
+    "yaml": "# operator note\nremote-management:\n  secret-key: '$2a$04$mEj3NnAnfxZlmu72iOpKm.R5kkHzzHYAjYobmxNalaHfbiO7A8Mnu'\n"
+  },
+  {
+    "name": "hashed v8 secret",
+    "yaml": "# operator note\nmanagement:\n  secret-key: '$2a$04$mEj3NnAnfxZlmu72iOpKm.R5kkHzzHYAjYobmxNalaHfbiO7A8Mnu'\n"
+  },
+  {
+    "name": "no secret",
+    "yaml": "# operator note\nport: 8317\n"
+  },
+  {
+    "name": "null v8 secret",
+    "yaml": "# operator note\nmanagement:\n  secret-key: null\n"
+  },
+  {
+    "name": "tilde legacy secret",
+    "yaml": "# operator note\nremote-management:\n  secret-key: ~\n"
+  },
+  {
+    "name": "empty file",
+    "yaml": ""
+  },
+  {
+    "name": "unparsable",
+    "yaml": "remote-management:\n  secret-key: upload-plaintext-secret\nport: [8317\n"
+  },
+  {
+    "name": "secret too long for bcrypt",
+    "yaml": "remote-management:\n  secret-key: sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss\n"
+  },
+  {
+    "name": "mapping anchor",
+    "yaml": "defaults: &management\n  secret-key: upload-plaintext-secret\nmanagement: *management\n"
+  },
+  {
+    "name": "scalar anchor",
+    "yaml": "password: &password upload-plaintext-secret\nmanagement:\n  secret-key: *password\n"
+  },
+  {
+    "name": "merge key",
+    "yaml": "defaults: &management\n  secret-key: upload-plaintext-secret\nmanagement:\n  <<: *management\n  allow-remote: true\n"
+  },
+  {
+    "name": "shared anchor",
+    "yaml": "management: &management\n  secret-key: upload-plaintext-secret\nother: *management\n"
+  },
+  {
+    "name": "anchored legacy beside plaintext v8",
+    "yaml": "defaults: &legacy\n  secret-key: upload-plaintext-secret\nremote-management: *legacy\nmanagement:\n  secret-key: current-plaintext-secret\n"
+  },
+  {
+    "name": "anchored legacy beside hashed v8",
+    "yaml": "defaults: &legacy\n  secret-key: upload-plaintext-secret\nremote-management: *legacy\nmanagement:\n  secret-key: '$2a$04$mEj3NnAnfxZlmu72iOpKm.R5kkHzzHYAjYobmxNalaHfbiO7A8Mnu'\n"
+  },
+  {
+    "name": "quoted hex secret beside an unquoted copy",
+    "yaml": "management:\n  secret-key: \"0x1F\"\ncopy: 0x1F\n"
+  },
+  {
+    "name": "decimal secret beside a hex copy",
+    "yaml": "management:\n  secret-key: '31'\ncopy: 0x1F\n"
+  },
+  {
+    "name": "unquoted hex secret",
+    "yaml": "management:\n  secret-key: 0x1F\n"
+  },
+  {
+    "name": "unquoted boolean secret",
+    "yaml": "management:\n  secret-key: yes\n"
+  },
+  {
+    "name": "tagged copy of the secret",
+    "yaml": "management:\n  secret-key: secret\ncopy: !keep secret\n"
+  },
+  {
+    "name": "tagged mapping hiding a copy",
+    "yaml": "management:\n  secret-key: secret\ncopy: !keep {nested: [secret]}\n"
+  },
+  {
+    "name": "tagged secret",
+    "yaml": "management:\n  secret-key: !keep secret\n"
+  },
+  {
+    "name": "binary secret",
+    "yaml": "management:\n  secret-key: !!binary c2VjcmV0\n"
+  },
+  {
+    "name": "binary secret beside its base64 copy",
+    "yaml": "management:\n  secret-key: !!binary c2VjcmV0\ncopy: c2VjcmV0\n"
+  },
+  {
+    "name": "binary secret beside its decoded copy",
+    "yaml": "management:\n  secret-key: !!binary c2VjcmV0\ncopy: secret\n"
+  },
+  {
+    "name": "invalid binary secret",
+    "yaml": "management:\n  secret-key: !!binary 'c2VjcmV0!'\n"
+  },
+  {
+    "name": "binary secret with a space",
+    "yaml": "management:\n  secret-key: !!binary 'c2Vj cmV0'\n"
+  },
+  {
+    "name": "binary secret without padding",
+    "yaml": "management:\n  secret-key: !!binary YQ\n"
+  },
+  {
+    "name": "binary secret with unused bits",
+    "yaml": "management:\n  secret-key: !!binary YR==\n"
+  },
+  {
+    "name": "binary secret that is not UTF-8",
+    "yaml": "management:\n  secret-key: !!binary /w==\n"
+  },
+  {
+    "name": "verbatim binary secret beside its decoded copy",
+    "yaml": "management:\n  secret-key: !<tag:yaml.org,2002:binary> c2VjcmV0\ncopy: secret\n"
+  },
+  {
+    "name": "verbatim binary secret",
+    "yaml": "management:\n  secret-key: !<tag:yaml.org,2002:binary> c2VjcmV0\n"
+  },
+  {
+    "name": "escaped verbatim binary secret",
+    "yaml": "management:\n  secret-key: !<tag:yaml.org,2002:bin%61ry> c2VjcmV0\n"
+  },
+  {
+    "name": "escaped verbatim binary secret beside a copy",
+    "yaml": "management:\n  secret-key: !<tag:yaml.org,2002:bin%61ry> c2VjcmV0\ncopy: secret\n"
+  },
+  {
+    "name": "escaped shorthand binary secret",
+    "yaml": "management:\n  secret-key: !!bin%61ry c2VjcmV0\n"
+  },
+  {
+    "name": "escaped shorthand binary secret beside a copy",
+    "yaml": "management:\n  secret-key: !!bin%61ry c2VjcmV0\ncopy: secret\n"
+  },
+  {
+    "name": "named handle binary secret",
+    "yaml": "%TAG !e! tag:yaml.org,2002:\n---\nmanagement:\n  secret-key: !e!binary c2VjcmV0\n"
+  },
+  {
+    "name": "named handle binary secret beside a copy",
+    "yaml": "%TAG !e! tag:yaml.org,2002:\n---\nmanagement:\n  secret-key: !e!binary c2VjcmV0\ncopy: secret\n"
+  },
+  {
+    "name": "redefined secondary handle secret",
+    "yaml": "%TAG !! tag:example.com,2000:\n---\nmanagement:\n  secret-key: !!binary c2VjcmV0\n"
+  },
+  {
+    "name": "redefined secondary handle secret beside a copy",
+    "yaml": "%TAG !! tag:example.com,2000:\n---\nmanagement:\n  secret-key: !!binary c2VjcmV0\ncopy: secret\n"
+  },
+  {
+    "name": "malformed escape in the secret tag",
+    "yaml": "management:\n  secret-key: !<tag:yaml.org,2002:bin%6> c2VjcmV0\n"
+  },
+  {
+    "name": "binary anchor after a NEL-ended comment",
+    "yaml": "remote-management: # comment  secret-key: &a !!binary c2VjcmV0\nmanagement:\n  secret-key: *a\n"
+  },
+  {
+    "name": "binary anchor after a NEL-ended comment beside a copy",
+    "yaml": "remote-management: # comment  secret-key: &a !!binary c2VjcmV0\nmanagement:\n  secret-key: *a\ncopy: secret\n"
+  },
+  {
+    "name": "binary tag after a NEL-ended comment",
+    "yaml": "management:\n  secret-key: # c  !!binary c2VjcmV0\n"
+  },
+  {
+    "name": "binary tag after a NEL-ended comment beside a copy",
+    "yaml": "management:\n  secret-key: # c  !!binary c2VjcmV0\ncopy: secret\n"
+  },
+  {
+    "name": "line separator in a string",
+    "yaml": "management:\n  secret-key: upload-plaintext-secret\nnote: \"a b\"\n"
+  },
+  {
+    "name": "aliased legacy binary secret",
+    "yaml": "remote-management:\n  secret-key: &a !!binary c2VjcmV0\nmanagement:\n  secret-key: *a\n"
+  },
+  {
+    "name": "aliased legacy binary secret beside a copy",
+    "yaml": "remote-management:\n  secret-key: &a !!binary c2VjcmV0\nmanagement:\n  secret-key: *a\ncopy: secret\n"
+  },
+  {
+    "name": "aliased v8 binary secret",
+    "yaml": "management:\n  secret-key: &a !!binary c2VjcmV0\nremote-management:\n  secret-key: *a\n"
+  },
+  {
+    "name": "aliased v8 binary secret beside a copy",
+    "yaml": "management:\n  secret-key: &a !!binary c2VjcmV0\nremote-management:\n  secret-key: *a\ncopy: secret\n"
+  },
+  {
+    "name": "binary secret through an aliased section",
+    "yaml": "defaults: &d\n  secret-key: !!binary c2VjcmV0\nmanagement: *d\n"
+  },
+  {
+    "name": "binary secret through an aliased section beside a copy",
+    "yaml": "defaults: &d\n  secret-key: !!binary c2VjcmV0\nmanagement: *d\ncopy: secret\n"
+  },
+  {
+    "name": "binary secret through a merge",
+    "yaml": "defaults: &d\n  secret-key: !!binary c2VjcmV0\nmanagement:\n  <<: *d\n"
+  },
+  {
+    "name": "binary secret through a merge beside a copy",
+    "yaml": "defaults: &d\n  secret-key: !!binary c2VjcmV0\nmanagement:\n  <<: *d\ncopy: secret\n"
+  },
+  {
+    "name": "verbatim short binary secret",
+    "yaml": "management:\n  secret-key: !<!!binary> c2VjcmV0\n"
+  },
+  {
+    "name": "verbatim short binary secret beside a copy",
+    "yaml": "management:\n  secret-key: !<!!binary> c2VjcmV0\ncopy: secret\n"
+  },
+  {
+    "name": "escaped primary binary secret",
+    "yaml": "management:\n  secret-key: !%21binary c2VjcmV0\n"
+  },
+  {
+    "name": "escaped primary binary secret beside a copy",
+    "yaml": "management:\n  secret-key: !%21binary c2VjcmV0\ncopy: secret\n"
+  },
+  {
+    "name": "aliased plain secret beside an unrelated tag",
+    "yaml": "password: &p upload-plaintext-secret\nmanagement:\n  secret-key: *p\nother: !keep x\n"
+  },
+  {
+    "name": "tagged null copy",
+    "yaml": "management:\n  secret-key: 'null'\ncopy: !keep null\n"
+  },
+  {
+    "name": "tagged tilde copy",
+    "yaml": "management:\n  secret-key: '~'\ncopy: !keep ~\n"
+  },
+  {
+    "name": "tagged NULL copy",
+    "yaml": "management:\n  secret-key: 'NULL'\ncopy: [!keep NULL]\n"
+  },
+  {
+    "name": "tagged null secret",
+    "yaml": "management:\n  secret-key: !keep null\n"
+  },
+  {
+    "name": "core null tag copy",
+    "yaml": "management:\n  secret-key: 'null'\ncopy: !!null null\n"
+  },
+  {
+    "name": "aliased hex secret",
+    "yaml": "management:\n  secret-key: &key 0x1F\ncopy: *key\n"
+  },
+  {
+    "name": "binary host beside a merged secret",
+    "yaml": "management:\n  <<: {secret-key: secret}\nserver:\n  host: !!binary bG9jYWxob3N0\n"
+  },
+  {
+    "name": "hex key beside a merged secret",
+    "yaml": "management:\n  <<: {secret-key: secret}\nextra: {0x1F: unchanged}\n"
+  },
+  {
+    "name": "merged secret",
+    "yaml": "management:\n  <<: {secret-key: secret}\nport: 8317\n"
+  },
+  {
+    "name": "merge key beside a hex value",
+    "yaml": "defaults: &management\n  secret-key: upload-plaintext-secret\nmanagement:\n  <<: *management\nport: 0x1F9D\n"
+  },
+  {
+    "name": "71 bytes",
+    "yaml": "management:\n  secret-key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+  },
+  {
+    "name": "72 bytes",
+    "yaml": "management:\n  secret-key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+  },
+  {
+    "name": "73 bytes",
+    "yaml": "management:\n  secret-key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+  },
+  {
+    "name": "71 bytes multibyte",
+    "yaml": "management:\n  secret-key: éééééééééééééééééééééééééééééééééééa\n"
+  },
+  {
+    "name": "72 bytes multibyte",
+    "yaml": "management:\n  secret-key: éééééééééééééééééééééééééééééééééééé\n"
+  },
+  {
+    "name": "73 bytes multibyte",
+    "yaml": "management:\n  secret-key: ééééééééééééééééééééééééééééééééééééa\n"
+  },
+  {
+    "name": "bare $2a$",
+    "yaml": "management:\n  secret-key: '$2a$'\n"
+  },
+  {
+    "name": "bare $2b$",
+    "yaml": "management:\n  secret-key: '$2b$'\n"
+  },
+  {
+    "name": "bare $2y$",
+    "yaml": "management:\n  secret-key: '$2y$'\n"
+  },
+  {
+    "name": "secret aliased into trusted-proxies",
+    "yaml": "management:\n  secret-key: &key synthetic-secret\ntrusted-proxies: [*key]\n"
+  },
+  {
+    "name": "hash aliased into trusted-proxies",
+    "yaml": "management:\n  secret-key: &key '$2a$04$mEj3NnAnfxZlmu72iOpKm.R5kkHzzHYAjYobmxNalaHfbiO7A8Mnu'\ntrusted-proxies: [*key]\n"
+  },
+  {
+    "name": "secret aliased into the relay public-ip",
+    "yaml": "management:\n  secret-key: &key synthetic-secret\ncodex:\n  live-media-relay:\n    public-ip: *key\n"
+  },
+  {
+    "name": "legacy only",
+    "yaml": "request-retry: 4\ndisable-cooling: true\napi-keys: [old]\n"
+  },
+  {
+    "name": "mixed explicit zero",
+    "yaml": "# keep\nrequest-retry: 4\ndisable-cooling: true\napi-keys: [old]\nrouting:\n  retry: {request-retry: 0}\n  cooldown: {disable-cooling: false}\naccess: {api-keys: []}\n"
+  },
+  {
+    "name": "version does not force migration",
+    "yaml": "config-version: 8\nrequest-retry: 4\ndisable-cooling: true\napi-keys: [old]\n"
+  },
+  {
+    "name": "partial new block",
+    "yaml": "request-retry: 4\ndisable-cooling: true\napi-keys: [old]\nrouting: {retry: {max-retry-credentials: 2}}\n"
+  },
+  {
+    "name": "family beside its group, null legacy struct",
+    "yaml": "claude-api-key: [{api-key: a}]\napi-keys: {claude: [{keys: [{api-key: b}]}]}\nremote-management: null\nmanagement: {allow-remote: true}\n"
+  },
+  {
+    "name": "first prefix claims a leaf",
+    "yaml": "codex:\n  response-steering: true\noauth:\n  providers:\n    codex:\n      response-steering: false\n"
+  },
+  {
+    "name": "undeclared same-spelled oauth field",
+    "yaml": "codex:\n  live-media-relay:\n    enabled: true\n    allow-private-remote-ips: false\noauth:\n  providers:\n    codex:\n      live-media-relay:\n        allow-private-remote-ips: true\n"
+  },
+  {
+    "name": "private-IP alias beside the canonical field",
+    "yaml": "codex:\n  live-media-relay:\n    allow-private-remote-ips: false\noauth:\n  providers:\n    codex:\n      live-media-relay:\n        disable-private-remote-ips: false\n"
+  },
+  {
+    "name": "declared relay leaf overridden",
+    "yaml": "codex:\n  live-media-relay:\n    enabled: true\n    max-sessions: 3\noauth:\n  providers:\n    codex:\n      live-media-relay:\n        enabled: false\n"
+  },
+  {
+    "name": "empty legacy claude beside upstream",
+    "yaml": "claude: {}\nupstream:\n  claude:\n    model-level-cooling: true\n"
+  },
+  {
+    "name": "null legacy claude-code beside upstream",
+    "yaml": "claude-code: null\nupstream:\n  claude:\n    model-level-cooling: true\n"
+  },
+  {
+    "name": "empty historical oauth claude beside upstream",
+    "yaml": "oauth:\n  providers:\n    claude: {}\nupstream:\n  claude:\n    model-level-cooling: true\n"
+  },
+  {
+    "name": "null historical oauth xai beside upstream",
+    "yaml": "oauth:\n  providers:\n    xai: null\nupstream:\n  xai:\n    inject-x-search: true\n"
+  },
+  {
+    "name": "historical alias beside upstream",
+    "yaml": "oauth:\n  providers:\n    codex:\n      model-level-cooling: true\nupstream:\n  codex:\n    model-level-cooling: false\n"
+  },
+  {
+    "name": "scalar at a struct path",
+    "yaml": "tls: 5\nserver:\n  tls:\n    enable: false\n"
+  },
+  {
+    "name": "empty legacy struct, v8 struct present",
+    "yaml": "tls: {}\nserver:\n  tls:\n    enable: true\n"
+  },
+  {
+    "name": "declared claude header leaf overridden",
+    "yaml": "claude-header-defaults:\n  client-request-id: 'off'\nupstream:\n  claude:\n    header-defaults:\n      client-request-id: 'on'\n"
+  },
+  {
+    "name": "undeclared nested antigravity field",
+    "yaml": "antigravity:\n  signature-cache-enabled: false\noauth:\n  providers:\n    antigravity:\n      signature-cache-enabled: true\n"
+  },
+  {
+    "name": "empty legacy discovery interfaces",
+    "yaml": "discovery:\n  interfaces: {}\nserver:\n  discovery:\n    interfaces: {}\n"
+  },
+  {
+    "name": "binary value beside a dropped legacy field",
+    "yaml": "config-version: 8\nrequest-retry: 1\nrouting:\n  retry:\n    request-retry: 2\nrequests:\n  proxy-url: !!binary aHR0cDovL3guZXhhbXBsZTo4MA==\naccess:\n  api-keys: [&k !!binary ZmFrZS1iaW5hcnk=, *k]\nmanagement:\n  secret-key: upload-plaintext-secret\n"
+  },
+  {
+    "name": "relay port above uint16",
+    "yaml": "management:\n  secret-key: upload-plaintext-secret\ncodex:\n  live-media-relay:\n    udp-port-min: 65536\n"
+  },
+  {
+    "name": "negative relay port",
+    "yaml": "management:\n  secret-key: upload-plaintext-secret\noauth:\n  providers:\n    codex:\n      live-media-relay:\n        udp-port-max: -1\n"
+  },
+  {
+    "name": "server port above uint16",
+    "yaml": "port: 70000\n"
+  },
+  {
+    "name": "null legacy weight",
+    "yaml": "gemini-api-key: [{api-key: fake, weight: null}]\n"
+  },
+  {
+    "name": "legacy weight above the limit",
+    "yaml": "gemini-api-key: [{api-key: fake, weight: 1000001}]\n"
+  },
+  {
+    "name": "compatible weight above the limit",
+    "yaml": "openai-compatibility: [{name: x, base-url: https://x.invalid, api-key-entries: [{api-key: fake, weight: 1000001}]}]\n"
+  },
+  {
+    "name": "null group weight",
+    "yaml": "api-keys: {gemini: [{keys: [{api-key: fake, weight: null}]}]}\n"
+  },
+  {
+    "name": "non-integer legacy weight",
+    "yaml": "gemini-api-key: [{api-key: fake, weight: heavy}]\n"
+  },
+  {
+    "name": "group weight above the limit",
+    "yaml": "api-keys: {gemini: [{keys: [{api-key: fake, weight: 1000001}]}]}\n"
+  }
+]

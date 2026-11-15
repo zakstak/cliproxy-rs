@@ -1706,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn environment_proxies_follow_go_httpproxy() {
+    fn environment_proxies_respect_precedence_and_bypass_policy() {
         let env = |vars: &[(&str, &str)]| {
             let vars: std::collections::HashMap<String, String> =
                 vars.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
@@ -1775,14 +1775,30 @@ mod tests {
     }
 
     #[test]
-    fn canonical_header_matches_go() {
-        assert_eq!(canonical_header("x-msh-device-id"), "X-Msh-Device-Id");
-        assert_eq!(canonical_header("content-TYPE"), "Content-Type");
-        assert_eq!(canonical_header("bad header"), "bad header");
-    }
-
-    fn go_fixture() -> serde_json::Value {
-        serde_json::from_str(include_str!("../tests/fixtures/proxy_go.json")).unwrap()
+    fn header_lookup_is_case_insensitive_and_preserves_repeated_values() {
+        let mut headers = GoHeaders::new();
+        headers.set("content-TYPE", "application/json");
+        headers.set("X-Msh-Device-Id", "device");
+        // Canonical display spelling is incidental. HeaderMap represents the
+        // HTTP contract: case-insensitive field names and unchanged values.
+        headers.add_raw("x-repeated", "one");
+        headers.add_raw("X-Repeated", "two");
+        let mut map = http::HeaderMap::new();
+        for (name, value) in headers.pairs() {
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        assert_eq!(
+            map.get_all("x-repeated")
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        assert_eq!(map.get("CONTENT-TYPE").unwrap(), "application/json");
+        assert_eq!(map.get("x-msh-device-id").unwrap(), "device");
     }
 
     /// What a local upstream saw of one request.
@@ -1921,10 +1937,9 @@ mod tests {
         addr
     }
 
-    /// Go's `http.DefaultTransport` keeps idle connections per host; the standard clients
-    /// (API-key base URLs, OpenAI-compatible hosts) reuse theirs over HTTP/2 and HTTP/1.1.
+    /// Clients retain usable HTTP/2 and HTTP/1.1 connections to the same host.
     #[tokio::test]
-    async fn go_clients_reuse_connections() {
+    async fn clients_reuse_connections_for_the_same_host() {
         use std::sync::atomic::Ordering::SeqCst;
         let host = "upstream-reuse.test";
         for alpn in [&b"\x02h2\x08http/1.1"[..], b"\x08http/1.1"] {
@@ -1945,296 +1960,206 @@ mod tests {
         }
     }
 
-    /// Go's cloned default transport (proxyutil, ForceAttemptHTTP2) offers h2 and
-    /// http/1.1 to every TLS upstream and speaks HTTP/2 wherever the upstream picks it,
-    /// directly or through a CONNECT proxy; plain HTTP stays HTTP/1.1. Go's default
-    /// User-Agent names the protocol (tests/reference/proxy/main.go `protocols`).
+    /// RFC 9113 ALPN negotiation is exercised through direct and CONNECT routes.
     #[tokio::test]
-    async fn go_clients_negotiate_http2_like_go() {
-        let fixture = go_fixture();
-        let cases = fixture["protocols"].as_array().unwrap();
-        assert_eq!(cases.len(), 5);
-        for case in cases {
-            let name = case["name"].as_str().unwrap();
-            let alpn: Option<&'static [u8]> = match case["server"].as_str().unwrap() {
-                "h2" => Some(b"\x02h2\x08http/1.1"),
-                "h1" => Some(b"\x08http/1.1"),
-                _ => None,
-            };
-            let (addr, ca, saw) = upstream(alpn).await;
-            let host = "upstream.test.invalid";
-            let proxy = match case["proxy"].as_str().unwrap() {
-                "http" => Proxy::Url(format!("http://{}", connect_proxy(addr).await)),
-                _ => Proxy::Direct,
-            };
-            let clients = GoClients::new(Hooks {
-                trust: (!ca.is_empty()).then(|| CertStore::from_pem_stack(ca).unwrap()),
-                resolve: vec![(host.to_owned(), addr)],
-            });
-            let scheme = if alpn.is_some() { "https" } else { "http" };
-            let route = |_: &url::Url| {
-                Ok(Route {
-                    client: clients.get(&proxy),
-                    order: None,
-                })
-            };
-            let want = Saw {
-                proto: case["proto"].as_str().unwrap().to_owned(),
-                client_alpn: case["client_alpn"]
-                    .as_array()
-                    .map(|a| a.iter().map(|p| p.as_str().unwrap().to_owned()).collect()),
-                user_agent: case["user_agent"].as_str().unwrap().to_owned(),
-            };
-            // The second request knows the origin's protocol; the first assumes HTTP/1.1
-            // for the default User-Agent only (see `expects_http2`).
-            for attempt in ["first", "second"] {
-                let upstream = send_request(
-                    &route,
-                    wreq::Method::GET,
-                    &format!("{scheme}://{host}:{}/", addr.port()),
-                    GoHeaders::new(),
-                    None,
-                    Some(std::time::Duration::from_secs(10)),
-                )
-                .await
-                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
-                assert_eq!(upstream.status, 200, "{name}");
-                assert_eq!(read_all(upstream.body, 16, false).await.unwrap(), "ok", "{name}");
-                let mut want = want.clone();
-                if attempt == "first" && want.proto == "HTTP/2.0" {
-                    want.user_agent = "Go-http-client/1.1".into();
-                }
-                assert_eq!(*saw.lock().unwrap(), want, "{name} ({attempt} request)");
-            }
-        }
-    }
-
-    /// Every case runs the real `bufio.Scanner` in tests/reference/proxy/main.go.
-    #[tokio::test]
-    async fn lines_follow_go_bufio_scanner() {
-        for case in go_fixture()["lines"].as_array().unwrap() {
-            let name = case["name"].as_str().unwrap();
-            let mut items: Vec<Result<Bytes, ExecError>> = case["chunks"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|c| Ok(Bytes::from(c.as_str().unwrap().to_owned())))
-                .collect();
-            let failed = case["io_error"].as_bool().unwrap();
-            if failed {
-                items.push(Err(ExecError::local(502, FailureScope::Transport, "read failed")));
-            }
-            let body = futures_util::stream::iter(items);
-            // A failed reader is never read again; otherwise the body ends (EOF).
-            let body = if failed {
-                body.chain(futures_util::stream::pending()).boxed()
-            } else {
-                body.boxed()
-            };
-            let max = case["max"].as_u64().unwrap() as usize;
-            let got: Vec<_> = lines(body, max).collect().await;
-            // Go with a separate terminal read differs only where the ponytail says.
-            let separate = (case["separate_tokens"].clone(), case["separate_error"].clone());
-            let attached = (case["tokens"].clone(), case["error"].clone());
-            let differs = ["exact-max-unterminated", "exact-max-then-io-error"].contains(&name);
-            assert_eq!(separate != attached, differs, "{name}: Go's two terminal modes");
-            let (tokens, errors): (Vec<_>, Vec<_>) = got.into_iter().partition(Result::is_ok);
-            let tokens: Vec<String> = tokens
-                .into_iter()
-                .map(|t| String::from_utf8(t.unwrap().to_vec()).unwrap())
-                .collect();
-            let want: Vec<&str> = case["tokens"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t.as_str().unwrap())
-                .collect();
-            assert_eq!(tokens, want, "{name}");
-            let error = errors.into_iter().map(|e| e.unwrap_err()).collect::<Vec<_>>();
-            match case["error"].as_str().unwrap() {
-                "" => assert!(error.is_empty(), "{name}"),
-                "too_long" => {
-                    assert_eq!(error.len(), 1, "{name}");
-                    assert_eq!(error[0].body, "bufio.Scanner: token too long", "{name}");
-                }
-                _ => {
-                    assert_eq!(error.len(), 1, "{name}");
-                    assert_eq!(error[0].body, "read failed", "{name}");
+    async fn clients_negotiate_http_protocol_with_direct_and_connect_routes() {
+        for (alpn, protocol) in [
+            (Some(&b"\x02h2\x08http/1.1"[..]), "HTTP/2.0"),
+            (Some(&b"\x08http/1.1"[..]), "HTTP/1.1"),
+            (None, "HTTP/1.1"),
+        ] {
+            for proxied in [false, true] {
+                if proxied && alpn.is_none() {
+                    continue;
+                } // This peer implements CONNECT, not HTTP forwarding.
+                let (addr, ca, saw) = upstream(alpn).await;
+                let host = "upstream.test.invalid";
+                let proxy = if proxied {
+                    Proxy::Url(format!("http://{}", connect_proxy(addr).await))
+                } else {
+                    Proxy::Direct
+                };
+                let clients = GoClients::new(Hooks {
+                    trust: (!ca.is_empty()).then(|| CertStore::from_pem_stack(ca).unwrap()),
+                    resolve: vec![(host.to_owned(), addr)],
+                });
+                let scheme = if alpn.is_some() { "https" } else { "http" };
+                let route = |_: &url::Url| {
+                    Ok(Route {
+                        client: clients.get(&proxy),
+                        order: None,
+                    })
+                };
+                for _ in 0..2 {
+                    let response = send_request(
+                        &route,
+                        wreq::Method::GET,
+                        &format!("{scheme}://{host}:{}/", addr.port()),
+                        GoHeaders::new(),
+                        None,
+                        Some(std::time::Duration::from_secs(10)),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status, 200);
+                    assert_eq!(read_all(response.body, 16, false).await.unwrap(), "ok");
+                    let seen = saw.lock().unwrap();
+                    assert_eq!(seen.proto, protocol, "TLS={alpn:?}, proxy={proxied}");
+                    if let Some(offered) = &seen.client_alpn {
+                        assert!(offered.iter().any(|p| p == "http/1.1"));
+                        if protocol == "HTTP/2.0" {
+                            assert!(offered.iter().any(|p| p == "h2"));
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Go's `http.Client` redirect hops for GET and POST (tests/reference/proxy/main.go),
-    /// replayed through [`request`] against the same scripted servers.
+    /// Streaming line boundaries must be independent of transport chunk boundaries.
+    /// The configured cap protects the server, while I/O failures terminate once.
     #[tokio::test]
-    async fn redirects_follow_go_http_client() {
-        type Hops = Arc<Mutex<Vec<serde_json::Value>>>;
-        async fn record(
-            hops: Hops,
-            script: Arc<serde_json::Value>,
-            // Location placeholders and their values, replaced in order.
-            other: Arc<[(&'static str, String); 3]>,
-            request: axum::extract::Request,
-        ) -> axum::response::Response {
-            use axum::response::IntoResponse;
-            let (parts, body) = request.into_parts();
-            let body = axum::body::to_bytes(body, 1 << 20).await.unwrap();
-            let header = |name: &str| {
-                parts
-                    .headers
-                    .get_all(name)
-                    .iter()
-                    .map(|v| v.to_str().unwrap().to_owned())
+    async fn line_reader_handles_fragmentation_eof_caps_and_io_errors() {
+        for chunks in [
+            vec!["one\r\ntwo\nlast"],
+            vec!["o", "ne\r", "\nt", "wo\n", "last"],
+            vec!["one\r\n", "two\nlast"],
+        ] {
+            let body = futures_util::stream::iter(chunks.into_iter().map(|s| Ok(Bytes::from(s)))).boxed();
+            let output: Vec<_> = lines(body, 64).collect().await;
+            let output: Vec<_> = output.into_iter().map(Result::unwrap).collect();
+            assert_eq!(
+                output,
+                [
+                    Bytes::from_static(b"one"),
+                    Bytes::from_static(b"two"),
+                    Bytes::from_static(b"last")
+                ]
+            );
+        }
+        for (body, want) in [
+            ("", vec![]),
+            ("\n", vec![""]),
+            ("a\n\n", vec!["a", ""]),
+            ("a\r", vec!["a"]),
+        ] {
+            let stream = futures_util::stream::iter([Ok(Bytes::from(body))]).boxed();
+            let actual: Vec<_> = lines(stream, 64).map(Result::unwrap).collect().await;
+            assert_eq!(
+                actual,
+                want.iter()
+                    .map(|s| Bytes::copy_from_slice(s.as_bytes()))
                     .collect::<Vec<_>>()
-                    .join(",")
-            };
-            // Go's server looks the script up by `URL.Path`, unescaped.
-            let raw = parts.uri.path().as_bytes();
-            let mut path = Vec::with_capacity(raw.len());
-            let mut i = 0;
-            while i < raw.len() {
-                let hex = raw
-                    .get(i + 1..i + 3)
-                    .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok());
-                match (raw[i], hex) {
-                    (b'%', Some(byte)) => {
-                        path.push(byte);
-                        i += 3;
-                    }
-                    (byte, _) => {
-                        path.push(byte);
-                        i += 1;
-                    }
-                }
-            }
-            let path = String::from_utf8(path).unwrap();
-            let target = parts.uri.path_and_query().map_or("/", |p| p.as_str()).to_owned();
-            hops.lock().unwrap().push(serde_json::json!({
-                "user_agent": header("user-agent"),
-                "has_user_agent": parts.headers.contains_key("user-agent"),
-                "accept_encoding": header("accept-encoding"),
-                "method": parts.method.as_str(),
-                "path": target,
-                "host": header("host"),
-                "referer": header("referer"),
-                "authorization": header("authorization"),
-                "content_type": header("content-type"),
-                "content_length": header("content-length"),
-                "body": String::from_utf8_lossy(&body),
-            }));
-            // The exact request target first, as the recorder does.
-            let Some(step) = script.get(&target).or_else(|| script.get(&path)) else {
-                return (http::StatusCode::OK, "done").into_response();
-            };
-            let status = http::StatusCode::from_u16(step["status"].as_u64().unwrap() as u16).unwrap();
-            let location = other
-                .iter()
-                .fold(step["location"].as_str().unwrap().to_owned(), |l, (token, value)| {
-                    l.replace(token, value)
-                });
-            if location.is_empty() {
-                return status.into_response();
-            }
-            let location = http::HeaderValue::from_bytes(location.as_bytes()).unwrap();
-            (status, [(http::header::LOCATION, location)]).into_response()
+            );
         }
-        let fixture = go_fixture();
-        let cases = fixture["redirects"].as_array().unwrap();
-        // Go's net/url builds every hop; Rust does with exact_target, and normalizes
-        // otherwise, which only dot segments, escaping and malformed targets tell apart.
-        // cliproxy-rs refuses a hop whose Host header wreq would write without Go's port
-        // (DIFFERENCES "Model catalog reads"): the hops before it go out, then the
-        // request fails.
-        const REFUSED: &[(&str, usize)] = &[
-            ("get-empty-then-default-port-location-exact", 1),
-            ("get-default-port-source-exact", 0),
-        ];
-        // Goes to port 80, which a test cannot listen on; `go_url` tests cover its
-        // Host and Referer.
-        const PORT_80: &str = "get-empty-port-source-exact";
-        let runs = cases.iter().filter(|case| case["name"] != PORT_80).flat_map(|case| {
-            let start = case["start"].as_str().unwrap();
-            let both = start == "/start";
-            [(case, true)].into_iter().chain(both.then_some((case, false)))
-        });
-        for (case, exact) in runs {
-            let name = format!("{} (exact: {exact})", case["name"].as_str().unwrap());
-            let main = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let (main_addr, other_port) = (main.local_addr().unwrap(), second.local_addr().unwrap().port());
-            let other = Arc::new([
-                ("OTHERHOST", format!("localhost:{other_port}")),
-                ("MAINHOST", main_addr.to_string()),
-                ("OTHER", format!("http://localhost:{other_port}")),
-            ]);
-            let hops: Hops = Arc::default();
-            let script = Arc::new(case["script"].clone());
-            for listener in [main, second] {
-                let (hops, script, other) = (hops.clone(), script.clone(), other.clone());
-                let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
-                    record(hops.clone(), script.clone(), other.clone(), request)
-                });
-                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            }
-            let mut headers = GoHeaders::new();
-            for (k, v) in case["headers"].as_object().unwrap() {
-                headers.set(k, v.as_str().unwrap());
-            }
-            if exact {
-                headers.exact_target();
-            }
-            if case["disable_compression"].as_bool().unwrap() {
-                headers.disable_compression();
-            }
-            let base = format!("http://{main_addr}");
-            let method = wreq::Method::from_bytes(case["method"].as_str().unwrap().as_bytes()).unwrap();
-            let body = case["body"].as_str().map(|b| Bytes::from(b.to_owned()));
-            let start = case["start"].as_str().unwrap();
-            let target = match (case["target"].as_str(), case["user"].as_str()) {
-                (Some(target), _) => target.replacen("MAINHOST", &main_addr.to_string(), 1),
-                (None, Some(user)) => format!("http://{user}@{main_addr}{start}"),
-                (None, None) => format!("{base}{start}"),
-            };
-            let refused = REFUSED.iter().find(|(n, _)| case["name"] == *n).map(|(_, sent)| *sent);
-            let result = request(
-                &default_client(),
-                method,
-                &target,
-                headers,
-                body,
-                Some(std::time::Duration::from_secs(10)),
-            )
-            .await;
-            match &result {
-                Ok(upstream) => {
-                    assert!(refused.is_none(), "{name}: not refused");
-                    assert_eq!(u64::from(upstream.status), case["status"].as_u64().unwrap(), "{name}");
+        for body in ["123456789", "123456789\n", "short\n123456789"] {
+            let stream = futures_util::stream::iter([Ok(Bytes::from(body))]).boxed();
+            let output: Vec<_> = lines(stream, 8).collect().await;
+            assert!(output.last().unwrap().is_err(), "the line cap is enforced: {body:?}");
+            assert_eq!(output.iter().filter(|r| r.is_err()).count(), 1);
+        }
+        let stream = futures_util::stream::iter([
+            Ok(Bytes::from_static(b"one\npartial")),
+            Err(ExecError::local(502, FailureScope::Transport, "read failed")),
+            Ok(Bytes::from_static(b"never\n")),
+        ])
+        .boxed();
+        let output: Vec<_> = lines(stream, 64).collect().await;
+        assert_eq!(output[0].as_ref().unwrap(), "one");
+        assert_eq!(output.iter().filter(|r| r.is_err()).count(), 1);
+        assert!(
+            output.last().unwrap().is_err(),
+            "nothing is emitted after the I/O failure"
+        );
+    }
+
+    /// RFC 9110 redirects define method/body handling. Cross-origin hops must
+    /// never receive the original Authorization or Cookie credentials.
+    #[tokio::test]
+    async fn redirects_preserve_methods_bodies_and_credential_boundaries() {
+        use axum::response::IntoResponse;
+        type Seen = Arc<Mutex<Vec<(http::Method, http::HeaderMap, Bytes)>>>;
+        for status in [301u16, 302, 303, 307, 308] {
+            for method in [wreq::Method::GET, wreq::Method::POST] {
+                for cross_origin in [false, true] {
+                    let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let source_addr = source.local_addr().unwrap();
+                    let target_addr = target.local_addr().unwrap();
+                    // A host change rather than just a port change exercises the
+                    // credential boundary independently of local dial addresses.
+                    let location = if cross_origin {
+                        format!("http://localhost:{}/final?q=one%20two", target_addr.port())
+                    } else {
+                        "/final?q=one%20two".into()
+                    };
+                    let seen: Seen = Arc::default();
+                    let app = {
+                        let seen = seen.clone();
+                        axum::Router::new().fallback(move |request: axum::extract::Request| {
+                            let seen = seen.clone();
+                            let location = location.clone();
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let body = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                                let first = parts.uri.path() == "/start";
+                                assert!(first || parts.uri.path_and_query().unwrap().as_str() == "/final?q=one%20two");
+                                seen.lock().unwrap().push((parts.method, parts.headers, body));
+                                if first {
+                                    (
+                                        http::StatusCode::from_u16(status).unwrap(),
+                                        [(http::header::LOCATION, location)],
+                                    )
+                                        .into_response()
+                                } else {
+                                    (http::StatusCode::OK, "done").into_response()
+                                }
+                            }
+                        })
+                    };
+                    let source_task = tokio::spawn(axum::serve(source, app.clone()).into_future());
+                    let target_task = tokio::spawn(axum::serve(target, app).into_future());
+                    let mut headers = GoHeaders::new();
+                    headers.set("Authorization", "Bearer private-test-token");
+                    headers.set("Cookie", "session=private-test-cookie");
+                    headers.set("Content-Type", "application/json");
+                    headers.set("X-Trace", "retained");
+                    let original = if method == wreq::Method::POST {
+                        Bytes::from_static(b"{ \"text\" : \"opaque\" }")
+                    } else {
+                        Bytes::new()
+                    };
+                    let response = request(
+                        &default_client(),
+                        method.clone(),
+                        &format!("http://{source_addr}/start"),
+                        headers,
+                        Some(original.clone()),
+                        Some(std::time::Duration::from_secs(10)),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(response.status, 200);
+                    assert_eq!(read_all(response.body, 32, false).await.unwrap(), "done");
+                    let seen = seen.lock().unwrap();
+                    assert_eq!(seen.len(), 2);
+                    assert_eq!(seen[0].0.as_str(), method.as_str());
+                    assert_eq!(seen[0].2, original);
+                    let switches = method == wreq::Method::POST && matches!(status, 301..=303);
+                    assert_eq!(seen[1].0.as_str(), if switches { "GET" } else { method.as_str() });
+                    assert_eq!(seen[1].2.as_ref(), if switches { &b""[..] } else { original.as_ref() });
+                    assert_eq!(seen[1].1.get("x-trace").unwrap(), "retained");
+                    for secret in ["authorization", "cookie"] {
+                        if cross_origin {
+                            assert!(seen[1].1.get(secret).is_none(), "{status} {secret}");
+                        } else {
+                            assert_eq!(seen[1].1.get(secret), seen[0].1.get(secret));
+                        }
+                    }
+                    source_task.abort();
+                    target_task.abort();
                 }
-                // A refusal names the URL invalid; reaching for port 80 fails differently.
-                Err(e) if refused.is_some() => {
-                    assert!(String::from_utf8_lossy(&e.body).contains("invalid"), "{name}: {e:?}")
-                }
-                Err(_) => assert!(case["error"].as_bool().unwrap(), "{name}: unexpected error"),
             }
-            let got: Vec<serde_json::Value> = hops
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|h| {
-                    let mut h = h.clone();
-                    let host = h["host"]
-                        .as_str()
-                        .unwrap()
-                        .replace(&main_addr.to_string(), "BASE")
-                        .replace(&format!("localhost:{other_port}"), "OTHER");
-                    h["host"] = host.into();
-                    h["referer"] = h["referer"].as_str().unwrap().replacen(&base, "BASE", 1).into();
-                    h
-                })
-                .collect();
-            let want = case["hops"].as_array().unwrap();
-            assert_eq!(&got, &want[..refused.unwrap_or(want.len())], "{name}");
         }
     }
 

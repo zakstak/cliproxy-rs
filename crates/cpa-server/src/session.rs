@@ -80,9 +80,8 @@ pub fn resolve(format: Format, headers: &HeaderMap, body: &[u8], execution: Opti
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderName, HeaderValue};
-    use cpa_common::session::{self as identity, Meta};
+    use cpa_common::session as identity;
     use cpa_core::format::Format;
-    use serde_json::Value;
 
     /// #113: first-party Codex (openai/codex@44ccf394573c `core/src/client.rs`,
     /// `core/src/responses_metadata.rs`, `core/src/codex_delegate.rs`) sends a Guardian
@@ -172,97 +171,112 @@ mod tests {
         assert_eq!(worker_review.parent, worker.thread, "named by the worker's thread");
     }
 
-    /// Goldens from Go `session.ExtractSessionInfo`, `session.Enrich` and
-    /// `auth.ExtractSessionID` (tests/reference/server/main.go).
     #[test]
-    fn identity_matches_go() {
-        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        let cases = fixture["session"].as_array().unwrap();
-        assert!(cases.len() >= 50);
-        for case in cases {
-            let name = case["name"].as_str().unwrap();
-            let mut headers = super::HeaderMap::new();
-            for pair in case["headers"].as_array().into_iter().flatten() {
-                let name = HeaderName::from_bytes(pair[0].as_str().unwrap().as_bytes()).unwrap();
-                // Values hyper would reject (control characters) never reach a route.
-                if let Ok(value) = HeaderValue::from_bytes(pair[1].as_str().unwrap().as_bytes()) {
-                    headers.append(name, value);
-                }
+    fn request_session_resolution_owns_explicit_precedence_and_caller_isolation() {
+        let headers = |pairs: &[(&str, &str)]| {
+            let mut out = super::HeaderMap::new();
+            for (name, value) in pairs {
+                out.append(
+                    HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_str(value).unwrap(),
+                );
             }
-            let payload = case["payload"].as_str().unwrap().as_bytes();
-            let execution = case["execution"].as_str().filter(|s| !s.is_empty());
-            // Gemini and Interactions clients were removed (issue #49).
-            let Some(format) = Format::parse(case["format"].as_str().unwrap()) else {
-                continue;
-            };
-            let scope = identity::caller_scope(case["client_key"].as_str().unwrap());
-            assert_eq!(scope, case["caller_scope"].as_str().unwrap(), "{name} caller scope");
-
-            let info = identity::extract_session_info(&headers, payload, execution);
-            match (&info, case["info"].as_object()) {
-                (None, None) => {}
-                (Some(info), Some(go)) => {
-                    let s = |k: &str| go.get(k).and_then(Value::as_str).unwrap_or_default();
-                    let b = |k: &str| go.get(k).and_then(Value::as_bool).unwrap_or_default();
-                    assert_eq!(info.session_id, s("session_id"), "{name} session");
-                    assert_eq!(info.parent_session_id, s("parent_session_id"), "{name} parent");
-                    assert_eq!(info.agent_name, s("agent_name"), "{name} agent");
-                    assert_eq!(info.client_type, s("client_type"), "{name} client");
-                    assert_eq!(info.is_fork, b("is_fork"), "{name} fork");
-                    assert_eq!(info.is_subagent, b("is_subagent"), "{name} subagent");
-                }
-                (rust, go) => panic!("{name}: rust {rust:?}, go {go:?}"),
+            out
+        };
+        for (header, prefix) in [
+            ("x-claude-code-session-id", "claude:"),
+            ("session-id", "codex:"),
+            ("x-session-id", "header:"),
+            ("x-session-affinity", "affinity:"),
+            ("x-slot-session-id", "slot:"),
+            ("x-task-id", "task:"),
+            ("x-conversation-id", "conv:"),
+            ("x-thread-id", "thread:"),
+            ("x-client-request-id", "clientreq:"),
+        ] {
+            for format in [Format::OpenAI, Format::Claude, Format::OpenAIResponse] {
+                let actual = super::resolve(
+                    format,
+                    &headers(&[(header, " root ")]),
+                    br#"{"session_id":"body"}"#,
+                    Some("execution"),
+                    "fake-client-key",
+                );
+                assert_eq!(actual.id, Some(format!("{prefix}root")));
+                assert!(actual.explicit);
+                assert_eq!(actual.source, "header");
+                assert!(actual.derived.is_none());
+                assert!(actual.parent.is_none());
+                assert!(!actual.caller.is_empty());
+                assert!(!actual.caller.contains("fake-client-key"));
             }
-
-            let derived = identity::derived_id(format, &headers, payload, execution, &scope);
-            assert_eq!(
-                derived.as_deref().unwrap_or_default(),
-                case["derived"].as_str().unwrap(),
-                "{name} derived"
+        }
+        for (body, expected) in [
+            (r#"{"session_id":"body"}"#, "session:body"),
+            (r#"{"thread_id":"body"}"#, "thread:body"),
+            (r#"{"task_id":"body"}"#, "task:body"),
+            (r#"{"prompt_cache_key":"body"}"#, "pck:body"),
+        ] {
+            let actual = super::resolve(
+                Format::OpenAI,
+                &headers(&[]),
+                body.as_bytes(),
+                Some("execution"),
+                "caller",
             );
-            // Enrich's canonical and parent metadata: the explicit (or execution) session.
-            let explicit = execution.is_some() || identity::has_explicit_session(&headers, payload);
-            let canonical = info.as_ref().filter(|_| explicit);
-            assert_eq!(
-                canonical.map_or("", |i| i.session_id.as_str()),
-                case["canonical"].as_str().unwrap(),
-                "{name} canonical"
-            );
-            assert_eq!(
-                canonical.map_or("", |i| i.parent_session_id.as_str()),
-                case["parent"].as_str().unwrap(),
-                "{name} parent metadata"
-            );
-            let meta = Meta {
-                execution_session: execution,
-                derived: derived.as_deref(),
+            assert_eq!(actual.id.as_deref(), Some(expected));
+            assert!(actual.explicit);
+            assert_eq!(actual.source, "body");
+        }
+        let actual = super::resolve(Format::OpenAI, &headers(&[]), b"{}", Some(" execution "), "caller");
+        assert_eq!(actual.id.as_deref(), Some("execution:execution"));
+        assert!(actual.explicit);
+        assert_eq!(actual.source, "execution");
+        let child = super::resolve(
+            Format::Claude,
+            &headers(&[
+                ("x-claude-code-session-id", "root"),
+                ("x-claude-code-agent-id", "worker"),
+                ("x-claude-code-parent-agent-id", "planner"),
+            ]),
+            b"{}",
+            None,
+            "caller",
+        );
+        assert_eq!(child.id.as_deref(), Some("claude:root:agent:worker"));
+        assert_eq!(child.parent.as_deref(), Some("claude:root:agent:planner"));
+        assert!(!child.fork);
+        let aliases = super::resolve(
+            Format::OpenAIResponse,
+            &headers(&[]),
+            br#"{"prompt_cache_key":"prompt","conversation":{"id":"conversation"}}"#,
+            None,
+            "caller",
+        );
+        assert_eq!(aliases.id.as_deref(), Some("pck:prompt"));
+        assert_eq!(aliases.parent.as_deref(), Some("conv:conversation"));
+        for format in [Format::OpenAI, Format::Claude, Format::OpenAIResponse] {
+            let body = if format == Format::OpenAIResponse {
+                br#"{"instructions":"policy","input":[{"role":"user","content":"hello"}]}"#.as_slice()
+            } else {
+                br#"{"messages":[{"role":"system","content":"policy"},{"role":"user","content":"hello"}]}"#.as_slice()
             };
-            assert_eq!(
-                identity::extract_session_id(&headers, payload, &meta),
-                case["session_id"].as_str().unwrap(),
-                "{name} session id"
-            );
-            let bare = Meta {
-                execution_session: execution,
-                derived: None,
-            };
-            assert_eq!(
-                identity::extract_session_id(&headers, payload, &bare),
-                case["hash_session_id"].as_str().unwrap(),
-                "{name} hash session id"
-            );
-            let resolved = super::resolve(
-                format,
-                &headers,
-                payload,
-                execution,
-                case["client_key"].as_str().unwrap(),
-            );
-            assert_eq!(
-                resolved.id.as_deref().unwrap_or_default(),
-                case["session_id"].as_str().unwrap(),
-                "{name} resolved"
-            );
+            let a = super::resolve(format, &headers(&[]), body, None, "caller-a");
+            let again = super::resolve(format, &headers(&[]), body, None, "caller-a");
+            let b = super::resolve(format, &headers(&[]), body, None, "caller-b");
+            assert_eq!(a, again);
+            assert!(!a.explicit);
+            assert_eq!(a.source, "derived");
+            assert!(a.id.as_ref().unwrap().starts_with("derived:"));
+            assert!(a.derived.is_some());
+            assert_ne!(a.id, b.id);
+            assert_ne!(a.caller, b.caller);
+        }
+        for body in [b"".as_slice(), b"{}", b"{broken", b"null"] {
+            let actual = super::resolve(Format::OpenAI, &headers(&[]), body, None, "");
+            assert!(actual.id.is_none());
+            assert!(!actual.explicit);
+            assert_eq!(actual.source, "");
         }
     }
 }

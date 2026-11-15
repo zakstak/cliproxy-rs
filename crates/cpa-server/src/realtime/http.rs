@@ -789,7 +789,8 @@ mod tests {
 
     /// Values from Go 1.26 `http.DetectContentType`.
     #[test]
-    fn sniff_matches_go_for_live_bodies() {
+    // Product policy: Media request content detection recognizes supported signatures and ordinary text without depending on a proxy recorder.
+    fn live_media_bodies_have_usable_detected_content_types() {
         assert_eq!(
             sniff(b"v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\n"),
             "text/plain; charset=utf-8"

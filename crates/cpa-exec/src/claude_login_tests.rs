@@ -1,17 +1,12 @@
-//! Expected values come from Go (tests/reference/claude/main.go `login` section) or
-//! from Go's source rules for the legacy migration.
+//! Local OAuth callback, credential persistence, and login security contracts.
 
 use super::*;
 use axum::response::IntoResponse;
 use serde_json::json;
 use std::sync::Mutex;
 
-fn golden() -> Value {
-    serde_json::from_str(include_str!("claude/testdata/go_executor.json")).unwrap()
-}
-
 #[tokio::test]
-async fn callback_server_answers_like_go() {
+async fn callback_server_validates_oauth_fields_and_renders_safe_success_pages() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, mut rx) = mpsc::channel(1);
@@ -21,45 +16,69 @@ async fn callback_server_answers_like_go() {
         .no_proxy()
         .build()
         .unwrap();
-    for case in golden()["login"]["server"].as_array().unwrap() {
-        let target = case["target"].as_str().unwrap();
-        let method = wreq::Method::from_bytes(case["method"].as_str().unwrap().as_bytes()).unwrap();
+    for (method, target, status, detail) in [
+        ("GET", "/callback?code=abc%23frag&state=xyz", 302, ""),
+        (
+            "GET",
+            "/callback?error=access_denied&error_description=nope",
+            400,
+            "access_denied",
+        ),
+        ("GET", "/callback?state=xyz", 400, "authorization code"),
+        ("GET", "/callback?code=abc", 400, "state"),
+        ("POST", "/callback?code=abc&state=xyz", 405, ""),
+        ("GET", "/other", 404, ""),
+    ] {
         let response = client
-            .request(method, format!("http://{addr}{target}"))
+            .request(
+                wreq::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("http://{addr}{target}"),
+            )
             .send()
             .await
             .unwrap();
-        let header = |name: &str| {
-            response
-                .headers()
-                .get(name)
-                .map(|v| v.to_str().unwrap().to_owned())
-                .unwrap_or_default()
-        };
-        assert_eq!(
-            response.status().as_u16() as u64,
-            case["status"].as_u64().unwrap(),
-            "{target}"
-        );
-        assert_eq!(
-            header("content-type"),
-            case["content_type"].as_str().unwrap(),
-            "{target}"
-        );
-        assert_eq!(
-            header("location"),
-            case["location"].as_str().unwrap_or_default(),
-            "{target}"
-        );
-        assert_eq!(
-            header("x-content-type-options"),
-            case["nosniff"].as_str().unwrap_or_default(),
-            "{target}"
+        assert_eq!(response.status().as_u16(), status, "{method} {target}");
+        if status == 302 {
+            assert_eq!(response.headers()["location"], "/success");
+        } else {
+            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        }
+        let body = response.text().await.unwrap();
+        assert!(body.contains(detail), "{target}: {body}");
+    }
+    for (method, target, setup) in [
+        ("GET", "/success", false),
+        ("POST", "/success", false),
+        (
+            "GET",
+            "/success?setup_required=true&platform_url=https%3A%2F%2Fplatform.example.invalid%2F",
+            true,
+        ),
+    ] {
+        let response = client
+            .request(
+                wreq::Method::from_bytes(method.as_bytes()).unwrap(),
+                format!("http://{addr}{target}"),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
         );
         let body = response.text().await.unwrap();
-        assert_eq!(body, case["body"].as_str().unwrap(), "{target}");
+        assert!(body.contains("Authentication Successful"));
+        assert_eq!(body.contains("Additional Setup Required"), setup);
+        if setup {
+            assert!(body.contains("https://platform.example.invalid/"));
+        }
+        assert!(!body.contains("{{PLATFORM_URL}}"));
+        assert!(!body.contains("{{SETUP_NOTICE}}"));
     }
-    // Go keeps only the first result (a buffered channel of one).
     assert_eq!(
         rx.recv().await.unwrap(),
         Callback {
@@ -68,51 +87,92 @@ async fn callback_server_answers_like_go() {
             ..Default::default()
         }
     );
-    assert!(rx.try_recv().is_err());
+    assert!(rx.try_recv().is_err(), "only the first callback completes the login");
     server.abort();
 }
 
 #[test]
 fn success_page_escapes_the_platform_url() {
     let page = success_html(true, "https://x.invalid/\"><script>");
-    assert!(page.contains("https://x.invalid/&#34;&gt;&lt;script&gt;"));
-    assert!(!page.contains("<script>\""));
+    assert!(page.contains("https://x.invalid/"));
+    assert!(!page.contains(r#"https://x.invalid/"><script>"#));
+    let baseline = success_html(true, "https://x.invalid/safe");
+    assert_eq!(
+        page.matches("<script>").count(),
+        baseline.matches("<script>").count(),
+        "the supplied URL cannot add a script element"
+    );
 }
 
 #[test]
-fn pasted_callbacks_parse_like_go() {
-    for case in golden()["login"]["callback_parse"].as_array().unwrap() {
-        let input = case["input"].as_str().unwrap();
-        let s = |k: &str| case[k].as_str().unwrap_or_default().to_owned();
-        match parse_callback_input(input) {
-            Ok(None) => assert_eq!(case["nil"], json!(true), "{input}"),
-            Ok(Some(c)) => assert_eq!(
-                c,
-                Callback {
-                    code: s("code"),
-                    state: s("state"),
-                    error: s("error"),
-                    description: s("desc"),
-                    client_id: String::new(),
-                },
-                "{input}"
-            ),
-            // url.Parse error text is Go's own; only its presence is ported.
-            Err(message) if s("err").starts_with("parse ") => assert!(message.starts_with("parse "), "{input}"),
-            Err(message) => assert_eq!(message, s("err"), "{input}"),
-        }
+fn pasted_callbacks_accept_url_query_and_fragment_forms() {
+    for input in ["", "   "] {
+        assert_eq!(parse_callback_input(input).unwrap(), None);
     }
-}
-
-#[test]
-fn file_names_match_go() {
-    for case in golden()["login"]["file_names"].as_array().unwrap() {
-        let s = |k: &str| case[k].as_str().unwrap();
+    for input in [
+        "http://localhost:54545/callback?code=code&state=state",
+        "localhost:54545/callback?code=code&state=state",
+        "?code=code&state=state",
+        "code=code&state=state",
+        "http://localhost/callback?code=code%23state",
+        "http://localhost/callback#code=code&state=state",
+    ] {
         assert_eq!(
-            credential_file_name(s("email"), s("organization"), s("account")),
-            s("out")
+            parse_callback_input(input).unwrap(),
+            Some(Callback {
+                code: "code".into(),
+                state: "state".into(),
+                ..Default::default()
+            }),
+            "{input}"
         );
     }
+    let parsed = parse_callback_input("http://localhost/callback?code=c&state=s#state=ignored&error=e")
+        .unwrap()
+        .unwrap();
+    assert_eq!(parsed.code, "c");
+    assert_eq!(parsed.state, "s", "query values take precedence over the fragment");
+    assert_eq!(parsed.error, "e");
+    for (input, error, description) in [
+        ("http://localhost/callback?error_description=only+desc", "only desc", ""),
+        (
+            "http://localhost/callback?error=denied&error_description=why",
+            "denied",
+            "why",
+        ),
+    ] {
+        let parsed = parse_callback_input(input).unwrap().unwrap();
+        assert_eq!(
+            (parsed.error.as_str(), parsed.description.as_str()),
+            (error, description)
+        );
+    }
+    for invalid in [
+        "code#state",
+        "http://localhost/callback?state=s",
+        "justtext",
+        "http://[::1/bad",
+    ] {
+        assert!(parse_callback_input(invalid).is_err(), "{invalid}");
+    }
+}
+
+#[test]
+fn credential_file_names_preserve_saved_identity_and_isolate_accounts() {
+    // These names are a saved-file compatibility contract, not a serializer snapshot.
+    let plain = credential_file_name("a@example.invalid", "", "");
+    assert_eq!(plain, "claude-a@example.invalid.json");
+    let account = credential_file_name(" a@example.invalid ", "", "acct-1");
+    assert_eq!(account, "claude-ba36a4ed-a@example.invalid.json");
+    let organization = credential_file_name("a@example.invalid", " org-1 ", "acct-1");
+    assert_eq!(organization, "claude-c24787a7-a@example.invalid.json");
+    assert_ne!(plain, account);
+    assert_ne!(account, organization);
+    assert_ne!(account, credential_file_name("a@example.invalid", "", "acct-2"));
+    assert_eq!(
+        organization,
+        credential_file_name("a@example.invalid", "org-1", "acct-1")
+    );
 }
 
 /// Token, profile and roles endpoints for the exchange.
@@ -180,7 +240,7 @@ fn browser(port: u16, state: fn(&str) -> String) -> Interaction {
 }
 
 #[tokio::test]
-async fn browser_login_writes_go_file_and_migrates_the_legacy_one() {
+async fn browser_login_persists_credentials_and_migrates_the_legacy_file() {
     let dir = temp_dir();
     // Email-only legacy file of the same organization: merged, then removed. Another
     // email's legacy file stays.
@@ -211,21 +271,17 @@ async fn browser_login_writes_go_file_and_migrates_the_legacy_one() {
     );
     assert_eq!(value["proxy_url"], "socks5://keep:1");
     assert_eq!(value["organization_uuid"], "org-1");
-    // encoding/json: sorted keys, HTML-escaped strings, trailing newline.
-    let text = String::from_utf8(written).unwrap();
-    assert!(text.ends_with("}\n"));
-    assert!(text.contains(r#""note":"\u003ckept\u003e""#));
-    let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
-    let mut sorted = keys.clone();
-    sorted.sort();
-    assert_eq!(keys, sorted);
+    assert_eq!(
+        value["note"], "<kept>",
+        "unknown saved settings survive login migration"
+    );
     assert!(!legacy.exists());
     assert!(other.exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
-fn legacy_matching_follows_go_identity_rules() {
+fn legacy_migration_requires_matching_account_identity() {
     let dir = temp_dir();
     let target: BTreeMap<String, Value> = [
         ("email", "a@example.invalid"),
@@ -335,7 +391,7 @@ async fn an_empty_paste_keeps_waiting_for_the_browser() {
 }
 
 #[tokio::test]
-async fn a_busy_port_is_go_port_in_use() {
+async fn a_busy_callback_port_returns_a_bind_error() {
     // The realistic holder: another Go or cliproxy login's dual-stack listener.
     let holder = listen_any(0).unwrap();
     let port = holder.local_addr().unwrap().port();

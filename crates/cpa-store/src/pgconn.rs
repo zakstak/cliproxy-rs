@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn sslmode_maps_to_pgx_verification() {
+    fn postgres_sslmode_enforces_certificate_and_hostname_policy() {
         let dsn = Dsn::parse("host=db user=u password=p sslmode=verify-full", &no_env).unwrap();
         assert_eq!(dsn.config.get_ssl_mode(), SslMode::Require);
         assert!(dsn.tls.verify && dsn.tls.verify_hostname);
@@ -638,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn other_keys_travel_as_runtime_parameters_like_pgx() {
+    fn postgres_connection_parameters_preserve_application_settings() {
         let dsn = Dsn::parse(
             r"host=db user=u options='-c work_mem=4MB' search_path='a b,c\\d' statement_cache_capacity=0",
             &no_env,

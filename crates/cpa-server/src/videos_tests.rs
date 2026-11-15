@@ -32,7 +32,8 @@ fn bindings_expire() {
 }
 
 #[test]
-fn seconds_clamp_like_go() {
+// Product policy: The supported video API accepts integer duration inputs and clamps them to the documented provider range.
+fn video_durations_clamp_to_the_supported_provider_range() {
     assert_eq!(seconds(""), Ok(4));
     assert_eq!(seconds("+20"), Ok(15));
     assert_eq!(seconds("-3"), Ok(1));

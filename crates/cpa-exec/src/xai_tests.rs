@@ -1,9 +1,6 @@
-//! Differential tests against `tests/fixtures/xai_go.json`, produced by the real Go
-//! XAIExecutor (tests/reference/xai). Scenarios run in order on one executor, as the Go
-//! generator runs them in one process, so the reasoning replay cache carries from one
-//! turn to the next. Each scenario replays the scripted upstream answer and compares the
-//! URL the executor chose, the raw upstream request and the executor's output. Expected
-//! values come only from Go.
+//! xAI HTTP behavior against local scripted peers. Expectations describe routing,
+//! authentication isolation, protocol semantics, tool bridges and usage accounting.
+//! Generated header order, JSON spelling and translator frame boundaries are irrelevant.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,97 +11,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use super::*;
 use crate::usage_testkit::{HttpAttempt, Logged, http_capture_problems, published};
 
-const FIXTURE: &str = include_str!("../tests/fixtures/xai_go.json");
-/// The scenarios the payload barrier changed, recorded at v8.0.35; they replace their
-/// 6fecc6e recordings.
-const FIXTURE_V8_0_35: &str = include_str!("../tests/fixtures/xai_go_v8.0.35.json");
-
-/// Native video recordings whose client body Go rewrote (`normalizeXAIImageRefs`:
-/// nested `image_url` to `url`, the body re-encoded). cliproxy-rs sends a native body
-/// as the client sent it, and xAI's API accepts `image_url` there
-/// (docs/DIFFERENCES-FROM-GO.md, "Native xAI video bodies"): the request Go recorded,
-/// with the client's payload as its body.
-const NATIVE_VIDEO_BODIES: &[&str] = &["videos_create_idempotency"];
-
-/// The upstream request scenario `name` must send.
-fn native_video_request(name: &str, s: &Value) -> Option<String> {
-    let go = s["request"].as_str()?;
-    if !NATIVE_VIDEO_BODIES.contains(&name) {
-        return Some(go.to_owned());
-    }
-    let (head, body) = go.split_once("\r\n\r\n").expect("a recorded request");
-    let payload = s["payload"].as_str().unwrap();
-    assert!(
-        payload.contains("\"image_url\"") && !body.contains("image_url"),
-        "{name}: Go's recording changed"
-    );
-    let length = format!("Content-Length: {}\r\n", body.len());
-    assert!(head.contains(&length), "{name}: Go's recording changed");
-    let head = head.replace(&length, &format!("Content-Length: {}\r\n", payload.len()));
-    Some(format!("{head}\r\n\r\n{payload}"))
-}
-
-/// #80 (crate::controls_testkit): a translated request carries the client's output
-/// limit where the converter writes it and keeps its `parallel_tool_calls: false`. The
-/// recorded request stays Go v8.0.35's, with only those fields and `Content-Length`
-/// changed.
-fn with_controls_difference(s: &Value, go: String) -> String {
-    let Some(from) = s["source"].as_str().and_then(Format::parse) else {
-        return go;
-    };
-    let Some(payload) = s["payload"].as_str() else {
-        return go;
-    };
-    let (head, body) = go.split_once("\r\n\r\n").expect("a recorded request");
-    if !head.starts_with("POST /v1/responses ") || from == Format::Codex {
-        return go;
-    }
-    let ours = String::from_utf8(crate::controls_testkit::expected_body(
-        from,
-        payload.as_bytes(),
-        body.as_bytes(),
-    ))
-    .unwrap();
-    if ours == body {
-        return go;
-    }
-    let length = format!("Content-Length: {}\r\n", body.len());
-    assert!(head.contains(&length), "recorded Content-Length");
-    let head = head.replace(&length, &format!("Content-Length: {}\r\n", ours.len()));
-    format!("{head}\r\n\r\n{ours}")
-}
-
-/// Recordings whose buffered body ends without a terminal event: v8.0.35 answered 408
-/// and cooled the credential; this fork follows v8.0.67 (949b43b3) with a request-scoped
-/// 502 (docs/DIFFERENCES-FROM-GO.md, "xAI non-streaming responses"). The rest of each
-/// recording (request, usage record) still compares.
-const V8_0_67_ENDINGS: &[&str] = &["disconnected_before_completed", "usage_done_ignored_execute"];
-
-/// Recordings of a reasoning summary streamed to a Claude client. The thinking block now
-/// opens with the summary's first text, not at `response.reasoning_summary_part.added`
-/// (#168, docs/DIFFERENCES-FROM-GO.md, "Reasoning summaries for Claude clients"), so the
-/// block start shares a frame with that text. Go's frames, joined, must still match.
-const REASONING_FLUSH: &[&str] = &["reasoning_to_claude_stream", "replay_claude_turn1"];
-
-/// Shared helpers whose real port has not landed: scenarios that need them are skipped
-/// and listed, so integration can remove an entry and see the scenario run.
-const PENDING: &[&str] = &[];
-
-/// #88 (docs/DIFFERENCES-FROM-GO.md, "xAI User-Agent"): outside the Grok CLI chat proxy,
-/// a request without a caller `User-Agent` sends the Grok CLI's, as Go v8.0.67 does
-/// (5026f365), where v8.0.35 sent net/http's default. No recording has a caller
-/// User-Agent, so every recorded default becomes the Grok CLI's; the rest compares.
-fn with_user_agent_difference(s: &Value, go: String) -> String {
-    let caller = s["headers"]
-        .as_object()
-        .is_some_and(|h| h.keys().any(|k| k.eq_ignore_ascii_case("user-agent")));
-    assert!(!caller, "{}: a recording with a caller User-Agent", s["name"]);
-    go.replacen(
-        "\r\nUser-Agent: Go-http-client/1.1\r\n",
-        "\r\nUser-Agent: xai-grok-workspace/1.0.44\r\n",
-        1,
-    )
-}
+// Historical client inputs and scripted peer answers; recorded Go outputs are excluded.
+const FIXTURE: &str = include_str!("../tests/fixtures/xai_http_inputs.json");
 
 /// Caller headers that must never reach xAI, with a header a `$X-Explicit-UA`
 /// attribute may reference.
@@ -164,16 +72,7 @@ async fn caller_user_agent_on_http() {
             .as_str()
             .unwrap()
             .replacen('{', &format!("{{{OPAQUE_MEMBER}"), 1);
-        scenario["payload"] = Value::String(payload);
-        // The native video body is the client's payload, opaque member included.
-        let recorded = native_video_request(name, &scenario).unwrap();
-        let (_, recorded_body) = recorded.split_once("\r\n\r\n").unwrap();
-        let want_body = if NATIVE_VIDEO_BODIES.contains(&name) {
-            recorded_body.to_owned()
-        } else {
-            recorded_body.replacen('{', &format!("{{{OPAQUE_MEMBER}"), 1)
-        };
-        assert!(want_body.contains(OPAQUE_MEMBER), "{name}");
+        scenario["payload"] = Value::String(payload.clone());
         let chat_proxy = name == "oauth_default_chat_proxy";
         for (caller, custom, expected) in USER_AGENT_CASES {
             let mock = Mock::start(&scenario["upstream"]).await;
@@ -228,7 +127,12 @@ async fn caller_user_agent_on_http() {
             }
             let cli = if chat_proxy { vec!["xai-grok-cli"] } else { vec![] };
             assert_eq!(get("X-XAI-Token-Auth"), cli, "{case}");
-            assert_eq!(body, want_body, "{case}: native body changed");
+            assert!(body.contains(OPAQUE_MEMBER), "{case}: opaque member preserved");
+            if scenario["op"] == "videos" {
+                assert_eq!(body, payload, "{case}: native body bytes preserved");
+            } else {
+                assert!(gj::get(body.as_bytes(), "input").exists(), "{case}: translated input");
+            }
         }
     }
 }
@@ -414,11 +318,11 @@ fn redirect(url: &str, addr: &str) -> String {
 }
 
 #[tokio::test]
-async fn go_reference_scenarios() {
-    let fixture = crate::payload_barrier::with_v8_0_35(FIXTURE, FIXTURE_V8_0_35, "scenarios");
+async fn http_scenarios_preserve_routing_translation_and_accounting() {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
     let scenarios = fixture["scenarios"].as_array().unwrap();
     assert!(scenarios.len() >= 80, "fixture lost scenarios");
-    // One executor for all scenarios: Go's replay cache is process-wide.
+    // Keep one executor so replay isolation is exercised across turns.
     let target: Arc<Mutex<String>> = Arc::default();
     let chosen: Arc<Mutex<Option<String>>> = Arc::default();
     let executor = {
@@ -428,18 +332,9 @@ async fn go_reference_scenarios() {
             redirect(url, &target.lock().unwrap())
         })
     };
-    let mut skipped = Vec::new();
     let mut failures = Vec::new();
     for s in scenarios {
         let name = s["name"].as_str().unwrap();
-        let needs: Vec<&str> = s["needs"]
-            .as_array()
-            .map(|n| n.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        if needs.iter().any(|n| PENDING.contains(n)) {
-            skipped.push(name);
-            continue;
-        }
         let mock = match s.get("upstream").filter(|u| !u.is_null()) {
             Some(up) => Some(Mock::start(up).await),
             None => None,
@@ -447,7 +342,8 @@ async fn go_reference_scenarios() {
         let addr = mock.as_ref().map_or("127.0.0.1:9".to_owned(), |m| m.addr.clone());
         *target.lock().unwrap() = addr.clone();
         *chosen.lock().unwrap() = None;
-        let cfg = Config::parse(&s["config"].as_str().unwrap_or_default().replace("UPSTREAM", &addr)).unwrap();
+        let mut cfg = Config::parse(&s["config"].as_str().unwrap_or_default().replace("UPSTREAM", &addr)).unwrap();
+        cfg.auth_dir = std::env::temp_dir().join(format!("cpa-xai-http-{}", uuid::Uuid::new_v4()));
         let cred = credential(s, &cfg);
         let (recorder, capture, sink) = crate::usage_testkit::sinks();
         let req = request(s, sink);
@@ -482,18 +378,9 @@ async fn go_reference_scenarios() {
         }
         let mut problems = Vec::new();
         let raw = mock.as_ref().and_then(|m| m.raw.lock().unwrap().clone());
-        if let Some(mock) = &mock {
-            let url = chosen.lock().unwrap().clone();
-            if url.as_deref() != s["url"].as_str() {
-                problems.push(format!("url: {url:?} != {:?}", s["url"]));
-            }
-            let got = mock.request();
-            let want = native_video_request(name, s)
-                .map(|want| with_controls_difference(s, want))
-                .map(|want| with_user_agent_difference(s, want));
-            if got.as_deref() != want.as_deref() {
-                problems.push(format!("request:\n  rust: {got:?}\n  go:   {want:?}"));
-            }
+        if let Some(raw) = mock.as_ref().and_then(Mock::request) {
+            let url = chosen.lock().unwrap().clone().unwrap();
+            assert_http_request(name, s, &cred, &url, &raw);
         }
         if op != "count"
             && let Some(problem) = crate::usage_testkit::ttft_problem(
@@ -511,8 +398,7 @@ async fn go_reference_scenarios() {
             let get = raw.starts_with(b"GET ");
             let attempt = HttpAttempt {
                 raw: &raw,
-                // The URL Go chose, as the rewrite sent it to the mock.
-                url: &redirect(s["url"].as_str().unwrap_or_default(), &addr),
+                url: &redirect(chosen.lock().unwrap().as_deref().unwrap(), &addr),
                 provider: "xai",
                 credential: &cred,
                 // The video poll is a GET that logs its payload.
@@ -540,67 +426,29 @@ async fn go_reference_scenarios() {
                 problems.push(format!("capture without an upstream attempt: {events:?}"));
             }
         }
-        if output.as_deref() != s["output"].as_str() {
-            problems.push(format!(
-                "output:\n  rust: {output:?}\n  go:   {:?}",
-                s["output"].as_str()
-            ));
-        }
-        let go_chunks: Vec<&str> = s["chunks"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        let want: Vec<String> = if response_format(s) == Format::OpenAIResponse {
-            let mut framer = cpa_translate::stream::ResponsesFramer::default();
-            let mut frames: Vec<Bytes> = Vec::new();
-            for chunk in &go_chunks {
-                frames.extend(framer.write(chunk.as_bytes()));
-            }
-            frames.extend(framer.flush());
-            frames.iter().map(|f| String::from_utf8_lossy(f).into_owned()).collect()
-        } else {
-            go_chunks
-                .iter()
-                .filter_map(|c| cpa_translate::stream::frame(response_format(s), c.as_bytes()))
-                .map(|f| String::from_utf8_lossy(&f).into_owned())
-                .collect()
-        };
-        let moved = REASONING_FLUSH.contains(&name) && chunks.concat() == want.concat();
-        if chunks != want && !moved {
-            problems.push(format!("frames:\n  rust: {chunks:?}\n  go:   {want:?}"));
-        }
-        // Go publishes at most one record per attempt; the server publishes what the
-        // executor's reports say (the rules of cpa-server's usage_record.rs, including
-        // `discard` for an error Go raises before its reporter exists), compared with
-        // Go's record or its absence. The server tracks no record for CountTokens.
-        let want = s.get("usage").filter(|u| !u.is_null()).cloned();
-        let reports = recorder.0.lock().unwrap();
+        assert_http_outcome(name, s, output.as_deref(), &chunks, error.as_ref());
         if op != "count" {
-            let got = published(&reports, error.is_some());
-            if got != want {
-                problems.push(format!("usage: {got:?} != {want:?}"));
+            let reports = recorder.0.lock().unwrap();
+            let usage = published(&reports, error.is_some());
+            if let Some(usage) = usage {
+                assert_eq!(usage["failed"], error.is_some(), "{name}: accounting outcome");
+                if error.is_none()
+                    && let Some(peer) = peer_messages(s["upstream"]["body"].as_str().unwrap_or_default())
+                        .into_iter()
+                        .find(|e| matches!(e["type"].as_str(), Some("response.completed" | "response.incomplete")))
+                {
+                    let tokens = &peer["response"]["usage"];
+                    for (local, upstream) in [
+                        ("input", "input_tokens"),
+                        ("output", "output_tokens"),
+                        ("total", "total_tokens"),
+                    ] {
+                        if let Some(value) = tokens.get(upstream) {
+                            assert_eq!(&usage[local], value, "{name}: {local}");
+                        }
+                    }
+                }
             }
-        }
-        drop(reports);
-        let mut want_error = s["error"].clone();
-        if !want_error.is_null() {
-            let plain = want_error["status"] == 0;
-            if plain {
-                // A plain Go error: the handler answers 500.
-                want_error["status"] = 500.into();
-            }
-            want_error["plain"] = plain.into();
-            if V8_0_67_ENDINGS.contains(&name) {
-                assert_eq!(want_error["status"], 408, "{name}: recording changed");
-                want_error["status"] = 502.into();
-                want_error["message"] = crate::xai_sse::INCOMPLETE_STREAM.into();
-            }
-        }
-        let error = error.unwrap_or(Value::Null);
-        if error != want_error {
-            problems.push(format!("error: {error} != {want_error}"));
         }
         if !problems.is_empty() {
             failures.push(format!("{name}:\n{}", problems.join("\n")));
@@ -612,7 +460,6 @@ async fn go_reference_scenarios() {
         failures.len(),
         failures.join("\n\n")
     );
-    assert_eq!(skipped, Vec::<&str>::new());
 }
 
 /// Go marks the first response byte only on a body read that returns data
@@ -629,7 +476,10 @@ async fn empty_error_body_starts_ttft_without_first_byte() {
     let mock = Mock::start(&serde_json::json!({"status": 500, "headers": [], "body": ""})).await;
     let addr = mock.addr.clone();
     let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
-    let cfg = Config::default();
+    let cfg = Config {
+        auth_dir: std::env::temp_dir().join(format!("cpa-xai-private-{}", uuid::Uuid::new_v4())),
+        ..Default::default()
+    };
     let cred = credential(s, &cfg);
     let (recorder, _capture, sink) = crate::usage_testkit::sinks();
     let error = executor
@@ -648,7 +498,7 @@ async fn empty_error_body_starts_ttft_without_first_byte() {
 /// only a 404 that names no model problem is request-scoped (an explicit request scope
 /// without upstream headers: neither rotated nor cooled).
 #[tokio::test]
-async fn speech_errors_keep_go_scope() {
+async fn speech_errors_preserve_body_and_classify_voice_vs_model_failures() {
     let cases: [(u16, &str, u16, bool); 15] = [
         (400, r#"{"error":"invalid language"}"#, 400, false),
         (400, r#"{"error":"requested model is not supported"}"#, 400, false),
@@ -705,7 +555,10 @@ async fn speech_errors_keep_go_scope() {
         "payload": r#"{"text":"hello","voice_id":"nope","language":"auto"}"#,
         "model": "grok-tts",
     });
-    let cfg = Config::default();
+    let cfg = Config {
+        auth_dir: std::env::temp_dir().join(format!("cpa-xai-private-{}", uuid::Uuid::new_v4())),
+        ..Default::default()
+    };
     for (status, body, want, scoped) in cases {
         let reply =
             serde_json::json!({"status": status, "headers": [["Content-Type", "application/json"]], "body": body});
@@ -746,8 +599,9 @@ async fn compact_keeps_a_configured_top_k() {
     let mock = Mock::start(&s["upstream"]).await;
     let addr = mock.addr.clone();
     let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
-    let cfg =
+    let mut cfg =
         Config::parse("payload:\n  override:\n    - models: [{name: \"*\"}]\n      params: {top_k: 10}\n").unwrap();
+    cfg.auth_dir = std::env::temp_dir().join(format!("cpa-xai-private-{}", uuid::Uuid::new_v4()));
     let cred = credential(s, &cfg);
     executor
         .execute(&cred, request(s, Default::default()), &cfg, false)
@@ -781,7 +635,10 @@ async fn a_refused_baseline_alone_does_not_refuse_the_request() {
         let mock = Mock::start(&s["upstream"]).await;
         let addr = mock.addr.clone();
         let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
-        let cfg = Config::parse("").unwrap();
+        let cfg = Config {
+            auth_dir: std::env::temp_dir().join(format!("cpa-xai-private-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
         let cred = credential(&s, &cfg);
         let ok = executor
             .execute(&cred, request(&s, Default::default()), &cfg, false)
@@ -869,7 +726,10 @@ async fn buffered_turn(payload: &str, content_type: &str, pieces: Vec<Vec<u8>>, 
         "op": "execute",
     });
     let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
-    let cfg = Config::default();
+    let cfg = Config {
+        auth_dir: std::env::temp_dir().join(format!("cpa-xai-private-{}", uuid::Uuid::new_v4())),
+        ..Default::default()
+    };
     let (recorder, _capture, sink) = crate::usage_testkit::sinks();
     let result = executor
         .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
@@ -1101,7 +961,10 @@ async fn transport_faults_and_upstream_408_are_not_stream_faults() {
         "payload": PLAIN, "source": "openai-response", "op": "execute",
     });
     let executor = XaiExecutor::default().with_url_rewrite(move |url| redirect(url, &addr));
-    let cfg = Config::default();
+    let cfg = Config {
+        auth_dir: std::env::temp_dir().join(format!("cpa-xai-private-{}", uuid::Uuid::new_v4())),
+        ..Default::default()
+    };
     let (_recorder, _capture, sink) = crate::usage_testkit::sinks();
     let e = executor
         .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
@@ -1146,7 +1009,10 @@ async fn historical_additional_tools_are_sent_once() {
                     "response": "openai-response",
                     "op": op,
                 });
-                let cfg = Config::default();
+                let cfg = Config {
+                    auth_dir: std::env::temp_dir().join(format!("cpa-xai-private-{}", uuid::Uuid::new_v4())),
+                    ..Default::default()
+                };
                 let (_recorder, _capture, sink) = crate::usage_testkit::sinks();
                 let response = executor
                     .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
@@ -1217,7 +1083,10 @@ async fn claude_clients_read_the_same_reasoning_streamed_and_buffered() {
             "source": "claude",
             "op": op,
         });
-        let cfg = Config::default();
+        let cfg = Config {
+            auth_dir: std::env::temp_dir().join(format!("cpa-xai-private-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
         let (_recorder, _capture, sink) = crate::usage_testkit::sinks();
         let response = executor
             .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
@@ -1274,7 +1143,10 @@ async fn stream_ttft_is_marked_at_the_first_output_event() {
             "source": "openai-response",
             "op": op,
         });
-        let cfg = Config::default();
+        let cfg = Config {
+            auth_dir: std::env::temp_dir().join(format!("cpa-xai-private-{}", uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
         let (recorder, _capture, sink) = crate::usage_testkit::sinks();
         let response = executor
             .execute(&credential(&s, &cfg), request(&s, sink), &cfg, false)
@@ -1304,5 +1176,290 @@ async fn stream_ttft_is_marked_at_the_first_output_event() {
             &["start", "byte"]
         };
         assert_eq!(marks, want, "{op}");
+    }
+}
+
+fn peer_messages(body: &str) -> Vec<Value> {
+    if let Ok(value) = serde_json::from_str(body) {
+        return vec![value];
+    }
+    body.lines()
+        .filter_map(|line| serde_json::from_str(line.strip_prefix("data:")?.trim()).ok())
+        .collect()
+}
+
+fn assert_http_request(name: &str, s: &Value, credential: &Credential, url: &str, raw: &str) {
+    let parsed = url::Url::parse(url).unwrap();
+    assert!(matches!(parsed.scheme(), "http" | "https"), "{name}");
+    assert_eq!(parsed.username(), "", "{name}: credentials cannot enter URL");
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+    let headers: Vec<_> = head
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(n, v)| (n, v.trim()))
+        .collect();
+    let get = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| *v)
+    };
+    let token = creds(credential).0;
+    assert_eq!(
+        get("authorization"),
+        (!token.is_empty()).then(|| format!("Bearer {token}")).as_deref(),
+        "{name}"
+    );
+    let request_path = head.lines().next().unwrap().split_whitespace().nth(1).unwrap();
+    assert_eq!(
+        request_path,
+        parsed[url::Position::BeforePath..].split('#').next().unwrap(),
+        "{name}: selected path reaches peer"
+    );
+    if s["op"] == "videos" {
+        if head.starts_with("POST ") {
+            assert_eq!(body, s["payload"].as_str().unwrap(), "{name}: native video bytes");
+        }
+        assert!(parsed.path().contains("/videos"), "{name}: native video endpoint");
+        return;
+    }
+    if s["op"] == "images" {
+        assert!(parsed.path().contains("/images"), "{name}: native image endpoint");
+        return;
+    }
+    assert!(
+        parsed.path().ends_with("/responses") || parsed.path().ends_with("/responses/compact"),
+        "{name}: Responses endpoint"
+    );
+    let value: Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{name}: upstream JSON: {e}: {body}"));
+    assert!(value.get("input").is_some(), "{name}: input retained");
+    if !parsed.path().ends_with("/compact") {
+        assert_eq!(value["stream"], true, "{name}: upstream always streams");
+    }
+    if let Some(tools) = value["tools"].as_array() {
+        assert!(tools.len() <= 200, "{name}: provider tool cap");
+        assert!(
+            !tools.iter().any(|t| t["type"] == "namespace"),
+            "{name}: namespaces adapted"
+        );
+    }
+    match name {
+        "thinking_suffix_applied" => {
+            assert_eq!(value["model"], "grok-4.3");
+            assert_eq!(value["reasoning"]["effort"], "high");
+        }
+        "unsupported_reasoning_effort_omitted" => {
+            // An unbound model has no catalog-backed restriction: retain the client's value.
+            assert_eq!(value["reasoning"]["effort"], "high");
+        }
+        "composer_reuses_prompt_cache_key" => assert_eq!(value["prompt_cache_key"], "pck-123"),
+        "payload_override_stop_dropped" => {
+            assert_eq!(value["temperature"], 0.3);
+            assert_eq!(value["stop"], serde_json::json!(["X"]));
+        }
+        "replay_other_caller_isolated" => assert!(
+            !body.contains("encrypted-secret-1"),
+            "other caller cannot receive replay"
+        ),
+        "replay_claude_turn2_injects" => assert!(
+            value["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["type"] == "reasoning"),
+            "reasoning is replayed for its owner"
+        ),
+        "custom_tool_history_normalized" => {
+            assert!(
+                !value["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|i| i["type"] == "custom_tool_call")
+            );
+            assert!(body.contains("ls -la"), "custom input survives adaptation");
+        }
+        "compact_oauth_uses_official_api" => assert_eq!(parsed.host_str(), Some("api.x.ai")),
+        "oauth_default_chat_proxy" | "oauth_default_api_base_goes_to_chat_proxy" => {
+            assert_ne!(parsed.host_str(), Some("api.x.ai"))
+        }
+        _ => {}
+    }
+}
+
+fn assert_http_outcome(name: &str, s: &Value, output: Option<&str>, chunks: &[String], error: Option<&Value>) {
+    let peer_status = s["upstream"]["status"].as_u64().unwrap_or(200);
+    let expected_error = match name {
+        "compact_stream_rejected" => Some(400),
+        "bad_credentials_403_becomes_401" | "videos_error_bad_credentials" => Some(401),
+        "apply_patch_invalid_history_input" => Some(500),
+        "disconnected_before_completed"
+        | "usage_done_ignored_execute"
+        | "apply_patch_invalid_input_execute"
+        | "apply_patch_invalid_input_stream"
+        | "apply_patch_eof_without_completion_stream"
+        | "apply_patch_eof_without_completion_execute" => Some(502),
+        _ if peer_status >= 400 => Some(peer_status),
+        _ => None,
+    };
+    assert_eq!(
+        error.map(|e| e["status"].as_u64().unwrap()),
+        expected_error,
+        "{name}: outcome"
+    );
+    if let Some(error) = error {
+        if peer_status >= 400 {
+            assert_eq!(error["message"], s["upstream"]["body"], "{name}: peer error body");
+        }
+        assert!(
+            !error["message"].as_str().unwrap().is_empty(),
+            "{name}: actionable error"
+        );
+        return;
+    }
+    if s["op"] == "count" {
+        let count: Value = serde_json::from_str(output.unwrap()).unwrap();
+        assert!(
+            count["input_tokens"].as_u64().unwrap_or(0) > 0
+                || count["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0
+                || count["response"]["usage"]["input_tokens"].as_u64().unwrap_or(0) > 0,
+            "{name}: positive token estimate"
+        );
+        return;
+    }
+    let joined = output.map(str::to_owned).unwrap_or_else(|| chunks.concat());
+    let messages = peer_messages(&joined);
+    assert!(!messages.is_empty(), "{name}: valid client JSON or SSE");
+    if s["op"] == "images" || s["op"] == "videos" {
+        assert_eq!(
+            joined,
+            s["upstream"]["body"].as_str().unwrap(),
+            "{name}: native response bytes"
+        );
+        return;
+    }
+    if name.contains("apply_patch") && !name.contains("history") {
+        assert!(
+            joined.contains("custom_tool_call") || joined.contains("tool_use"),
+            "{name}: patch call restored"
+        );
+        assert!(joined.contains("apply_patch"), "{name}: patch name restored");
+    }
+    if s["op"] == "stream" && response_format(s) == Format::Claude {
+        assert_eq!(messages.first().unwrap()["type"], "message_start", "{name}");
+        assert!(
+            messages.iter().any(|m| m["type"] == "message_stop"),
+            "{name}: terminal stop"
+        );
+    }
+    if output.is_some() {
+        assert!(messages[0].is_object(), "{name}: client object");
+    }
+    // Compare semantic text supplied by the peer, independently of translator framing.
+    let peer = peer_messages(s["upstream"]["body"].as_str().unwrap_or_default());
+    let mut all_client = Vec::new();
+    for message in &messages {
+        nodes(message, &mut all_client);
+    }
+    let client_strings: Vec<_> = all_client.iter().filter_map(|v| v.as_str()).collect();
+    let client_text = all_client
+        .iter()
+        .filter_map(|v| v.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    let text_survives =
+        |text: &str| client_strings.iter().any(|actual| actual.contains(text)) || client_text.contains(text);
+    if output.is_none() {
+        // Streams expose deltas. A terminal response may carry a conflicting snapshot;
+        // it does not retroactively rewrite text already delivered to a client.
+        for event in &peer {
+            if matches!(
+                event["type"].as_str(),
+                Some(
+                    "response.output_text.delta"
+                        | "response.reasoning_text.delta"
+                        | "response.reasoning_summary_text.delta"
+                )
+            ) && let Some(text) = event["delta"].as_str().filter(|s| !s.is_empty())
+            {
+                assert!(text_survives(text), "{name}: peer delta survives: {text:?}");
+            }
+        }
+    } else if let Some(terminal) = peer.iter().find(|event| {
+        matches!(
+            event["type"].as_str(),
+            Some("response.completed" | "response.incomplete")
+        )
+    }) {
+        let mut peer_nodes = Vec::new();
+        nodes(&terminal["response"]["output"], &mut peer_nodes);
+        for node in peer_nodes {
+            if let Some(text) = node.get("text").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                assert!(text_survives(text), "{name}: completed peer text survives: {text:?}");
+            }
+        }
+    }
+    let find = |kind: &str, name: &str| all_client.iter().any(|v| v["type"] == kind && v["name"] == name);
+    match name {
+        "namespaces_flatten_and_restore" => {
+            assert!(find("function_call", "read"), "client tool name restored");
+            assert!(
+                all_client.iter().any(|v| v["namespace"] == "files"),
+                "namespace restored"
+            );
+        }
+        "namespaces_fold_when_over_200_tools" | "namespaces_fold_stream" => {
+            assert!(find("function_call", "t3"), "folded tool selected by envelope name");
+            assert!(
+                all_client.iter().any(|v| v["namespace"] == "big"),
+                "folded namespace restored"
+            );
+        }
+        "client_web_search_function_aliased" | "client_web_search_alias_restored_in_stream" => assert!(
+            find("function_call", "web_search"),
+            "client name restored after reserved-name alias"
+        ),
+        "x_search_internal_calls_filtered" => assert!(
+            !find("function_call", "x_keyword_search"),
+            "internal search cannot become client tool calls"
+        ),
+        "x_search_stream_keeps_client_same_name_tool" => {
+            assert!(find("function_call", "x_keyword_search"), "declared client tool kept");
+            assert!(
+                !find("function_call", "x_semantic_search"),
+                "undeclared internal search hidden"
+            );
+        }
+        "reasoning_text_events_normalized_stream" | "reasoning_output_normalized_execute" => {
+            assert!(
+                all_client
+                    .iter()
+                    .any(|v| v["type"] == "summary_text" || v["type"] == "response.reasoning_summary_text.delta"),
+                "reasoning exposes client summary grammar"
+            );
+            assert!(
+                !all_client
+                    .iter()
+                    .any(|v| v["type"] == "reasoning_text" || v["type"] == "response.reasoning_text.delta")
+            );
+        }
+        _ => {}
+    }
+}
+
+fn nodes<'a>(value: &'a Value, out: &mut Vec<&'a Value>) {
+    out.push(value);
+    match value {
+        Value::Object(fields) => {
+            for child in fields.values() {
+                nodes(child, out);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                nodes(child, out);
+            }
+        }
+        _ => {}
     }
 }

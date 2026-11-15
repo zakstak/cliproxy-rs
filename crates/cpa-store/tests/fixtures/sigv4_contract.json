@@ -1,0 +1,102 @@
+{
+  "source": "AWS Signature Version 4 specification; explicit canonical requests signed by Python hashlib/hmac, not proxy output",
+  "date": "20261114T120000Z",
+  "access_key": "AKIAIOSFODNN7EXAMPLE",
+  "secret_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  "cases": [
+    {
+      "method": "HEAD",
+      "path": "/bucket",
+      "query": [],
+      "headers": [],
+      "host": "s3.example.invalid",
+      "region": "us-east-1",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "canonical_request": "HEAD\n/bucket\n\nhost:s3.example.invalid\nx-amz-date:20261114T120000Z\n\nhost;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261114/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=d1826849c5b980ae1355a51b2caaf7a428416848617da4a937335c4d8c6706a7"
+    },
+    {
+      "method": "GET",
+      "path": "/bucket",
+      "query": [
+        [
+          "location",
+          ""
+        ]
+      ],
+      "headers": [],
+      "host": "s3.example.invalid",
+      "region": "us-east-1",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "canonical_request": "GET\n/bucket\nlocation=\nhost:s3.example.invalid\nx-amz-date:20261114T120000Z\n\nhost;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261114/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=93775440750c20640b2efc73576be2cebb26de247ebd4d120a3319170f2aeb1e"
+    },
+    {
+      "method": "GET",
+      "path": "/bucket",
+      "query": [
+        [
+          "prefix",
+          "auths/"
+        ],
+        [
+          "list-type",
+          "2"
+        ],
+        [
+          "continuation-token",
+          "a b/c="
+        ]
+      ],
+      "headers": [],
+      "host": "s3.example.invalid",
+      "region": "eu-west-1",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "canonical_request": "GET\n/bucket\ncontinuation-token=a%20b%2Fc%3D&list-type=2&prefix=auths%2F\nhost:s3.example.invalid\nx-amz-date:20261114T120000Z\n\nhost;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261114/eu-west-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=2ec9e4f86bef0ca3032b6c37301172ae6ec951ef7a2799ea19e72afa4be739ec"
+    },
+    {
+      "method": "PUT",
+      "path": "/bucket/team a/ü+x.json",
+      "query": [],
+      "headers": [
+        [
+          "Content-Type",
+          "application/json"
+        ]
+      ],
+      "host": "s3.example.invalid",
+      "region": "us-east-1",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "canonical_request": "PUT\n/bucket/team%20a/%C3%BC%2Bx.json\n\ncontent-type:application/json\nhost:s3.example.invalid\nx-amz-date:20261114T120000Z\n\ncontent-type;host;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261114/us-east-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature=7a30a70aec4c8c68e7193e9a7b9ad138132841ff7595a14fd6d75a4412dda121"
+    },
+    {
+      "method": "DELETE",
+      "path": "/bucket/auths/a.json",
+      "query": [],
+      "headers": [],
+      "host": "127.0.0.1:9000",
+      "region": "us-east-1",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "canonical_request": "DELETE\n/bucket/auths/a.json\n\nhost:127.0.0.1:9000\nx-amz-date:20261114T120000Z\n\nhost;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261114/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=8d931e3432e8a1e5bf5732aa3b6f14b5712edc6cf2e8004cd771134b866d5c4e"
+    },
+    {
+      "method": "PUT",
+      "path": "/new-bucket",
+      "query": [],
+      "headers": [
+        [
+          "X-Amz-Content-Sha256",
+          "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ]
+      ],
+      "host": "s3.example.invalid",
+      "region": "ap-south-1",
+      "payload_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "canonical_request": "PUT\n/new-bucket\n\nhost:s3.example.invalid\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20261114T120000Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "authorization": "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20261114/ap-south-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=766fae3965243c2fcfaf051fbbf80d231889917adf995fdb7787b61584f4c35c"
+    }
+  ]
+}

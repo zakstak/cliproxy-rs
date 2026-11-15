@@ -1,0 +1,707 @@
+{
+  "prepare": [
+    {
+      "name": "go_rewrite",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "go_private",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 tcp 1671430143 10.0.0.1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "go_zero_network",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 tcp 1671430143 0.0.0.1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "go_carrier_nat",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 tcp 1671430143 100.64.0.1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "go_reserved",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 tcp 1671430143 203.0.113.10 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "go_site_local_v6",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 tcp 1671430143 fec0::1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "go_wrong_port",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 tcp 1671430143 20.42.0.10 8443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "go_relay",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 tcp 1671430143 20.42.0.10 443 typ relay raddr 192.0.2.1 rport 5000 tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "go_active",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 tcp 1671430143 20.42.0.10 443 typ host tcptype active\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "only_udp",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 udp 2130706431 20.42.0.10 3478 typ host\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "no_candidates",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "ipv6_public",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 2606:4700::1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "ipv4_mapped",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 ::ffff:20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "component_two",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 2 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "component_two_and_valid",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 2 tcp 1671430143 20.42.0.21 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "upper_tcp",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 TCP 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "upper_passive",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype PASSIVE\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "extensions",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive generation 0 network-id 1\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "extra_spaces",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:  2  1 tcp 1671430143   20.42.0.20 443 typ host tcptype passive  \r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "mdns_name",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 abcd-1234.local 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "hostname",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 example.com 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "short",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 tcp\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "bad_port",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 abc typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "bad_priority",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp x 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "bad_component",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 x tcp 1 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "unknown_type",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1 20.42.0.20 443 typ foo tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "unknown_network",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 sctp 1 20.42.0.20 443 typ host\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "srflx",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1 20.42.0.20 443 typ srflx raddr 0.0.0.0 rport 0 tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "simultaneous_open",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1 20.42.0.20 443 typ host tcptype so\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "tcp_no_tcptype",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1 20.42.0.20 443 typ host\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "unspecified",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 0.0.0.0 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "multicast",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 224.0.0.1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "broadcast",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 255.255.255.255 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "loopback",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 127.0.0.1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "private_192",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 192.168.1.1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "nat64",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 64:ff9b::1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "teredo",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 2001::1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "google_v6",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 2001:4860::1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "second_media",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "session_credentials",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=ice-ufrag:sess-ufrag\r\na=ice-pwd:sess-password\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "media_overrides_session",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=ice-ufrag:sess-ufrag\r\na=ice-pwd:sess-password\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:media-ufrag\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:media-ufrag\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "inconsistent",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:a\r\na=ice-pwd:p\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:b\r\na=ice-pwd:p\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "incomplete",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:a\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "missing",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "padded_credentials",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag: remote-ufrag \r\na=ice-pwd: remote-password \r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "offer_missing",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\n"
+    },
+    {
+      "name": "offer_inconsistent",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:x\r\na=ice-pwd:p\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:y\r\na=ice-pwd:p\r\n"
+    },
+    {
+      "name": "garbage_answer",
+      "answer": "garbage",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_bad_digit",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 2606:4700::zz 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_triple_colon",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 2606:4700:::1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_nine_fields",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1:2:3:4:5:6:7:8:9 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_long_group",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 12345::1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_trailing_colon",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1::2: 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_too_short",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1:2 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_double_ellipsis",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1::2::3 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_full_with_ellipsis",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1:2:3:4::5:6:7:8 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_embedded_v4",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 2606:4700::1.2.3.4 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_embedded_v4_misplaced",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1:2:3:1.2.3.4 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_embedded_v4_too_many",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1:2:3:4:5:6:7:1.2.3.4 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_embedded_bad_v4",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 ::ffff:1.2.3.400 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_garbage_after_v4",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 ::ffff:1.2.3.4x 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v6_bad_separator",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 2606:4700::1g 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v4_short",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1.2.3 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v4_long",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1.2.3.4.5 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v4_leading_zero",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 01.2.3.4 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v4_big",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 256.1.1.1 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v4_empty_field",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 1..2.3 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "v4_with_zone",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.0.20%eth0 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "percent_only",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 %eth0 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "no_separator",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 abc 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "garbage_offer",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "garbage"
+    },
+    {
+      "name": "limit_65",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:2 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:3 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:4 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:5 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:6 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:7 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:8 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:9 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:10 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:11 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:12 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:13 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:14 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:15 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:16 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:17 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:18 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:19 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:20 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:21 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:22 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:23 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:24 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:25 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:26 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:27 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:28 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:29 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:30 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:31 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:32 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:33 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:34 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:35 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:36 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:37 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:38 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:39 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:40 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:41 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:42 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:43 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:44 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:45 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:46 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:47 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:48 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:49 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:50 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:51 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:52 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:53 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:54 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:55 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:56 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:57 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:58 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:59 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:60 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:61 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:62 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:63 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:64 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:65 1 udp 2130706431 20.42.0.10 3478 typ host\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "exactly_64",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:2 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:3 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:4 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:5 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:6 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:7 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:8 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:9 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:10 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:11 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:12 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:13 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:14 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:15 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:16 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:17 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:18 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:19 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:20 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:21 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:22 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:23 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:24 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:25 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:26 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:27 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:28 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:29 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:30 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:31 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:32 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:33 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:34 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:35 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:36 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:37 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:38 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:39 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:40 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:41 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:42 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:43 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:44 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:45 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:46 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:47 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:48 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:49 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:50 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:51 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:52 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:53 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:54 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:55 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:56 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:57 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:58 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:59 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:60 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:61 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:62 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:63 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:2 1 tcp 1671430143 20.42.0.20 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "tcp_limit_17",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.1.1 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.2 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.3 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.4 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.5 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.6 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.7 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.8 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.9 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.10 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.11 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.12 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.13 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.14 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.15 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.16 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.17 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "tcp_16",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 20.42.1.1 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.2 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.3 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.4 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.5 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.6 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.7 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.8 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.9 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.10 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.11 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.12 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.13 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.14 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.15 443 typ host tcptype passive\r\na=candidate:2 1 tcp 1671430143 20.42.1.16 443 typ host tcptype passive\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "limit_before_bad",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:1 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:2 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:3 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:4 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:5 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:6 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:7 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:8 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:9 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:10 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:11 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:12 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:13 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:14 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:15 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:16 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:17 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:18 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:19 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:20 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:21 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:22 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:23 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:24 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:25 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:26 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:27 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:28 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:29 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:30 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:31 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:32 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:33 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:34 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:35 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:36 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:37 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:38 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:39 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:40 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:41 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:42 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:43 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:44 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:45 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:46 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:47 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:48 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:49 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:50 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:51 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:52 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:53 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:54 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:55 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:56 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:57 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:58 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:59 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:60 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:61 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:62 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:63 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:64 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:65 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:bad\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    },
+    {
+      "name": "bad_before_limit",
+      "answer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\na=candidate:2 1 tcp 1671430143 10.0.0.1 443 typ host tcptype passive\r\na=candidate:1 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:2 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:3 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:4 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:5 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:6 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:7 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:8 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:9 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:10 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:11 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:12 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:13 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:14 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:15 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:16 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:17 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:18 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:19 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:20 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:21 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:22 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:23 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:24 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:25 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:26 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:27 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:28 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:29 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:30 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:31 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:32 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:33 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:34 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:35 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:36 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:37 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:38 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:39 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:40 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:41 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:42 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:43 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:44 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:45 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:46 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:47 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:48 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:49 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:50 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:51 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:52 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:53 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:54 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:55 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:56 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:57 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:58 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:59 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:60 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:61 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:62 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:63 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:64 1 udp 2130706431 20.42.0.10 3478 typ host\r\na=candidate:65 1 udp 2130706431 20.42.0.10 3478 typ host\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:remote-ufrag\r\na=ice-pwd:remote-password\r\n",
+      "offer": "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0 1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:1\r\na=ice-ufrag:local-ufrag\r\na=ice-pwd:local-password\r\n"
+    }
+  ],
+  "dialers": [
+    {
+      "auth_ok": false,
+      "kind": "socks",
+      "method": 0,
+      "name": "socks5_no_auth",
+      "reply": "05000001142a001401bb",
+      "target": "20.42.0.20:443",
+      "url": "socks5://HOST"
+    },
+    {
+      "auth_ok": true,
+      "kind": "socks",
+      "method": 2,
+      "name": "socks5h_auth",
+      "reply": "05000001142a001401bb",
+      "target": "20.42.0.20:443",
+      "url": "socks5h://user:pa%3Ass@HOST"
+    },
+    {
+      "auth_ok": false,
+      "kind": "socks",
+      "method": 0,
+      "name": "socks5_auth_server_skips",
+      "reply": "05000001142a001401bb",
+      "target": "20.42.0.20:443",
+      "url": "socks5://user:pass@HOST"
+    },
+    {
+      "auth_ok": true,
+      "kind": "socks",
+      "method": 2,
+      "name": "socks5_user_only",
+      "reply": "05000001142a001401bb",
+      "target": "20.42.0.20:443",
+      "url": "socks5://user@HOST"
+    },
+    {
+      "auth_ok": false,
+      "kind": "socks",
+      "method": 2,
+      "name": "socks5_auth_rejected",
+      "reply": "05000001142a001401bb",
+      "target": "20.42.0.20:443",
+      "url": "socks5://user:bad@HOST"
+    },
+    {
+      "auth_ok": false,
+      "kind": "socks",
+      "method": 255,
+      "name": "socks5_no_acceptable",
+      "reply": "05000001142a001401bb",
+      "target": "20.42.0.20:443",
+      "url": "socks5://HOST"
+    },
+    {
+      "auth_ok": false,
+      "kind": "socks",
+      "method": 0,
+      "name": "socks5_ipv6_target",
+      "reply": "050000042606470000000000000000000000000101bb",
+      "target": "[2606:4700::1]:443",
+      "url": "socks5://HOST"
+    },
+    {
+      "auth_ok": false,
+      "kind": "socks",
+      "method": 0,
+      "name": "socks5_fqdn_bound",
+      "reply": "0500000304686f737401bb",
+      "target": "20.42.0.20:443",
+      "url": "socks5://HOST"
+    },
+    {
+      "auth_ok": false,
+      "kind": "socks",
+      "method": 0,
+      "name": "socks5_refused",
+      "reply": "05050001000000000000",
+      "target": "20.42.0.20:443",
+      "url": "socks5://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "http_connect",
+      "response": "HTTP/1.1 200 Connection established\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "http_connect_auth",
+      "response": "HTTP/1.1 200 OK\r\nProxy-Agent: x\r\n\r\nearly",
+      "target": "20.42.0.20:443",
+      "url": "http://us%40er:p%3Ass@HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "http_connect_ipv6",
+      "response": "HTTP/1.0 200 OK\r\n\r\n",
+      "target": "[2606:4700::1]:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "http_connect_407",
+      "response": "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "http_connect_garbage",
+      "response": "nonsense\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "auth_ok": true,
+      "kind": "socks",
+      "method": 2,
+      "name": "socks5_ff_password",
+      "reply": "05000001142a001401bb",
+      "target": "20.42.0.20:443",
+      "url": "socks5://u:%FF@HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "http_connect_ff_password",
+      "response": "HTTP/1.1 200 OK\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://u:%FF@HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "http_connect_user_only",
+      "response": "HTTP/1.1 200 OK\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://u@HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "lf_only",
+      "response": "HTTP/1.1 200 OK\n\nafter",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "continuation",
+      "response": "HTTP/1.1 200 OK\r\nX-Test: a\r\n b\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "bad_content_length",
+      "response": "HTTP/1.1 200 OK\r\nContent-Length: nope\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "empty_content_length",
+      "response": "HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "two_content_lengths",
+      "response": "HTTP/1.1 200 OK\r\nContent-Length: 1\r\ncontent-length: 2\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "same_content_lengths",
+      "response": "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length:  3\r\n\r\nabcdef",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "te_gzip",
+      "response": "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "te_chunked",
+      "response": "HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\nearly",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "te_two",
+      "response": "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "te_gzip_http10",
+      "response": "HTTP/1.0 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "chunked_bad_trailer",
+      "response": "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x, content-length\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "space_in_key",
+      "response": "HTTP/1.1 200 OK\r\nBad Key: x\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "bad_key_byte",
+      "response": "HTTP/1.1 200 OK\r\nBad(Key): x\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "missing_colon",
+      "response": "HTTP/1.1 200 OK\r\nNoColon\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "leading_space_header",
+      "response": "HTTP/1.1 200 OK\r\n X: y\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "ctl_in_value",
+      "response": "HTTP/1.1 200 OK\r\nX: a\u0001b\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "status_201",
+      "response": "HTTP/1.1 201 Created\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "status_plus",
+      "response": "HTTP/1.1 +20 Odd\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "status_only_code",
+      "response": "HTTP/1.1 200\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "http2_version",
+      "response": "HTTP/2 200 OK\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "spaces_before_status",
+      "response": "HTTP/1.1   200 OK\r\n\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "eof_in_headers",
+      "response": "HTTP/1.1 200 OK\r\nX: y\r\n",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "kind": "connect",
+      "name": "eof_in_status",
+      "response": "HTTP/1.1 200 OK",
+      "target": "20.42.0.20:443",
+      "url": "http://HOST"
+    },
+    {
+      "auth_ok": false,
+      "kind": "socks",
+      "method": 0,
+      "name": "socks5_empty_host",
+      "reply": "05000001142a001401bb",
+      "target": "20.42.0.20:443",
+      "url": "socks5://:PORT"
+    },
+    {
+      "kind": "connect",
+      "name": "http_empty_host",
+      "response": "HTTP/1.1 200 OK\r\n\r\nempty",
+      "target": "20.42.0.20:443",
+      "url": "http://:PORT"
+    }
+  ]
+}

@@ -635,7 +635,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identifiers_and_paths_follow_go() {
+    fn sql_identifiers_are_quoted_and_spool_paths_are_resolved() {
         assert_eq!(quote_identifier(r#"my"schema"#), r#""my""schema""#);
         assert_eq!(clean(Path::new("a/./b/../c")), PathBuf::from("a/c"));
         assert_eq!(clean(Path::new("../x")), PathBuf::from("../x"));

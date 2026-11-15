@@ -194,10 +194,6 @@ impl From<&ModelInfo> for ModelCaps {
 /// `registry.LookupModelInfo(model, provider)`: the server's dynamic registry
 /// (provider-specific registration, then the last registration), then the pinned catalog.
 pub fn lookup_model_info(model: &str, provider: &str) -> Option<ModelCaps> {
-    #[cfg(test)]
-    if let Some(found) = tests::lookup_override(model, provider) {
-        return found;
-    }
     let provider = Some(provider).filter(|p| !p.is_empty());
     cpa_core::registry::lookup_model(model, provider).map(|info| ModelCaps::from(&info))
 }

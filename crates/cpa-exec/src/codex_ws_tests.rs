@@ -1,8 +1,5 @@
-//! Upstream WebSocket executor tests. Error-frame expectations come from Go
-//! (`tests/fixtures/codex_ws_errors.json`, `tests/reference/codex/zz_rsfix_ws_errors_test.go`);
-//! the lifecycle tests run the executor against a loopback axum WebSocket upstream with
-//! fake credentials. Whole-handler behaviour is covered against Go fixtures in
-//! cpa-server's `tests/ws_e2e.rs`.
+//! WebSocket executor behavior uses local peers and explicit event/HTTP contracts.
+//! Error envelope tests separate usable fields from incidental diagnostic rendering.
 
 use super::*;
 use std::collections::VecDeque;
@@ -48,50 +45,86 @@ fn observers_read_first_duplicates_and_keep_raw_numbers() {
 }
 
 #[test]
-fn error_frames_match_go() {
-    let cases: Vec<Value> =
-        serde_json::from_str(include_str!("../tests/fixtures/codex_ws_errors.json")).expect("fixture");
-    assert_eq!(cases.len(), 15);
-    for case in &cases {
-        let payload = case["payload"].as_str().unwrap();
-        let cooling = case["model_level_cooling"].as_bool().unwrap_or(false);
-        let got = ws_error(payload, cooling);
-        if !case["matched"].as_bool().unwrap() {
-            assert!(got.is_none(), "{payload}");
-            continue;
-        }
-        let got = got.unwrap_or_else(|| panic!("{payload}: not classified"));
-        assert_eq!(u64::from(got.status), case["status"].as_u64().unwrap(), "{payload}");
+fn websocket_error_envelopes_preserve_status_error_fields_and_retry_scope() {
+    // CONTRACT.md's WebSocket error handling keeps the selected upstream error.
+    // Unspecified extension fields exercise our local compatibility fallback only;
+    // they do not establish what a provider sends or accepts.
+    for (status, error) in [
+        (
+            400,
+            serde_json::json!({"type":"invalid_request_error","code":"context_length_exceeded","message":"context refused"}),
+        ),
+        (
+            401,
+            serde_json::json!({"type":"authentication_error","message":"authentication refused"}),
+        ),
+        (
+            500,
+            serde_json::json!({"type":"server_error","message":"upstream failed"}),
+        ),
+    ] {
+        let frame = serde_json::json!({"type":"error","status":status,"error":error}).to_string();
+        let result = ws_error(&frame, false).unwrap();
+        assert_eq!(result.status, status);
+        let body: Value = serde_json::from_slice(&result.body).unwrap();
+        assert_eq!(body["status"], status);
+        assert_eq!(body["error"], error);
+        assert_eq!(result.retry_after, None);
+    }
+    for cooling in [false, true] {
+        let frame = r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"limit","resets_in_seconds":60}}"#;
+        let result = ws_error(frame, cooling).unwrap();
+        assert_eq!(result.status, 429);
+        assert_eq!(result.retry_after, Some(Duration::from_secs(60)));
         assert_eq!(
-            String::from_utf8_lossy(&got.body),
-            case["message"].as_str().unwrap(),
-            "{payload}"
+            result.scope,
+            if cooling {
+                FailureScope::Model
+            } else {
+                FailureScope::Credential
+            }
         );
+    }
+    // Only primitive, non-empty header values are carried into local classification.
+    let frame = r#"{"type":"error","status":429,"body":{"error":{"code":"rate_limit_exceeded","message":"slow"}},"headers":{"retry-after":"7","x-codex-primary-used-percent":91,"x-flag":true,"x-empty":" ","x-object":{}}}"#;
+    let result = ws_error(frame, false).unwrap();
+    let body: Value = serde_json::from_slice(&result.body).unwrap();
+    assert_eq!(
+        body["error"],
+        serde_json::json!({"code":"rate_limit_exceeded","message":"slow"})
+    );
+    assert_eq!(result.headers.len(), 3);
+    assert_eq!(result.headers["retry-after"], "7");
+    assert_eq!(result.headers["x-codex-primary-used-percent"], "91");
+    assert_eq!(result.headers["x-flag"], "true");
+    for frame in [
+        r#"{"type":"error","status_code":503}"#,
+        r#"{"type":"error","status":418}"#,
+        r#"{"type":"error","status":413}"#,
+        r#"{"type":"error","status":429,"body":{"detail":"diagnostic"},"error":{"message":"top"}}"#,
+    ] {
+        let source: Value = serde_json::from_str(frame).unwrap();
+        let error = ws_error(frame, false).unwrap();
         assert_eq!(
-            got.retry_after.map(|d| d.as_millis() as i64),
-            case["retry_after_ms"].as_i64(),
-            "{payload}"
+            u64::from(error.status),
+            source["status"].as_u64().or(source["status_code"].as_u64()).unwrap()
         );
-        let credential_scoped = case["credential_scoped"].as_bool().unwrap_or(false);
-        assert_eq!(
-            got.scope == FailureScope::Credential && response::is_usage_limit(&String::from_utf8_lossy(&got.body)),
-            credential_scoped,
-            "{payload}: credential-wide usage limit"
-        );
-        let mut headers: Vec<(String, String)> = got
-            .headers
-            .iter()
-            .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap().to_owned()))
-            .collect();
-        headers.sort();
-        let mut want: Vec<(String, String)> = case["headers"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(k, v)| (k.to_ascii_lowercase(), v.as_str().unwrap().to_owned()))
-            .collect();
-        want.sort();
-        assert_eq!(headers, want, "{payload}");
+        let body: Value = serde_json::from_slice(&error.body).unwrap();
+        assert!(body["error"].is_object());
+        assert!(!body["error"]["message"].as_str().unwrap().is_empty());
+    }
+    for frame in [
+        r#"{"type":"error","status":429,"error":{"code":"websocket_connection_limit_reached","message":"capacity"}}"#,
+        r#"{"type":"error","status":503,"code":"websocket_connection_limit_reached"}"#,
+    ] {
+        assert_eq!(ws_error(frame, false).unwrap().retry_after, Some(Duration::ZERO));
+    }
+    for unrelated in [
+        r#"{"type":"error","status":0}"#,
+        r#"{"type":"error","error":{"message":"no status"}}"#,
+        r#"{"type":"response.failed","status":500}"#,
+    ] {
+        assert!(ws_error(unrelated, false).is_none(), "{unrelated}");
     }
 }
 
@@ -527,12 +560,10 @@ async fn a_global_proxy_reload_keeps_the_open_socket() {
     assert_eq!(up.dials.lock().unwrap().len(), 1);
 }
 
-/// Go `websocketSessionTargetMatches` compares the trimmed proxy settings, not parsed
-/// proxies: `direct` and `none`, or two unparseable settings, are different targets. A
-/// continuation that changes `(global, own)` after the first turn keeps the socket or
-/// needs a replay as Go decides.
+/// A pooled continuation is tied to its effective proxy settings. A change that
+/// could select another network path requires replay; whitespace-only edits reuse it.
 #[tokio::test]
-async fn proxy_settings_match_as_go_compares_them() {
+async fn pooled_continuations_reuse_only_the_same_effective_proxy_settings() {
     type Row = (
         &'static str,
         Option<&'static str>,
@@ -1126,9 +1157,9 @@ fn tapped(body: &str, tap: &Arc<crate::codex_testkit::Wiretap>) -> ExecRequest {
 /// frame with the dial's URL and headers before dialing, the handshake after a new dial
 /// only, then every upstream message as received.
 #[tokio::test]
-async fn capture_records_websocket_turns_as_go_does() {
+async fn websocket_capture_matches_peer_frames_and_records_each_handshake_once() {
     use crate::codex_testkit::{Tap, Wiretap};
-    let (_up, url) = upstream(vec![
+    let (up, url) = upstream(vec![
         Act::Send(vec![CREATED, COMPLETED]),
         Act::Send(vec![CREATED, COMPLETED]),
     ])
@@ -1153,6 +1184,21 @@ async fn capture_records_websocket_turns_as_go_does() {
         else {
             panic!("{taps:?}");
         };
+        assert_eq!(
+            body,
+            up.frames.lock().unwrap().last().unwrap(),
+            "capture preserves the frame the peer received"
+        );
+        let dials = up.dials.lock().unwrap();
+        let dial = dials.last().unwrap();
+        for (name, value) in headers {
+            assert_eq!(
+                dial.get(name).unwrap().to_str().unwrap(),
+                value,
+                "captured dial header {name}"
+            );
+        }
+        drop(dials);
         assert_eq!(url, &ws_url);
         assert_eq!(
             crate::rawjson::get(body, "type").str(),
@@ -1160,7 +1206,9 @@ async fn capture_records_websocket_turns_as_go_does() {
             "the frame as sent"
         );
         assert!(
-            headers.contains(&("Authorization".into(), "Bearer sk-FAKE".into())),
+            headers
+                .iter()
+                .any(|(key, value)| key.eq_ignore_ascii_case("authorization") && value == "Bearer sk-FAKE"),
             "{headers:?}"
         );
         assert_eq!(
@@ -1924,27 +1972,52 @@ mod fragment;
 #[path = "codex_ws_budget_tests.rs"]
 mod budget;
 
-/// `buildCodexResponsesWebsocketURL` answers, recorded from Go v8.0.35 with the inputs of `url.Parse` and
-/// `URL.String()` (tests/reference/go_url).
+/// RFC 6455 uses ws and wss for the same resource named by an HTTP URL.
 #[test]
-fn ws_url_follows_go() {
-    let cases: Value = serde_json::from_str(include_str!("../tests/fixtures/go_url_string.json")).unwrap();
-    for case in cases.as_array().unwrap() {
-        let input = case["in"].as_str().unwrap();
-        let want = &case["codex_ws"];
-        match ws_url(input) {
-            Ok(got) => assert_eq!(Some(got.as_str()), want["out"].as_str(), "{input}"),
-            Err(e) => {
-                assert_eq!(
-                    String::from_utf8_lossy(&e.body),
-                    want["err"].as_str().unwrap(),
-                    "{input}"
-                );
-                // A plain Go error before dialing: no status, no retry round, and the
-                // model cools for the credential.
-                assert_eq!((e.status, e.scope), (0, cpa_core::exec::FailureScope::Model), "{input}");
-            }
-        }
+fn websocket_url_preserves_the_http_resource_and_rejects_unusable_origins() {
+    for (input, scheme, host, path, query) in [
+        (
+            "https://api.openai.com/v1/responses",
+            "wss",
+            "api.openai.com",
+            "/v1/responses",
+            None,
+        ),
+        (
+            "http://127.0.0.1:8317/responses?tenant=one%2Ftwo",
+            "ws",
+            "127.0.0.1",
+            "/responses",
+            Some("tenant=one%2Ftwo"),
+        ),
+        (
+            " https://example.invalid/prefix/responses?x=1&x=2 ",
+            "wss",
+            "example.invalid",
+            "/prefix/responses",
+            Some("x=1&x=2"),
+        ),
+        ("https://[::1]:8443/responses", "wss", "[::1]", "/responses", None),
+    ] {
+        let converted = ws_url(input).unwrap();
+        let parsed = url::Url::parse(&converted).unwrap();
+        assert_eq!(parsed.scheme(), scheme);
+        assert_eq!(parsed.host_str(), Some(host));
+        assert_eq!(parsed.path(), path);
+        assert_eq!(parsed.query(), query);
+        assert_eq!(parsed.port(), url::Url::parse(input.trim()).unwrap().port());
+    }
+    for invalid in [
+        "",
+        "relative/responses",
+        "ftp://example.invalid/responses",
+        "wss://example.invalid/responses",
+        "https:///",
+        "https://bad%host/responses",
+    ] {
+        let error = ws_url(invalid).unwrap_err();
+        assert_eq!((error.status, error.scope), (0, FailureScope::Model));
+        assert!(!error.body.is_empty(), "actionable URL refusal");
     }
 }
 

@@ -474,8 +474,8 @@ mod tests {
     /// Go `TestConcurrencyDispatchFixture` (accounted): the shared fixture's tuple and
     /// identity; the pick side is `home::tests::picks_install_release_and_fence_like_go`.
     #[test]
-    fn concurrency_fixture_round_trips() {
-        let raw = include_bytes!("../tests/fixtures/concurrency_dispatch_accounted.json");
+    fn accounted_concurrency_tuple_requires_matching_credential_identity() {
+        let raw = br#"{"auth":{"id":"cred-1"},"auth_index":"cred-1","concurrency":{"accounted":true,"credential_id":"cred-1","model":"gpt"}}"#;
         let tuple = decode_concurrency(raw).unwrap().unwrap();
         assert_eq!(
             tuple,
@@ -517,8 +517,8 @@ mod tests {
     /// `TestHomeBusyErrorHeadersRoundUpMilliseconds` and
     /// `TestHomeConcurrencyBusyErrorsRemainTypedWhenWrapped`.
     #[test]
-    fn busy_fixture_maps_to_429_with_retry_after() {
-        let raw = include_bytes!("../tests/fixtures/concurrency_dispatch_busy.json");
+    fn concurrency_busy_errors_preserve_retry_hints_and_round_up_public_seconds() {
+        let raw = br#"{"error":{"type":"credential_concurrency_exceeded","message":"busy","retryable":true,"retry_after_ms":750}}"#;
         let error = decode_error(raw).unwrap();
         assert_eq!(error.code, "credential_concurrency_exceeded");
         assert_eq!(error.status, 429);
@@ -545,7 +545,7 @@ mod tests {
     /// Go `TestHomeNoCandidateErrorsMapToServiceUnavailable` and
     /// `TestHomeUserBillingAndPeriodLimitErrors`.
     #[test]
-    fn error_codes_map_to_go_statuses() {
+    fn dispatch_error_codes_define_public_status_and_retry_policy() {
         let status = |code: &str| {
             decode_error(format!(r#"{{"error":{{"type":"{code}"}}}}"#).as_bytes())
                 .unwrap()
@@ -601,83 +601,145 @@ mod tests {
 }
 
 #[cfg(test)]
-mod go_golden {
+mod protocol_contract {
     use super::*;
-    use serde_json::Value as Json;
-
-    fn doc() -> Json {
-        serde_json::from_str(include_str!("../tests/fixtures/go_auth_golden.json")).unwrap()
-    }
+    use serde_json::json;
 
     #[test]
-    fn dispatch_errors_match_go() {
-        for case in doc()["dispatch_errors"].as_array().unwrap() {
-            let raw = case["raw"].as_str().unwrap();
-            let got = decode_error(raw.as_bytes());
-            let Some(code) = case["code"].as_str() else {
-                assert!(got.is_none(), "{raw}");
-                continue;
-            };
-            let got = got.unwrap_or_else(|| panic!("{raw}"));
-            assert_eq!(got.code, code, "{raw}");
-            assert_eq!(got.message, case["message"].as_str().unwrap(), "{raw}");
-            assert_eq!(i64::from(got.status), case["status"].as_i64().unwrap(), "{raw}");
-            assert_eq!(got.retryable, case["retryable"].as_bool().unwrap(), "{raw}");
-            let ms = |d: Option<Duration>| d.map(|d| d.as_millis() as i64);
-            let (kind, retry_after, request_retry) = match got.kind {
-                HomeErrorKind::Plain => ("plain", None, None),
-                HomeErrorKind::Busy { retry_after } => ("busy", ms(retry_after), None),
-                HomeErrorKind::Cooldown {
-                    retry_after,
-                    request_retry,
-                } => ("cooldown", ms(retry_after), request_retry),
-            };
-            assert_eq!(kind, case["kind"].as_str().unwrap(), "{raw}");
-            assert_eq!(retry_after, case["retry_after_ms"].as_i64(), "{raw}");
-            assert_eq!(request_retry, case["request_retry"].as_i64(), "{raw}");
-            let header = got.retry_after_header().map(|s| s.to_string());
-            assert_eq!(header.as_deref(), case["retry_after_header"].as_str(), "{raw}");
-        }
-    }
-
-    #[test]
-    fn model_keys_match_go() {
-        for case in doc()["model_keys"].as_array().unwrap() {
-            let input = case["in"].as_str().unwrap();
+    fn dispatch_errors_preserve_scope_message_and_retry_metadata() {
+        // Home error types are part of the shared protocol. The HTTP mapping is a
+        // proxy policy, independent of any peer's JSON encoder or error rendering.
+        for (code, status) in [
+            ("credential_concurrency_exceeded", 429),
+            ("credential_model_concurrency_exceeded", 429),
+            ("model_cooldown", 429),
+            ("MODEL_NOT_FOUND", 404),
+            ("unauthorized", 401),
+            ("user_credits_insufficient", 402),
+            ("user_period_limit_exceeded", 429),
+            ("refresh_temporarily_unavailable", 503),
+            ("concurrency_protocol_required", 503),
+            ("request_retry_exceeded", 502),
+            ("auth_not_found", 503),
+        ] {
+            let raw = serde_json::to_vec(&json!({"error":{"type":code,"message":" useful detail ","retryable":true,"retry_after_ms":1500,"request_retry":2}})).unwrap();
+            let actual = decode_error(&raw).unwrap();
             assert_eq!(
-                canonical_concurrency_model_key(input),
-                case["key"].as_str().unwrap(),
-                "{input:?}"
+                (actual.code.as_str(), actual.status, actual.retryable),
+                (code, status, true)
             );
-            assert_eq!(
-                valid_concurrency_model_key(input).is_some(),
-                case["valid"].as_bool().unwrap(),
-                "{input:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn envelopes_match_go() {
-        for case in doc()["envelopes"].as_array().unwrap() {
-            let raw = case["raw"].as_str().unwrap();
-            let got = decode_concurrency(raw.as_bytes());
-            let (ok, present) = (case["ok"].as_bool().unwrap(), case["present"].as_bool().unwrap());
-            match got {
-                Ok(tuple) => {
-                    assert!(ok, "{raw}");
-                    assert_eq!(tuple.is_some(), present, "{raw}");
-                    if let Some(tuple) = tuple {
-                        let want = &case["tuple"];
-                        assert_eq!(tuple.credential_id, want["credential_id"].as_str().unwrap());
-                        assert_eq!(tuple.model, want["model"].as_str().unwrap());
+            assert_eq!(actual.message, "useful detail");
+            match code {
+                "credential_concurrency_exceeded" | "credential_model_concurrency_exceeded" => assert_eq!(
+                    actual.kind,
+                    HomeErrorKind::Busy {
+                        retry_after: Some(Duration::from_millis(1500))
                     }
-                }
-                Err((got_present, _)) => {
-                    assert!(!ok, "{raw}");
-                    assert_eq!(got_present, present, "{raw}");
-                }
+                ),
+                "model_cooldown" => assert_eq!(
+                    actual.kind,
+                    HomeErrorKind::Cooldown {
+                        retry_after: Some(Duration::from_millis(1500)),
+                        request_retry: Some(2)
+                    }
+                ),
+                _ => assert_eq!(actual.kind, HomeErrorKind::Plain),
             }
+            assert_eq!(
+                actual.retry_after_header(),
+                if status == 429 && code != "user_period_limit_exceeded" {
+                    Some(2)
+                } else {
+                    None
+                }
+            );
+        }
+        for raw in [
+            br#"{"error":null}"#.as_slice(),
+            br#"{"error":"text"}"#,
+            br#"{"error":{"message":"no code"}}"#,
+            br#"{"error":{"type":5}}"#,
+        ] {
+            let actual = decode_error(raw).unwrap();
+            assert_eq!((actual.code.as_str(), actual.status), ("invalid_auth", 502));
+            assert!(!actual.message.is_empty());
+        }
+        for raw in [br#"{"auth":{}}"#.as_slice(), b"not json"] {
+            assert!(decode_error(raw).is_none());
+        }
+        let alternate = decode_error(br#"{"error":{"type":" ","code":" auth_not_found "}}"#).unwrap();
+        assert_eq!((alternate.code.as_str(), alternate.status), ("auth_not_found", 503));
+        let negative =
+            decode_error(br#"{"error":{"type":"model_cooldown","retry_after_ms":-5,"request_retry":-1}}"#).unwrap();
+        assert_eq!(
+            negative.kind,
+            HomeErrorKind::Cooldown {
+                retry_after: None,
+                request_retry: None
+            }
+        );
+    }
+
+    #[test]
+    fn model_keys_normalize_recognized_suffixes_and_bound_shared_identity() {
+        for (raw, expected) in [
+            (" GPT-5(HIGH) ", "gpt-5"),
+            ("gpt(123)", "gpt"),
+            ("gpt(-1)", "gpt"),
+            ("gpt(custom)", "gpt(custom)"),
+            ("(high)", "(high)"),
+            ("gpt(2147483648)", "gpt(2147483648)"),
+            ("gpt", "gpt"),
+        ] {
+            assert_eq!(canonical_concurrency_model_key(raw), expected);
+            assert_eq!(
+                canonical_concurrency_model_key(expected),
+                expected,
+                "canonicalization is idempotent"
+            );
+            assert_eq!(valid_concurrency_model_key(raw).as_deref(), Some(expected));
+        }
+        assert!(valid_concurrency_model_key(" \t\n").is_none());
+        assert!(valid_concurrency_model_key(&"m".repeat(256)).is_some());
+        assert!(valid_concurrency_model_key(&"m".repeat(257)).is_none());
+    }
+
+    #[test]
+    fn concurrency_envelopes_distinguish_absent_invalid_and_accounted_tuples() {
+        let valid = json!({"concurrency":{"accounted":true,"credential_id":"credential-a","model":"gpt"}});
+        let actual = decode_concurrency(&serde_json::to_vec(&valid).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            actual,
+            ConcurrencyTuple {
+                accounted: true,
+                credential_id: "credential-a".into(),
+                model: "gpt".into()
+            }
+        );
+        for (field, value) in [
+            ("accounted", json!(false)),
+            ("credential_id", json!(" credential-a")),
+            ("model", json!("GPT")),
+            ("model", json!("gpt(high)")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["concurrency"][field] = value;
+            assert!(matches!(
+                decode_concurrency(&serde_json::to_vec(&invalid).unwrap()),
+                Err((true, _))
+            ));
+        }
+        for value in [json!(null), json!("x")] {
+            assert!(matches!(
+                decode_concurrency(&serde_json::to_vec(&json!({"concurrency":value})).unwrap()),
+                Err((true, _))
+            ));
+        }
+        assert_eq!(decode_concurrency(br#"{"auth":{}}"#), Ok(None));
+        for raw in [b"[1]".as_slice(), b"\xff"] {
+            assert!(matches!(decode_concurrency(raw), Err((false, _))));
         }
     }
 }

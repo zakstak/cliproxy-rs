@@ -2,10 +2,6 @@ use super::*;
 use crate::codex_testkit::{Mock, json};
 use serde_json::Value;
 
-fn golden() -> Value {
-    serde_json::from_str(include_str!("../tests/fixtures/codex_siwc_bind_go.json")).unwrap()
-}
-
 fn temp_root() -> PathBuf {
     let root = std::env::temp_dir().join(format!("cpa-siwc-bind-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join("auth")).unwrap();
@@ -13,135 +9,273 @@ fn temp_root() -> PathBuf {
     std::fs::canonicalize(root).unwrap()
 }
 
-/// The Go recorder's file layout: `->target` is a symlink, `/` a directory.
-fn write_files(base: &Path, files: &Value, expand: &dyn Fn(&str) -> String) {
-    for (name, content) in files.as_object().into_iter().flatten() {
-        let (path, content) = (base.join(name), content.as_str().unwrap());
-        if let Some(target) = content.strip_prefix("->") {
-            std::os::unix::fs::symlink(expand(target), &path).unwrap();
-        } else if content == "/" {
-            std::fs::create_dir_all(&path).unwrap();
-        } else {
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, content).unwrap();
-        }
+const OUTER: &str =
+    r#"{"type":"codex","access_token":"outer-access","refresh_token":"outer-refresh","note":"operator"}"#;
+
+#[test]
+fn bind_target_is_a_regular_oauth_file_inside_the_real_auth_directory() {
+    let root = temp_root();
+    let dir = root.join("auth");
+    let path = dir.join("account.json");
+    std::fs::write(&path, OUTER).unwrap();
+    std::fs::write(root.join("out/outside.json"), OUTER).unwrap();
+    std::fs::create_dir(dir.join("folder")).unwrap();
+    std::os::unix::fs::symlink(&path, dir.join("inside.json")).unwrap();
+    std::os::unix::fs::symlink(root.join("out/outside.json"), dir.join("outside.json")).unwrap();
+    std::os::unix::fs::symlink(&dir, root.join("alias")).unwrap();
+    for (auth, target) in [
+        (dir.clone(), "account.json".to_owned()),
+        (dir.clone(), path.to_string_lossy().into_owned()),
+        (dir.clone(), "inside.json".to_owned()),
+        (root.join("alias"), "account.json".to_owned()),
+        (
+            root.join("alias"),
+            root.join("alias/account.json").to_string_lossy().into_owned(),
+        ),
+        (root.join("out/../auth"), "account.json".to_owned()),
+        (root.join("alias/../auth"), "account.json".to_owned()),
+    ] {
+        assert_eq!(resolve(&auth, &target).unwrap(), path, "{auth:?} {target}");
     }
+    for target in [
+        "",
+        "  ",
+        ".",
+        "..",
+        "../out/outside.json",
+        "folder/account.json",
+        r"folder\account.json",
+        "missing.json",
+        "outside.json",
+        "folder",
+    ] {
+        assert!(resolve(&dir, target).is_err(), "unsafe or absent target {target}");
+    }
+    for target in [root.join("out/outside.json"), dir.clone()] {
+        assert!(resolve(&dir, &target.to_string_lossy()).is_err(), "{target:?}");
+    }
+    assert!(resolve(Path::new(""), "account.json").is_err());
+    assert!(resolve(&root.join("missing"), "account.json").is_err());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        OUTER,
+        "resolution never writes tokens"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
-/// Go's message, with a wrapped cause's OS text cut (`cause`), against ours.
-fn assert_error(case: &Value, got: &str, expand: &dyn Fn(&str) -> String) {
-    let want = expand(
-        case["error"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{case}: unexpected error {got}")),
-    );
-    if case["cause"] == Value::Bool(true) {
-        assert!(
-            got.starts_with(&format!("{want}: ")),
-            "{}: {got} vs {want}",
-            case["name"]
-        );
-    } else {
-        assert_eq!(got, want, "{}", case["name"]);
+#[test]
+fn binding_requires_a_typed_codex_oauth_credential() {
+    let root = temp_root();
+    let dir = root.join("auth");
+    let path = dir.join("account.json");
+    for invalid in [
+        "not JSON",
+        "[]",
+        "null",
+        "{}",
+        r#"{"type":"claude","access_token":"a","refresh_token":"r"}"#,
+        r#"{"type":7,"access_token":"a","refresh_token":"r"}"#,
+        r#"{"type":"codex","refresh_token":"r"}"#,
+        r#"{"type":"codex","access_token":7,"refresh_token":"r"}"#,
+        r#"{"type":"codex","access_token":"a","refresh_token":"  "}"#,
+    ] {
+        std::fs::write(&path, invalid).unwrap();
+        assert!(resolve(&dir, "account.json").is_err(), "{invalid}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
+    }
+    // Existing credential type spellings remain accepted during test migration.
+    std::fs::write(&path, r#"{"type":" CoDeX ","access_token":"a","refresh_token":"r"}"#).unwrap();
+    assert_eq!(resolve(&dir, "account.json").unwrap(), path);
+    // Duplicated type fields are a saved-file parser policy, not wire evidence.
+    std::fs::write(
+        &path,
+        r#"{"type":"claude","type":"codex","access_token":"a","refresh_token":"r"}"#,
+    )
+    .unwrap();
+    assert_eq!(resolve(&dir, "account.json").unwrap(), path);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn binding_reuses_a_valid_device_or_generates_a_uuid_without_writing_the_file() {
+    let root = temp_root();
+    let path = root.join("auth/account.json");
+    for partition in [
+        serde_json::json!({"device_id":"AD674BB2-09CC-4CF0-AC43-970AE5557235"}),
+        serde_json::json!({"device_id":"invalid"}),
+        serde_json::json!({"device_id":7}),
+        serde_json::json!({}),
+        serde_json::json!("not-a-partition"),
+        Value::Null,
+    ] {
+        let body = serde_json::json!({"siwc":partition}).to_string();
+        std::fs::write(&path, &body).unwrap();
+        let id = device_id(&path).unwrap();
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+        assert_eq!(id, id.to_ascii_lowercase());
+        if partition["device_id"].as_str().is_some_and(|s| s.starts_with("AD674")) {
+            assert_eq!(id, "ad674bb2-09cc-4cf0-ac43-970ae5557235");
+        } else {
+            assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 4);
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+    }
+    std::fs::write(&path, "{").unwrap();
+    assert!(device_id(&path).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn binding_tokens() -> Tokens {
+    Tokens {
+        access_token: "bound-access".into(),
+        refresh_token: "bound-refresh".into(),
+        id_token: "bound-id".into(),
+        client_id: "issued-client".into(),
+        scope: "openid chatgpt.tokens.use.direct".into(),
+        scopes: vec!["openid".into(), "chatgpt.tokens.use.direct".into()],
+        expired: "2026-11-12T14:30:00Z".into(),
+        expires_at: "2026-11-12T14:33:00Z".into(),
+        last_refresh: "2026-11-12T13:33:00Z".into(),
+        device_id: "ad674bb2-09cc-4cf0-ac43-970ae5557235".into(),
     }
 }
 
 #[test]
-fn siwc_bind_matches_go() {
-    let go = golden();
-    for case in go["resolve"].as_array().unwrap() {
-        let root = temp_root();
-        let (dir, out) = (root.join("auth"), root.join("out"));
-        let expand = |s: &str| {
-            s.replace("$DIR", &dir.to_string_lossy())
-                .replace("$OUT", &out.to_string_lossy())
-        };
-        write_files(&out, &case["outside"], &expand);
-        write_files(&dir, &case["files"], &expand);
-        let auth_dir = expand(case["auth_dir"].as_str().unwrap());
-        match resolve(Path::new(&auth_dir), &expand(case["target"].as_str().unwrap())) {
-            Ok(path) => assert_eq!(
-                path,
-                PathBuf::from(expand(
-                    case["result"].as_str().unwrap_or_else(|| panic!("{case}: {path:?}"))
-                )),
-                "{}",
-                case["name"]
-            ),
-            Err(e) => assert_error(case, &e, &expand),
-        }
-        let _ = std::fs::remove_dir_all(root);
+fn binding_atomically_replaces_siwc_and_preserves_outer_tokens_and_operator_fields() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_root();
+    let dir = root.join("auth");
+    let path = dir.join("account.json");
+    let original = serde_json::json!({"type":"codex","access_token":"outer-access","refresh_token":"outer-refresh",
+        "note":"<operator>&","siwc":{"access_token":"stale","stale":"discard"},"use_siwc":false});
+    std::fs::write(&path, original.to_string()).unwrap();
+    save(&path, &binding_tokens()).unwrap();
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for key in ["type", "access_token", "refresh_token", "note"] {
+        assert_eq!(saved[key], original[key], "{key}");
     }
+    assert_eq!(saved["use_siwc"], true);
+    assert_eq!(
+        saved["siwc"],
+        serde_json::json!({
+            "access_token":"bound-access","refresh_token":"bound-refresh","id_token":"bound-id","client_id":"issued-client",
+            "scope":"openid chatgpt.tokens.use.direct","scopes":["openid","chatgpt.tokens.use.direct"],
+            "expired":"2026-11-12T14:30:00Z","expires_at":"2026-11-12T14:33:00Z","last_refresh":"2026-11-12T13:33:00Z",
+            "device_id":"ad674bb2-09cc-4cf0-ac43-970ae5557235"
+        })
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            std::ffi::OsString::from("account.json"),
+            std::ffi::OsString::from("account.json.lock")
+        ],
+        "no leftover publish temporary"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
 
-    for case in go["device"].as_array().unwrap() {
-        let root = temp_root();
-        let dir = root.join("auth");
-        write_files(&dir, &case["files"], &|s| s.to_owned());
-        match device_id(&dir.join("c.json")) {
-            Ok(id) if case["device"] == "generated" => {
-                assert!(
-                    crate::codex_siwc::is_valid_uuid(&id) && id == id.go_lower(),
-                    "{case}: {id}"
-                );
-                assert!(!case["files"]["c.json"].as_str().unwrap().go_lower().contains(&id));
-            }
-            Ok(id) => assert_eq!(id, case["device"].as_str().unwrap(), "{}", case["name"]),
-            Err(e) => assert_error(case, &e, &|s| s.to_owned()),
-        }
-        let _ = std::fs::remove_dir_all(root);
+#[test]
+fn binding_save_refuses_invalid_or_missing_files_without_destroying_original_bytes() {
+    let root = temp_root();
+    let path = root.join("auth/account.json");
+    for invalid in ["{", "null", r#"{"type":"claude"}"#] {
+        std::fs::write(&path, invalid).unwrap();
+        assert!(save(&path, &binding_tokens()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid);
     }
+    std::fs::remove_file(&path).unwrap();
+    assert!(save(&path, &binding_tokens()).is_err());
+    assert!(!path.exists());
+    let spaced = root.join("auth/trailing.json ");
+    std::fs::write(&spaced, OUTER).unwrap();
+    save(&spaced, &binding_tokens()).unwrap();
+    assert!(spaced.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
 
-    let tokens = Tokens {
-        access_token: "siwc-at".into(),
-        refresh_token: "siwc-rt".into(),
-        id_token: "siwc-id".into(),
-        client_id: "issued-client".into(),
-        scope: "openid chatgpt.tokens.use.direct".into(),
-        scopes: vec!["openid".into(), "chatgpt.tokens.use.direct".into()],
-        expired: "2026-10-22T18:00:00Z".into(),
-        // The v8.0.35 golden predates `expires_at` (Go v8.0.67 06fd5b8b).
-        expires_at: String::new(),
-        last_refresh: "2026-10-22T17:00:00Z".into(),
-        device_id: "e61bbe28-07ef-466d-8e5d-a344f94ab305".into(),
-    };
-    for case in go["save"].as_array().unwrap() {
-        let root = temp_root();
-        let dir = root.join("auth");
-        write_files(&dir, &case["files"], &|s| s.to_owned());
-        let path = dir.join(case["target"].as_str().filter(|t| !t.is_empty()).unwrap_or("c.json"));
-        match save(&path, &tokens) {
-            Ok(()) => assert_eq!(
-                std::fs::read_to_string(&path).unwrap(),
-                case["result"].as_str().unwrap_or_else(|| panic!("{case}: saved")),
-                "{}",
-                case["name"]
+#[test]
+fn binding_callbacks_decode_query_fragment_issued_client_and_oauth_denials() {
+    for (input, code, state, client, error, description) in [
+        (
+            "http://127.0.0.1:1455/auth/callback?code=issued&state=nonce&client_id=%20client%20",
+            "issued",
+            "nonce",
+            "client",
+            "",
+            "",
+        ),
+        (
+            "?code=issued&state=nonce#client_id=fragment",
+            "issued",
+            "nonce",
+            "fragment",
+            "",
+            "",
+        ),
+        (
+            "?code=issued&state=nonce&client_id=query#client_id=fragment",
+            "issued",
+            "nonce",
+            "query",
+            "",
+            "",
+        ),
+        (
+            "http://localhost/cb#code=issued&state=nonce&client_id=fragment",
+            "issued",
+            "nonce",
+            "fragment",
+            "",
+            "",
+        ),
+        (
+            "?error=access_denied&error_description=denied&client_id=client",
+            "",
+            "",
+            "client",
+            "access_denied",
+            "denied",
+        ),
+        (
+            "?error_description=denied&client_id=client",
+            "",
+            "",
+            "client",
+            "denied",
+            "",
+        ),
+    ] {
+        let c = parse_callback_input(input).unwrap().unwrap();
+        assert_eq!(
+            (
+                c.code.as_str(),
+                c.state.as_str(),
+                c.client_id.as_str(),
+                c.error.as_str(),
+                c.description.as_str()
             ),
-            Err(e) => assert_error(case, &e, &|s| s.to_owned()),
-        }
-        // Go's lock file (`canonicalLockPath` + `.lock`) stays beside the credential.
-        let mut listing: Vec<String> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        listing.sort();
-        let want: Vec<String> = serde_json::from_value(case["listing"].clone()).unwrap();
-        assert_eq!(listing, want, "{}", case["name"]);
-        let _ = std::fs::remove_dir_all(root);
+            (code, state, client, error, description)
+        );
     }
-
-    for case in go["callback"].as_array().unwrap() {
-        let input = case["input"].as_str().unwrap();
-        let s = |k: &str| case[k].as_str().unwrap_or_default().to_owned();
-        match parse_callback_input(input) {
-            Ok(Some(c)) => assert_eq!(
-                (c.code, c.state, c.client_id, c.error, c.description),
-                (s("code"), s("state"), s("client_id"), s("error"), s("desc")),
-                "{input}"
-            ),
-            Ok(None) => panic!("{input}: nothing parsed"),
-            Err(message) => assert_eq!(message, s("err"), "{input}"),
-        }
-    }
+    let callback = parse_callback_input("?code=issued%23nonce&client_id=")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            callback.code.as_str(),
+            callback.state.as_str(),
+            callback.client_id.as_str()
+        ),
+        ("issued", "nonce", "")
+    );
 }
 
 /// The whole command against a loopback token endpoint: the stored device ID reaches

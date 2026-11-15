@@ -795,103 +795,131 @@ mod tests {
         assert_eq!(changed_providers(&old, &new), ["xai"]);
     }
 
-    /// Go validateModelsCatalog: null entries, empty ids and duplicates in required
-    /// sections reject the catalog; empty sections and unvalidated ones do not.
+    /// Retained provider catalogs require nonempty unique IDs; decoder error prose is not a contract.
     #[test]
-    fn validate_catalog_follows_go() {
-        let check = |json: &str| validate_catalog(&serde_json::from_str(json).unwrap());
-        assert!(check(r#"{"claude":[]}"#).is_ok());
-        assert!(check(r#"{"gemini-cli":[{"id":"x"},{"id":"x"}]}"#).is_ok());
-        assert_eq!(check(r#"{"claude":[null]}"#).unwrap_err(), "claude[0] is null");
-        assert_eq!(
-            check(r#"{"xai":[{"id":"a"},{"id":" "}]}"#).unwrap_err(),
-            "xai[1] has empty id"
-        );
-        assert_eq!(
-            check(r#"{"meta":[{"id":"m"},{"id":" m "}]}"#).unwrap_err(),
-            "meta contains duplicate model id \"m\""
+    fn retained_catalog_sections_reject_invalid_model_identities() {
+        let check = |value: Value| validate_catalog(value.as_object().unwrap());
+        for section in ["claude", "codex-pro", "xai", "meta"] {
+            assert!(check(serde_json::json!({section: []})).is_ok());
+            for models in [
+                serde_json::json!([null]),
+                serde_json::json!([{"id": " "}]),
+                serde_json::json!([{"id":"same"},{"id":" same "}]),
+            ] {
+                assert!(check(serde_json::json!({section: models})).is_err(), "{section}");
+            }
+        }
+        assert!(
+            check(serde_json::json!({"gemini-cli": [{"id":"x"},{"id":"x"}]})).is_ok(),
+            "removed sections are not routed (#49)"
         );
     }
 
-    /// Go 1.26.4 `json.Unmarshal` into `registry.ModelInfo`, then `json.Marshal`
-    /// (recorded from the v8.0.35 reference); `None` where Go's decode fails.
+    /// Model field types and capabilities are checked semantically without JSON ordering or runtime coercion goldens.
     #[test]
-    fn models_decode_like_go_model_info() {
-        let cases: [(&str, Option<&str>); 11] = [
-            (
-                r#"{"id":"gemini-typed","InputTokenLimit":123,"supportedInputModalities":[null,"text"],"config":{"override_header":{"X-Test":null,"b":"<v>"}},"THINKING":{"Min":1,"levels":[null],"DISABLE_TYPE":"x"},"Display_Name":"D","created":-0,"native_capabilities":{"web_search":true},"unknown":{"a":[1.5]}}"#,
-                Some(
-                    r#"{"id":"gemini-typed","object":"","created":0,"owned_by":"","type":"","display_name":"D","inputTokenLimit":123,"supportedInputModalities":["","text"],"thinking":{"min":1,"disable_type":"x","levels":[""]},"config":{"override_header":{"X-Test":"","b":"<v>"}}}"#,
-                ),
-            ),
-            (
-                r#"{"id":"n","display_name":null,"thinking":null,"config":{},"supportedOutputModalities":[],"supports_web_search":true}"#,
-                Some(
-                    r#"{"id":"n","object":"","created":0,"owned_by":"","type":"","supports_web_search":true,"config":{}}"#,
-                ),
-            ),
-            (r#"{"id":"bad","inputTokenLimit":1.5}"#, None),
-            (r#"{"id":"bad","inputTokenLimit":1e2}"#, None),
-            (r#"{"id":"bad","inputTokenLimit":"5"}"#, None),
-            (r#"{"id":"bad","created":9223372036854775808}"#, None),
-            (r#"{"id":"bad","supportedInputModalities":[1]}"#, None),
-            (r#"{"id":"bad","config":{"override_header":{"a":1}}}"#, None),
-            (r#"{"id":"bad","native_capabilities":{"web_search":"yes"}}"#, None),
-            (r#"{"id":"bad","support_configuration_update":1}"#, None),
-            (r#"{"id":"bad","thinking":[]}"#, None),
+    fn model_schema_preserves_capabilities_and_rejects_invalid_field_types() {
+        let model = serde_json::json!({
+            "id": "claude-test", "type": "claude", "created": 123,
+            "display_name": "Test <model>", "inputTokenLimit": 4096,
+            "supportedInputModalities": ["text", "image"],
+            "thinking": {"min": 1024, "max": 2048, "levels": ["low", "high"]},
+            "config": {"override_header": {"X-Test": "<value>"}},
+            "native_capabilities": {"web_search": true}
+        });
+        let decoded = go_model_json(model.as_object().unwrap()).unwrap();
+        for key in [
+            "id",
+            "type",
+            "created",
+            "display_name",
+            "inputTokenLimit",
+            "supportedInputModalities",
+            "thinking",
+            "config",
+        ] {
+            assert_eq!(decoded[key], model[key], "{key}");
+        }
+        let fields = [
+            ("inputTokenLimit", serde_json::json!(1.5)),
+            ("inputTokenLimit", serde_json::json!("5")),
+            ("created", serde_json::json!(9223372036854775808u64)),
+            ("supportedInputModalities", serde_json::json!([1])),
+            ("config", serde_json::json!({"override_header": {"a":1}})),
+            ("native_capabilities", serde_json::json!({"web_search":"yes"})),
+            ("support_configuration_update", serde_json::json!(1)),
+            ("thinking", serde_json::json!([])),
         ];
-        for (input, want) in cases {
-            let got = go_model_json(&serde_json::from_str(input).unwrap()).ok();
-            // Go escapes `<` and `>`; the management writer does too, serde does not.
-            let want: Option<Value> = want.map(|w| serde_json::from_str(w).unwrap());
-            assert_eq!(
-                got.as_ref().map(Value::to_string),
-                want.as_ref().map(Value::to_string),
-                "{input}"
+        for (field, value) in fields {
+            let mut malformed = model.clone();
+            malformed[field] = value;
+            assert!(
+                go_model_json(malformed.as_object().unwrap()).is_err(),
+                "{field}: {malformed}"
             );
         }
-        // The embedded catalog decodes as Go's does.
+        // Null optional fields and unknown extensions must not invalidate a catalog.
+        let optional = go_model_json(
+            serde_json::json!({"id":"optional", "display_name": null, "thinking":null, "extension": {"x":true}})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(optional["id"], "optional");
         decode_catalog(&serde_json::from_str(MODELS_JSON).unwrap()).unwrap();
         check_catalog_members(MODELS_JSON).unwrap();
     }
 
-    /// Go v8.0.35's retained section sizes plus the K1 additions (#68): Claude Fable 5.2,
-    /// GPT-6.1 Terra in each Codex tier and Muse Ember 1.0 (docs/DIFFERENCES-FROM-GO.md).
-    /// This is the catalog served when no remote catalog was read.
+    /// The embedded catalog has complete retained channels and valid model identities, without historical population counts.
     #[test]
-    fn embedded_catalog_channel_sizes() {
+    fn embedded_catalog_has_valid_unique_models_for_retained_channels() {
         let catalog = catalog(MODELS_JSON);
-        let sizes: Vec<(&str, usize)> = catalog.channels.iter().map(|(n, m)| (n.as_str(), m.len())).collect();
+        let channels: std::collections::BTreeSet<_> = catalog.channels.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
-            sizes,
+            channels,
             [
-                ("claude", 19 + 1),
-                ("codex-free", 5 + 1),
-                ("codex-team", 9 + 1),
-                ("codex-plus", 9 + 1),
-                ("codex-pro", 9 + 1),
-                ("xai", 12),
-                ("meta", 9 + 1),
+                "claude",
+                "codex-free",
+                "codex-team",
+                "codex-plus",
+                "codex-pro",
+                "xai",
+                "meta"
             ]
+            .into()
         );
+        for (channel, models) in &catalog.channels {
+            assert!(!models.is_empty(), "{channel}: no built-in models");
+            let mut ids = std::collections::HashSet::new();
+            for model in models {
+                assert!(!model.id.trim().is_empty(), "{channel}");
+                assert!(ids.insert(&model.id), "{channel}: duplicate {}", model.id);
+                assert_eq!(model.raw["id"], model.id);
+            }
+        }
     }
 
+    /// Provider-specific lookup remains available when a fallback ID occurs in several catalogs.
     #[test]
-    fn lookup_follows_go_search_order_across_providers() {
-        let catalog = pinned();
-        assert_eq!(catalog.lookup("claude-sonnet-4-6").unwrap().kind, "claude");
-        // The removed providers' sections are gone (issue #49).
-        assert!(catalog.lookup("gemini-3-flash").is_none());
-        assert!(catalog.lookup("kimi-k2.5").is_none());
+    fn lookup_has_explicit_provider_priority_for_duplicate_ids() {
+        let catalog = catalog(
+            r#"{"meta":[{"id":"shared","type":"meta"}],"xai":[{"id":"shared","type":"xai"}],"codex-pro":[{"id":"shared","type":"codex"}],"claude":[{"id":"shared","type":"claude"}]}"#,
+        );
+        assert_eq!(catalog.lookup("shared").unwrap().kind, "claude");
+        assert_eq!(catalog.channel("xai")[0].kind, "xai");
         assert!(catalog.lookup("").is_none());
-        assert!(catalog.lookup("no-such-model").is_none());
+        assert!(catalog.lookup("missing").is_none());
+        assert!(pinned().lookup("gemini-3-flash").is_none());
+        assert!(pinned().lookup("kimi-k2.5").is_none());
     }
 
     #[test]
-    fn raw_definition_keeps_published_key_order() {
+    fn raw_definition_preserves_model_fields_and_thinking_metadata() {
         let haiku = &pinned().channel("claude")[0];
-        let keys: Vec<&str> = haiku.raw.keys().map(String::as_str).collect();
-        assert_eq!(&keys[..4], ["id", "object", "created", "owned_by"]);
-        assert_eq!(haiku.thinking.as_ref().unwrap().min, 1024);
+        for key in ["id", "object", "created", "owned_by"] {
+            assert!(haiku.raw.contains_key(key), "missing {key}");
+        }
+        assert_eq!(haiku.raw["id"], haiku.id);
+        assert_eq!(haiku.raw["thinking"]["min"], haiku.thinking.as_ref().unwrap().min);
+        assert!(haiku.thinking.as_ref().unwrap().min > 0);
     }
 }

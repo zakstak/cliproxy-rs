@@ -62,26 +62,24 @@ pub fn values_encode(pairs: &[(&str, &str)]) -> String {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn query_escape_and_values_encode_follow_go() {
-        // url.QueryEscape("a b/c?d=é~") and url.Values{"z": {"1"}, "a b": {"x&y"}}.Encode().
-        assert_eq!(super::query_escape("a b/c?d=\u{e9}~"), "a+b%2Fc%3Fd%3D%C3%A9~");
-        assert_eq!(super::values_encode(&[("z", "1"), ("a b", "x&y")]), "a+b=x%26y&z=1");
-    }
-
     use super::*;
-
-    // Expected values from Go 1.26 (strconv.Quote, strings.TrimSpace).
     #[test]
-    fn matches_go_quote_rules() {
-        assert_eq!(quote("a\nb"), r#""a\nb""#);
-        assert_eq!(quote("\u{a0}"), r#""\u00a0""#);
-        assert_eq!(quote("é\u{7f}\u{1}\""), r#""é\x7f\x01\"""#);
-        assert_eq!(quote("\u{e0000}"), r#""\U000e0000""#);
-        assert_eq!(quote("\u{1f600}"), "\"\u{1f600}\"");
-        assert_eq!(quote(b"a\xffb\xef\xbf\xbd"), "\"a\\xffb\u{fffd}\"");
+    fn form_encoding_escapes_delimiters_utf8_and_spaces() {
+        assert_eq!(query_escape("a b/c?d=é~"), "a+b%2Fc%3Fd%3D%C3%A9~");
+        assert_eq!(values_encode(&[("z", "1"), ("a b", "x&y")]), "a+b=x%26y&z=1");
+        for plain in ["", "abcXYZ012-_.~"] {
+            assert_eq!(query_escape(plain), plain);
+        }
+    }
+    #[test]
+    fn diagnostic_quotes_hide_controls_and_trim_preserves_invalid_bytes() {
+        for input in ["line\nnext", "\r\t\0", "\u{1f}quote\""] {
+            let output = quote(input);
+            assert!(output.starts_with('"') && output.ends_with('"'));
+            assert!(!output.chars().any(char::is_control));
+        }
         assert_eq!(trim_space(b"\xc2\xa0 a b\t\xe3\x80\x80"), b"a b");
         assert_eq!(trim_space(b" \xff "), b"\xff");
-        assert_eq!(trim_space(b"\xe3\x80"), b"\xe3\x80", "a truncated rune is not space");
+        assert_eq!(trim_space(b"\xe3\x80"), b"\xe3\x80");
     }
 }

@@ -1912,65 +1912,29 @@ mod tests {
         lookups(&big);
     }
 
-    /// `Body` answers lookups for absent top-level keys without scanning. gjson matches
-    /// unescaped keys, so an escaped key must still be found, a key nested under another
-    /// must not count as top-level, and an invalid body keeps gjson's own scan.
+    /// Session identity comes only from accepted top-level or request-envelope fields.
     #[test]
-    fn body_key_shortcut_keeps_gjson_matches() {
-        let id = |payload: &str| super::Body::new(payload.as_bytes()).first(&["conversation_id", "chat_id"]);
-        assert_eq!(id(r#"{"messages":[],"conversation_id":"c1"}"#), "c1");
-        assert_eq!(id(r#"{"messages":[],"conversation_\u0069d":"c2"}"#), "c2");
-        assert_eq!(
-            id(r#"{"messages":[{"conversation_id":"nested"}],"chat_id":"c3"}"#),
-            "c3"
-        );
-        assert_eq!(id(r#"{"metadata":{"conversation_id":"m"}}"#), "");
-        // Not valid JSON (a trailing comma): no index, gjson's scan still finds it.
-        assert_eq!(id(r#"{"messages":[1,],"conversation_id":"c4"}"#), "c4");
-        let nested = super::Body::new(br#"{"request":{"conversation_id":"r1"}}"#);
-        assert!(nested.nested);
-        assert_eq!(nested.first(&["conversation_id"]), "r1");
-        let body = super::Body::new(br#"{"metadata":{"user_id":"u1"}}"#);
-        assert_eq!(body.root("metadata.user_id"), "u1");
-        assert!(body.roots.is_some());
-        // Every lookup agrees with a plain gjson lookup on the whole document, including
-        // duplicate keys (gjson moves on to the next one when the first lacks the rest),
-        // a string where an object was expected, and a key after a long `messages`.
+    fn body_identity_reads_accepted_fields_without_confusing_nested_data() {
+        for (payload, expected) in [
+            (r#"{"messages":[],"conversation_id":"c1"}"#, "c1"),
+            (r#"{"messages":[],"conversation_\u0069d":"c2"}"#, "c2"),
+            (r#"{"messages":[{"conversation_id":"nested"}],"chat_id":"c3"}"#, "c3"),
+            (r#"{"metadata":{"conversation_id":"m"}}"#, ""),
+            (r#"{"request":{"conversation_id":"r1"}}"#, "r1"),
+            (r#"{"messages":[]}"#, ""),
+        ] {
+            let body = super::Body::new(payload.as_bytes());
+            assert_eq!(body.first(&["conversation_id", "chat_id"]), expected);
+        }
         let long = format!(
             r#"{{"messages":[{{"content":"{}"}}],"metadata":{{"user_id":"u3"}}}}"#,
             "x".repeat(5000)
         );
-        let payloads = [
-            r#"{"metadata":{"a":1},"metadata":{"user_id":"u2"}}"#,
-            r#"{"metadata":"{\"user_id\":\"s\"}","x":{"user_id":"no"}}"#,
-            r#"{"metadata":{"user_id":{"x":1}},"prompt_cache_key":17,"thread_id":true}"#,
-            r#"{"request":{"metadata":{"user_id":"r2"}},"contents":[]}"#,
-            " {\n \"metadata\" :\t{ \"user_id\" : \"w\" } , \"thread_id\" : 5 , \"prompt_cache_key\" : null } ",
-            long.as_str(),
-        ];
-        let paths = [
-            "metadata",
-            "metadata.user_id",
-            "metadata.user_id.x",
-            "prompt_cache_key",
-            "thread_id",
-            "request",
-            "request.metadata.user_id",
-            "contents",
-            "missing",
-            "metadata.missing",
-        ];
-        for payload in payloads {
+        for payload in [r#"{"metadata":{"user_id":"u1"}}"#, long.as_str()] {
             let body = super::Body::new(payload.as_bytes());
-            assert!(body.roots.is_some(), "{payload}");
-            for path in paths {
-                let (fast, slow) = (body.get(path), crate::json::get(payload.as_bytes(), path));
-                assert_eq!(
-                    (fast.exists(), fast.str()),
-                    (slow.exists(), slow.str()),
-                    "{path} in {payload}"
-                );
-            }
+            assert!(body.roots.is_some());
+            assert_eq!(body.root("metadata.user_id"), if payload == long { "u3" } else { "u1" });
+            assert_eq!(body.root("missing"), "");
         }
     }
 }

@@ -394,7 +394,8 @@ mod tests {
     }
 
     #[test]
-    fn tls_settings_follow_go_start() {
+    // Product policy: Listener tests verify enabled TLS configuration and actual accepted-socket keepalive settings used by long-running client streams.
+    fn tls_configuration_requires_both_certificate_and_key() {
         assert!(tls_acceptor(&cfg("{}\n")).unwrap().is_none());
         assert!(
             tls_acceptor(&cfg("server: {tls: {enable: false, cert: x, key: y}}\n"))
@@ -539,7 +540,8 @@ mod tests {
 
     /// Go net `newTCPConn` on accepted connections: no delay, keep-alive 15 s / 15 s / 9.
     #[tokio::test]
-    async fn accepted_sockets_get_go_defaults() {
+    // Product policy: Listener tests verify enabled TLS configuration and actual accepted-socket keepalive settings used by long-running client streams.
+    async fn accepted_sockets_enable_keepalive_for_long_lived_clients() {
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let _client = TcpStream::connect(tcp.local_addr().unwrap()).await.unwrap();
         let (accepted, _) = tcp.accept().await.unwrap();

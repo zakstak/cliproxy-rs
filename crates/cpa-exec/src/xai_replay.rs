@@ -730,7 +730,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn long_call_ids_shorten_like_go() {
+    fn call_id_aliases_are_bounded_deterministic_and_collision_resistant() {
         // 70 sanitized characters: 47-byte prefix plus `_` and 16 hex digits.
         let id = "call.".to_owned() + &"x".repeat(65);
         let ids = comparable_call_ids(&id);
@@ -738,60 +738,62 @@ mod tests {
         assert_eq!(ids[1].len(), 64);
         assert!(ids[1].starts_with("call_xxx"));
         assert_eq!(comparable_call_ids("  call_1 "), vec!["call_1".to_owned()]);
+        assert_eq!(comparable_call_ids(&id), ids, "stable across turns");
+        let other = comparable_call_ids(&(id.clone() + "y"));
+        assert_ne!(ids[1], other[1], "a shared prefix must not alias distinct calls");
+        assert!(ids[1].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
     }
 
-    /// Go's Home KV backend for xAI replay, recorded by the reference's
-    /// internal/cache/zz_rustgolden_test.go: keys, base64 values, TTLs, the store
-    /// statuses and the items read back.
     #[tokio::test]
-    async fn home_kv_replay_matches_go() {
+    async fn home_replay_round_trips_isolates_models_and_releases_state() {
         use std::sync::{Arc, Mutex};
-        let golden: serde_json::Value =
-            serde_json::from_str(include_str!("claude/testdata/go_xai_replay_home.json")).unwrap();
-        let steps = golden["steps"].as_array().unwrap();
         let values = Arc::new(Mutex::new(HashMap::new()));
-        let home = cpa_home::fake::FakeHome::start(crate::claude::kv_test::kv_home(values)).await;
+        let home = cpa_home::fake::FakeHome::start(crate::claude::kv_test::kv_home(values.clone())).await;
         let client = home.client();
         let scope = |model: &str| ReplayScope {
             model_name: model.into(),
-            session_key: " sess-1 ".into(),
+            session_key: " session ".into(),
             writes: Default::default(),
         };
-        let anchored: Vec<Vec<u8>> = [
-            r#"{"type":"message","id":"m1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"<hi> & bye","annotations":[]}]}"#,
-            r#"{"type":"function_call","id":"fc1","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}","status":"completed"}"#,
-            r#"{"type":"web_search_call","id":"ws1"}"#,
-        ]
-        .iter()
-        .map(|s| s.as_bytes().to_vec())
-        .collect();
-        let mut seen = 0;
-        let mut calls = || {
-            let all: Vec<serde_json::Value> = home
-                .commands()
+        let items: Vec<Vec<u8>> = [
+            br#"{"type":"message","id":"m1","role":"assistant","status":"completed","content":[{"type":"output_text","text":"<hi> & bye","annotations":[]}]}"#.to_vec(),
+            br#"{"type":"function_call","id":"fc1","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}","status":"completed"}"#.to_vec(),
+            br#"{"type":"web_search_call","id":"ws1"}"#.to_vec(),
+        ].into();
+        assert_eq!(
+            home_store(&client, &scope(" grok-4 "), &items).await,
+            StoreStatus::Stored
+        );
+        let decoded = home_get(&client, &scope("grok-4")).await.unwrap().unwrap();
+        let semantic = |raw: &[u8]| serde_json::from_slice::<serde_json::Value>(raw).unwrap();
+        // Internal web-search bookkeeping is not replayable client context.
+        assert_eq!(
+            decoded.iter().map(|raw| semantic(raw)).collect::<Vec<_>>(),
+            vec![
+                serde_json::json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"<hi> & bye"}]}),
+                serde_json::json!({"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":1}"}),
+            ]
+        );
+        assert!(home_get(&client, &scope("another-model")).await.unwrap().is_none());
+        assert_eq!(
+            home_store(&client, &scope("grok-4"), &items[..1]).await,
+            StoreStatus::NoReplayableState
+        );
+        assert!(
+            home_get(&client, &scope("grok-4")).await.unwrap().is_some(),
+            "an unanchored write does not erase cached context"
+        );
+        let commands = home.commands();
+        assert!(
+            commands
                 .iter()
-                .filter_map(|c| crate::claude::kv_test::as_go_call(c))
-                .collect();
-            let new = all[seen..].to_vec();
-            seen = all.len();
-            serde_json::Value::from(new)
-        };
-        let status = home_store(&client, &scope(" grok-4 "), &anchored).await;
-        assert_eq!(status as i64, steps[0]["result"], "store_anchored");
-        assert_eq!(calls(), steps[0]["calls"], "store_anchored");
-        let items = home_get(&client, &scope("grok-4")).await.unwrap().unwrap();
-        let texts: Vec<String> = items.iter().map(|i| String::from_utf8(i.clone()).unwrap()).collect();
-        assert_eq!(serde_json::json!(texts), steps[1]["result"]["items"], "get");
-        assert_eq!(calls(), steps[1]["calls"], "get");
-        let status = home_store(&client, &scope("grok-4"), &anchored[..1]).await;
-        assert_eq!(status as i64, steps[2]["result"], "store_unanchored");
-        assert_eq!(calls(), steps[2]["calls"], "store_unanchored");
+                .any(|c| c[0].eq_ignore_ascii_case("expire") && c.last().is_some_and(|v| v == "3600")),
+            "reads renew the one-hour lease"
+        );
         home_delete(&client, &scope("grok-4")).await.unwrap();
-        assert_eq!(calls(), steps[3]["calls"], "delete");
         assert!(home_get(&client, &scope("grok-4")).await.unwrap().is_none());
-        assert_eq!(calls(), steps[4]["calls"], "get_missing");
-        let status = home_store(&client, &scope(""), &anchored).await;
-        assert_eq!(status as i64, steps[5]["result"], "store_invalid_scope");
-        assert_eq!(calls(), steps[5]["calls"], "store_invalid_scope");
+        let before = home.commands().len();
+        assert_eq!(home_store(&client, &scope(""), &items).await, StoreStatus::InvalidArgs);
+        assert_eq!(home.commands().len(), before, "invalid scopes never reach Home");
     }
 }

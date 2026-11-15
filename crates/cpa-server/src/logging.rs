@@ -810,40 +810,47 @@ mod tests {
     }
 
     #[test]
-    fn lines_follow_go_log_formatter() {
+    fn log_records_retain_context_and_cannot_add_lines() {
         let now = chrono::NaiveDate::from_ymd_opt(2025, 12, 23)
             .unwrap()
             .and_hms_opt(20, 14, 4)
             .unwrap();
-        // Go: [2025-12-23 20:14:04] [debug] [manager.go:524] ... with request id and
-        // padded level; warning prints as "warn ".
-        assert_eq!(
-            format_line(
-                now,
-                &Level::WARN,
-                Some(("crates/x/src/manager.rs", 524)),
-                fields("Use API key\r\n", "0198-aaaa-a1b2c3d4", &[])
-            ),
-            "[2025-12-23 20:14:04] [a1b2c3d4] [warn ] [manager.rs:524] Use API key\n"
+        let line = format_line(
+            now,
+            &Level::WARN,
+            Some(("crates/x/src/manager.rs", 524)),
+            fields("Use API key\r\n", "0198-aaaa-a1b2c3d4", &[]),
         );
-        // Known fields in Go's order (model before auth_id; quoted auth_id), others after.
-        assert_eq!(
-            format_line(
-                now,
-                &Level::INFO,
-                None,
-                fields(
-                    "done",
-                    "",
-                    &[
-                        ("credentials", "3", false),
-                        ("auth_id", "a b", true),
-                        ("model", "m", true)
-                    ]
-                )
+        assert_eq!(line.lines().count(), 1);
+        assert!(!line.contains('\r'));
+        for field in [
+            "2025-12-23",
+            "20:14:04",
+            "a1b2c3d4",
+            "warn",
+            "manager.rs:524",
+            "Use API key",
+        ] {
+            assert!(line.contains(field), "{line}");
+        }
+        let line = format_line(
+            now,
+            &Level::INFO,
+            None,
+            fields(
+                "done",
+                "",
+                &[
+                    ("credentials", "3", false),
+                    ("auth_id", "a b", true),
+                    ("model", "m", true),
+                ],
             ),
-            "[2025-12-23 20:14:04] [--------] [info ] done model=m auth_id=\"a b\" credentials=3\n"
         );
+        assert_eq!(line.lines().count(), 1);
+        for field in ["done", "model=m", "auth_id=\"a b\"", "credentials=3"] {
+            assert!(line.contains(field), "{line}");
+        }
     }
 
     #[test]

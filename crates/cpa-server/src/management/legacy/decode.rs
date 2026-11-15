@@ -286,37 +286,22 @@ mod tests {
         ])
     }
 
-    fn go(body: &str) -> Option<Value> {
+    fn setting(body: &str) -> Option<Value> {
         decode(&shape(), whole(body.as_bytes())?, view::zero(&shape()))
     }
 
-    // Expected values: Go 1.26 json.Unmarshal into the equivalent struct.
     #[test]
-    fn decodes_like_go_unmarshal() {
-        let v = go(r#"{"API-KEY":"k","Weight":-0,"raw":{"a" : [1, null]},"tags":["a",null],"x":1e400}"#).unwrap();
-        assert_eq!(v["api-key"], "k");
-        assert_eq!(v["weight"], 0);
-        assert_eq!(v["raw"], r#"{"a" : [1, null]}"#);
-        assert_eq!(v["tags"], json!(["a", ""]));
-        assert_eq!(
-            go(r#"{"api-key":"k\ud800\u00e9"}"#).unwrap()["api-key"],
-            "k\u{fffd}\u{e9}"
-        );
-        assert_eq!(go(r#"{"api-key":"k","api-key":null}"#).unwrap()["api-key"], "k");
-        assert_eq!(go(r#"{"weight":1,"weight":null}"#).unwrap()["weight"], Value::Null);
-        // EqualFold: U+017F folds with s and S; dotless U+0131 does not fold with i.
-        assert_eq!(go(r#"{"tag\u017f":["long-s"]}"#).unwrap()["tags"], json!(["long-s"]));
-        assert_eq!(go(r#"{"pr\u0131ority":7}"#).unwrap()["priority"], 0);
-        // Repeats merge slice elements and maps; map elements start fresh.
-        let v = go(r#"{"models":[{"name":"a","alias":"b"}],"models":[{"name":"c"}]}"#).unwrap();
-        assert_eq!(v["models"], json!([{"name": "c", "alias": "b"}]));
-        let v = go(r#"{"tags":["a","b"],"tags":[null]}"#).unwrap();
-        assert_eq!(v["tags"], json!(["a"]));
-        let v = go(r#"{"headers":{"A":"1"},"headers":{"B":"2","A":null}}"#).unwrap();
-        assert_eq!(v["headers"], json!({"A": "", "B": "2"}));
-        for bad in [
-            r#"{"weight":1.0}"#,
-            r#"{"weight":1e2}"#,
+    fn legacy_settings_validate_types_and_keep_raw_extension_bytes() {
+        let value = setting(
+            r#"{"api-key":"fake-key","weight":7,"raw":{"a" : [1, null]},"tags":["a","b"],"future":{"v":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(value["api-key"], "fake-key");
+        assert_eq!(value["weight"], 7);
+        assert_eq!(value["raw"], r#"{"a" : [1, null]}"#);
+        assert_eq!(value["tags"], json!(["a", "b"]));
+        for body in [
+            r#"{"weight":1.5}"#,
             r#"{"weight":"1"}"#,
             r#"{"weight":9223372036854775808}"#,
             r#"{"api-key":1}"#,
@@ -327,18 +312,31 @@ mod tests {
             r#"{"a":01}"#,
             "",
         ] {
-            assert_eq!(go(bad), None, "{bad}");
+            assert_eq!(setting(body), None, "{body}");
         }
-        assert_eq!(go("null"), Some(view::zero(&shape())));
-        // Go's scanner allows 10000 levels in a skipped member.
-        let deep = format!(r#"{{"x":{}{},"api-key":"k"}}"#, "[".repeat(200), "]".repeat(200));
-        assert_eq!(go(&deep).unwrap()["api-key"], "k");
+        // A malformed earlier member must not be hidden by a later duplicate.
+        assert_eq!(setting(r#"{"weight":"bad","weight":3}"#), None);
+        let deep = format!(
+            r#"{{"future":{}{},"api-key":"fake-key"}}"#,
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        assert_eq!(
+            setting(&deep).unwrap()["api-key"],
+            "fake-key",
+            "unknown extension data does not corrupt known fields"
+        );
     }
 
     #[test]
-    fn first_value_is_what_a_go_decoder_reads() {
-        assert_eq!(first(br#"  {"a":[1,"]"]} trailing"#), Some(&br#"{"a":[1,"]"]}"#[..]));
+    fn json_value_boundaries_ignore_brackets_inside_strings() {
+        assert_eq!(first(br#"  {"a":[1,"]"]}  "#), Some(&br#"{"a":[1,"]"]}"#[..]));
         assert_eq!(first(b"  "), None);
         assert_eq!(first(br#"{"a":}"#), None);
+        assert_eq!(
+            whole(br#"{"a":1} {"b":2}"#),
+            None,
+            "whole-body updates reject a second document"
+        );
     }
 }

@@ -237,40 +237,63 @@ pub fn is_hierarchy_parent(primary: &str, fallback: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
 
-    /// Go's alias cache and `isHierarchyParent` on the same inputs
-    /// (sdk/cliproxy/auth/zz_rustgolden_alias_test.go in the reference).
+    /// Alias relationships evolve under a fixed clock without changing hierarchy rules.
     #[test]
-    fn aliases_match_go() {
-        let golden: Value =
-            serde_json::from_str(include_str!("../tests/fixtures/go_home_session_aliases.json")).unwrap();
-        let base = Instant::now();
-        for scenario in golden["scenarios"].as_array().unwrap() {
-            let name = scenario["name"].as_str().unwrap();
-            let cache = SessionAliases::default();
-            let ttl = Duration::from_secs(scenario["ttl_secs"].as_u64().unwrap());
-            for (i, call) in scenario["calls"].as_array().unwrap().iter().enumerate() {
-                let at = base + Duration::from_secs(call["at_secs"].as_u64().unwrap());
-                let got = cache.canonical(
-                    call["primary"].as_str().unwrap(),
-                    call["fallback"].as_str().unwrap(),
-                    ttl,
-                    at,
-                );
-                assert_eq!(got, call["want"].as_str().unwrap(), "{name} call {i}");
-            }
+    fn alias_groups_join_merge_expire_and_keep_hierarchy_separate() {
+        let now = Instant::now();
+        let ttl = Duration::from_secs(60);
+        let at = |seconds| now + Duration::from_secs(seconds);
+        let cache = SessionAliases::default();
+        let primary = cache.canonical("session-a", "pck:shared", ttl, at(0));
+        assert_eq!(primary, "session-a");
+        assert_eq!(cache.canonical("pck:shared", "", ttl, at(10)), primary);
+        assert_eq!(cache.canonical("session-a", "", ttl, at(20)), primary);
+        assert_eq!(cache.canonical("pck:shared", "", ttl, at(81)), "pck:shared");
+        let cache = SessionAliases::default();
+        let primary = cache.canonical("pck:shared", "conversation-a", ttl, at(0));
+        cache.canonical("pck:shared", "conversation-b", ttl, at(1));
+        for alias in ["conversation-a", "conversation-b"] {
+            assert_eq!(cache.canonical(alias, "", ttl, at(2)), primary);
         }
-        for case in golden["hierarchy"].as_array().unwrap() {
-            let (primary, fallback) = (case["primary"].as_str().unwrap(), case["fallback"].as_str().unwrap());
-            assert_eq!(
-                is_hierarchy_parent(primary, fallback),
-                case["want"].as_bool().unwrap(),
-                "{primary:?} {fallback:?}"
-            );
+        let cache = SessionAliases::default();
+        let primary = cache.canonical("solo", "", ttl, at(0));
+        assert_eq!(cache.canonical("another", "solo", ttl, at(1)), primary);
+        assert_eq!(cache.canonical("another", "", ttl, at(2)), primary);
+        let cache = SessionAliases::default();
+        let primary = cache.canonical("session", "pck:first", ttl, at(0));
+        cache.canonical("session", "pck:second", ttl, at(1));
+        assert_eq!(cache.canonical("pck:second", "", ttl, at(2)), primary);
+        assert_eq!(
+            cache.canonical("pck:first", "", ttl, at(3)),
+            "pck:first",
+            "rotating prompt key releases old alias"
+        );
+        let cache = SessionAliases::default();
+        let first = cache.canonical("group-one", "alias-one", ttl, at(0));
+        cache.canonical("group-two", "alias-two", ttl, at(1));
+        assert_eq!(cache.canonical("alias-one", "alias-two", ttl, at(2)), first);
+        for alias in ["alias-two", "group-two"] {
+            assert_eq!(cache.canonical(alias, "", ttl, at(3)), first);
+        }
+        let cache = SessionAliases::default();
+        assert_eq!(cache.canonical("  ", "", Duration::ZERO, at(0)), "");
+        assert_eq!(cache.canonical(" session ", " ", Duration::ZERO, at(0)), "session");
+        assert_eq!(cache.canonical("session", "", Duration::ZERO, at(3599)), "session");
+        for (child, parent, expected) in [
+            ("a:agent:1", "root", true),
+            ("claude:child", "claude:root", true),
+            ("claude:child", "codex:root", false),
+            ("plain", "other", true),
+            ("plain", "pck:key", false),
+            ("same", "same", false),
+            ("", "x", false),
+            ("x", "", false),
+            (":child", ":parent", false),
+        ] {
+            assert_eq!(is_hierarchy_parent(child, parent), expected, "{child} -> {parent}");
         }
     }
-
     const MINUTE: Duration = Duration::from_secs(60);
 
     fn entries(cache: &SessionAliases) -> HashMap<String, Group> {

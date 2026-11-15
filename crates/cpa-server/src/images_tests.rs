@@ -5,7 +5,8 @@ use super::*;
 
 /// Expectations printed by Go 1.x `http.DetectContentType` for the same bytes.
 #[test]
-fn sniffs_like_go() {
+// Product policy: Content types follow recognizable file signatures and text/binary classification, so image and download responses receive usable MIME metadata.
+fn content_sniffing_recognizes_file_signatures_and_binary_text_boundaries() {
     let cases: [(&[u8], &str); 28] = [
         (b"", "text/plain; charset=utf-8"),
         (b"   ", "text/plain; charset=utf-8"),

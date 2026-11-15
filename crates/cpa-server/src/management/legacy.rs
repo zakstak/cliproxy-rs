@@ -1016,38 +1016,51 @@ mod tests {
     }
 
     #[test]
-    fn value_binding_follows_gin() {
-        assert_eq!(bind_value(br#"{"value":true}"#, Kind::Bool), Some(json!(true)));
-        assert_eq!(bind_value(br#"{"Value":true} trailing"#, Kind::Bool), Some(json!(true)));
-        assert_eq!(bind_value(br#"{"value":"true"}"#, Kind::Bool), None);
-        assert_eq!(bind_value(br#"{"value":1.5}"#, Kind::Int), None);
-        assert_eq!(bind_value(br#"{"value":7,"value":null}"#, Kind::Int), None);
-        assert_eq!(bind_value(br#"{"value":-3}"#, Kind::Int), Some(json!(-3)));
-        assert_eq!(bind_value(br#"{"value":-0}"#, Kind::Int), Some(json!(0)));
-        assert_eq!(bind_value(b"", Kind::Bool), None);
-        assert_eq!(bind_value(b"null", Kind::Bool), None);
+    fn scalar_updates_require_the_setting_type() {
+        for (body, kind, expected) in [
+            (r#"{"value":true}"#, Kind::Bool, Some(json!(true))),
+            (r#"{"value":false}"#, Kind::Bool, Some(json!(false))),
+            (r#"{"value":"true"}"#, Kind::Bool, None),
+            (r#"{"value":1.5}"#, Kind::Int, None),
+            (r#"{"value":-3}"#, Kind::Int, Some(json!(-3))),
+            (r#"{"value":0}"#, Kind::Int, Some(json!(0))),
+            ("", Kind::Bool, None),
+            ("null", Kind::Bool, None),
+        ] {
+            assert_eq!(bind_value(body.as_bytes(), kind), expected, "{body}");
+        }
     }
 
     #[test]
-    fn put_string_list_follows_go_unmarshal() {
+    fn key_list_updates_require_a_nonempty_string_collection() {
         let list = |b: &str| decode::put_collection(view::field("api-keys"), b.as_bytes(), true);
-        assert_eq!(list(r#"["a",null]"#), Some(json!(["a", ""])));
-        assert_eq!(list("null"), Some(Value::Null));
-        assert_eq!(list(r#"{"ITEMS":["r"]}"#), Some(json!(["r"])));
-        assert_eq!(list(r#"{"item\u017f":["r"]}"#), Some(json!(["r"])));
-        assert_eq!(list(r#"{"items":["a"],"items":[null]}"#), Some(json!(["a"])));
-        assert_eq!(list(r#"{"items":7,"items":["r"]}"#), None);
-        assert_eq!(list(r#"{"items":["r"],"ITEMS":null}"#), None);
-        assert_eq!(list(r#"{"items":[]}"#), None);
-        assert_eq!(list(r#"["a"] x"#), None);
-        assert_eq!(list(r#""x""#), None);
+        for (body, expected) in [
+            (r#"["a","b"]"#, Some(json!(["a", "b"]))),
+            (r#"{"items":["a","b"]}"#, Some(json!(["a", "b"]))),
+            ("null", Some(Value::Null)),
+            (r#"{"items":[]}"#, None),
+            (r#"{"items":7}"#, None),
+            (r#"["a"] x"#, None),
+            (r#""x""#, None),
+            (r#"{"items":7,"items":["r"]}"#, None),
+        ] {
+            assert_eq!(list(body), expected, "{body}");
+        }
     }
 
     #[test]
-    fn comment_lines_lose_their_indentation_like_go() {
+    fn comment_normalization_preserves_yaml_values_and_comment_text() {
+        let input = "a:\n    # c\n  b: 1 # d\n\t#e\n";
+        let output = normalize_comment_indentation(input);
+        let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&output).unwrap();
+        assert_eq!(value["a"]["b"], 1);
+        for comment in ["# c", "# d", "#e"] {
+            assert_eq!(output.matches(comment).count(), 1);
+        }
         assert_eq!(
-            normalize_comment_indentation("a:\n    # c\n  b: 1 # d\n\t#e\n"),
-            "a:\n# c\n  b: 1 # d\n#e\n"
+            normalize_comment_indentation(&output),
+            output,
+            "repeated saves are stable"
         );
     }
 

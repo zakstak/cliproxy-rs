@@ -29,10 +29,6 @@ pub struct Dashboard {
     pub vp: Viewport,
     width: usize,
     last: Option<Data>,
-    /// Sizes the cards to fit the screen. Go's `(width-2)/2` makes the pair three
-    /// columns wider than the terminal, which cuts the right card's border; the golden
-    /// test turns this off to compare with Go's exact layout.
-    pub(super) fit_cards: bool,
 }
 
 impl Dashboard {
@@ -42,7 +38,6 @@ impl Dashboard {
             vp: Viewport::default(),
             width: 0,
             last: None,
-            fit_cards: true,
         }
     }
 
@@ -136,9 +131,8 @@ impl Dashboard {
         ]);
         doc.blank();
 
-        let spare = if self.fit_cards { 5 } else { 2 };
         let card_width = if self.width > 0 {
-            ((self.width as i64 - spare) / 2).max(18) as usize
+            ((self.width as i64 - 5) / 2).max(18) as usize
         } else {
             25
         };

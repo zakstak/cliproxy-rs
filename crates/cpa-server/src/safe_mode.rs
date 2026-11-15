@@ -101,16 +101,23 @@ mod tests {
     use tower_service::Service;
 
     #[test]
-    fn templates_and_html_match_real_go() {
-        let cases: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/safe_mode_go.json")).unwrap();
-        for case in cases.as_array().unwrap() {
-            let keys: Vec<String> = serde_json::from_value(case["keys"].clone()).unwrap();
-            let expected: Vec<String> = serde_json::from_value(case["matches"].clone()).unwrap_or_default();
-            let found = examples(&keys);
-            assert_eq!(found, expected);
-            assert_eq!(warning(&found), case["html"].as_str().unwrap());
-        }
+    fn template_keys_are_detected_and_only_known_values_reach_html() {
+        let keys = vec![
+            "your-api-key-1".to_owned(),
+            "private-operator-key".to_owned(),
+            " your-api-key-2 ".to_owned(),
+        ];
+        let found = examples(&keys);
+        assert_eq!(found, ["your-api-key-1", "your-api-key-2"]);
+        assert!(examples(&["private-operator-key".to_owned()]).is_empty());
+        let hostile = vec!["<script>alert(1)</script>&\"".to_owned()];
+        assert!(examples(&hostile).is_empty());
+        let html = warning(&found);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("your-api-key-1"));
+        assert!(html.contains("your-api-key-2"));
+        assert!(!html.contains("private-operator-key"));
+        assert!(html.contains("safe-mode=configure"));
     }
 
     #[tokio::test]

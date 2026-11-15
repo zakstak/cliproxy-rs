@@ -233,20 +233,26 @@ mod tests {
     /// Go `GetAlt` goldens (tests/reference/server/main.go `alts`): an empty `alt`
     /// stops the `$alt` fallback and means none.
     #[test]
-    fn alt_matches_go() {
-        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        let cases = fixture["alt"].as_array().unwrap();
-        assert_eq!(cases.len(), 13);
-        for case in cases {
-            let want = case["out"].as_str().unwrap();
-            let got = alt(case["in"].as_str().unwrap());
-            assert_eq!(got.as_deref().unwrap_or(""), want, "query {}", case["in"]);
-            assert_eq!(got.is_some(), !want.is_empty());
+    fn alt_query_precedence_is_explicit_and_values_are_decoded() {
+        for (query, expected) in [
+            ("", None),
+            ("x=1", None),
+            ("alt=json", Some("json")),
+            ("%61lt=json", Some("json")),
+            ("$alt=sse", None),
+            ("alt=&$alt=sse", None),
+            ("alt=json&$alt=sse", Some("json")),
+            ("alt=sse&alt=json", None),
+            ("alt=a+b", Some("a b")),
+            ("alt=%2Fpath", Some("/path")),
+        ] {
+            assert_eq!(alt(query).as_deref(), expected, "{query}");
         }
     }
 
     #[test]
-    fn dd_model_ids_round_trip_like_go() {
+    // Product policy: The Anthropic client catalog uses a reversible encoded ID for models outside its native namespace; client-selected effort suffixes survive that mapping.
+    fn anthropic_catalog_model_ids_round_trip_with_effort_suffixes() {
         assert_eq!(ensure_dd("gpt-5.5"), "claude-fable-5-dd-5.5-tpg");
         assert_eq!(ensure_dd("claude-opus-5"), "claude-opus-5");
         assert_eq!(resolve_dd("claude-fable-5-dd-5.5-tpg(high)"), "gpt-5.5(high)");

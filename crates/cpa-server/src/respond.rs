@@ -719,48 +719,52 @@ mod tests {
     /// Go `handlers.FilterUpstreamHeaders` (tests/reference/server/main.go
     /// `upstreamHeaderFilters`).
     #[test]
-    fn upstream_header_filter_matches_go() {
-        use std::collections::BTreeMap;
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        let as_map = |v: &serde_json::Value| -> BTreeMap<String, Vec<String>> {
-            v.as_object()
-                .unwrap()
-                .iter()
-                .map(|(k, vs)| {
-                    let values = vs.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_owned());
-                    (k.to_ascii_lowercase(), values.collect())
-                })
-                .collect()
-        };
-        let cases = fixture["upstream_headers"].as_array().unwrap();
-        assert_eq!(cases.len(), 2);
-        for case in cases {
-            let mut src = axum::http::HeaderMap::new();
-            for (name, values) in as_map(&case["in"]) {
-                for value in values {
-                    src.append(
-                        axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                        HeaderValue::from_str(&value).unwrap(),
-                    );
-                }
-            }
-            let got = filter_upstream_headers(&src);
-            let mut got_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-            for (name, value) in &got {
-                got_map
-                    .entry(name.as_str().to_owned())
-                    .or_default()
-                    .push(value.to_str().unwrap().to_owned());
-            }
-            assert_eq!(got_map, as_map(&case["out"]));
+    fn upstream_header_filter_preserves_extensions_and_removes_connection_metadata() {
+        let mut source = axum::http::HeaderMap::new();
+        let removed = [
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "set-cookie",
+            "content-length",
+            "content-encoding",
+            "x-cpa-trace-id",
+            "x-private-hop",
+        ];
+        for name in removed {
+            source.insert(name, HeaderValue::from_static("private"));
+        }
+        source.insert("connection", HeaderValue::from_static("X-Private-Hop, keep-alive"));
+        for prefix in ["x-litellm-", "helicone-", "x-portkey-", "cf-aig-", "x-kong-", "x-bt-"] {
+            source.insert(
+                axum::http::HeaderName::from_bytes(format!("{prefix}secret").as_bytes()).unwrap(),
+                HeaderValue::from_static("private"),
+            );
+        }
+        for name in ["content-type", "retry-after", "request-id", "x-provider-extension"] {
+            source.append(name, HeaderValue::from_static("first"));
+            source.append(name, HeaderValue::from_static("second"));
+        }
+        let filtered = filter_upstream_headers(&source);
+        for name in removed {
+            assert!(!filtered.contains_key(name), "{name}");
+        }
+        assert_eq!(filtered.keys().count(), 4);
+        for name in ["content-type", "retry-after", "request-id", "x-provider-extension"] {
+            assert_eq!(filtered.get_all(name).iter().collect::<Vec<_>>(), ["first", "second"]);
         }
     }
 
     /// Go `WriteUpstreamHeaders` never overwrites what the handler set;
     /// `WriteErrorResponse` replaces with the error's headers but keeps reserved ones.
     #[test]
-    fn upstream_and_error_header_writes_follow_go() {
+    // Product policy: Response metadata cannot overwrite handler-owned content type or trace identity; unsafe framing headers are dropped and safe extensions retain all values.
+    fn response_header_merges_preserve_handler_identity_and_drop_framing() {
         let headers = |pairs: &[(&'static str, &'static str)]| {
             let mut h = axum::http::HeaderMap::new();
             for (k, v) in pairs {

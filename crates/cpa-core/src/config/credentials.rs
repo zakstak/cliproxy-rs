@@ -1417,10 +1417,9 @@ fn clean(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// Go `buildCodexConfigModels`: name-only entries register under their name, an
-    /// alias with its display name.
+    /// Configured model names register directly, with aliases and display labels preserved.
     #[test]
-    fn config_models_reach_the_registry_like_go() {
+    fn configured_models_register_names_aliases_and_display_names() {
         let cfg = Config::parse(
             "api-keys:\n  codex:\n    - base-url: https://c.example.invalid\n      models: [{name: gpt-name-only}, {name: gpt-real, alias: friendly, display-name: Friendly}]\n      keys: [{api-key: k}]\n",
         )
@@ -1443,54 +1442,44 @@ mod tests {
         );
     }
 
-    /// yaml.v3 reads a plain scalar into a string field as its text, so a model name or
-    /// alias written as a number or boolean (`0x1F`, `1.50`, `007`, `true`, aliased or
-    /// merged in too) registers and executes as written, and so do exclusions and OAuth
-    /// model aliases (tests/reference/scalar_model_names).
+    /// Model names and aliases are opaque strings; routing and exclusions use the configured text.
     #[test]
     fn scalar_model_names_keep_their_yaml_text() {
-        let go: Json = serde_json::from_str(include_str!("../../tests/fixtures/scalar_model_names_go.json")).unwrap();
-        for section in ["yaml", "legacy", "lists", "legacy-lists"] {
-            // The removed providers' sections (issue #49) and their keys' models go.
-            let yaml = crate::removed::strip_settings(go[section]["yaml"].as_str().unwrap());
-            let cfg = Config::parse(&yaml).unwrap();
+        for text in ["1.50", "0x1F", "007", "true", "2001-12-14"] {
+            // Both layouts must route an alias to the literal upstream name, and
+            // exclusion must compare the literal configured spelling.
+            for yaml in [
+                format!(
+                    "claude-api-key: [{{api-key: k, models: [{{name: {text}, alias: friendly}}, {{name: drop}}], excluded-models: [drop]}}]\n"
+                ),
+                format!(
+                    "api-keys: {{claude: [{{keys: [{{api-key: k}}], models: [{{name: {text}, alias: friendly}}, {{name: drop}}], excluded-models: [drop]}}]}}\n"
+                ),
+            ] {
+                let cfg = Config::parse(&yaml).unwrap();
+                let aliases = crate::registry::dynamic::global_aliases(&cfg);
+                let credentials = from_config(&cfg);
+                assert_eq!(credentials.len(), 1);
+                let c = &credentials[0];
+                let models = crate::registry::dynamic::models_for(&cfg, &aliases, c, 0);
+                assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["friendly"]);
+                assert_eq!(
+                    crate::registry::dynamic::execution_models(&aliases, c, "friendly").0,
+                    [text]
+                );
+                let saved = crate::config::yaml_string(&cfg.document).unwrap();
+                assert_eq!(Config::parse(&saved).unwrap().document, cfg.document);
+            }
+            let cfg = Config::parse(&format!("oauth: {{excluded-models: {{claude: [{text}]}}, model-alias: {{claude: [{{name: {text}, alias: public}}]}}}}\n")).unwrap();
+            let normalized = if text == "0x1F" { "0x1f" } else { text };
+            assert_eq!(oauth_excluded(&cfg)["claude"], [normalized]);
             let aliases = crate::registry::dynamic::global_aliases(&cfg);
-            // Exclusions and OAuth model aliases, where Go has them.
-            if let Some(want) = go[section].get("oauth-excluded-models") {
-                assert_eq!(serde_json::to_value(oauth_excluded(&cfg)).unwrap(), *want, "{section}");
-            }
-            if let Some(want) = go[section].get("oauth-model-alias") {
-                let got: HashMap<&String, Vec<[&String; 2]>> = aliases
-                    .iter()
-                    .map(|(channel, entries)| (channel, entries.iter().map(|e| [&e.name, &e.alias]).collect()))
-                    .collect();
-                assert_eq!(serde_json::to_value(got).unwrap(), *want, "{section}");
-            }
-            let mut got = serde_json::Map::new();
-            for c in from_config(&cfg) {
-                let models: Vec<Json> = crate::registry::dynamic::models_for(&cfg, &aliases, &c, 0)
-                    .into_iter()
-                    .map(|m| {
-                        let upstream = crate::registry::dynamic::execution_models(&aliases, &c, &m.id)
-                            .0
-                            .remove(0);
-                        serde_json::json!([m.id, upstream])
-                    })
-                    .collect();
-                got.insert(c.attributes["api_key"].clone(), models.into());
-            }
-            let mut want = go[section]["models"].clone();
-            for removed in ["vk", "ok"] {
-                want.as_object_mut().unwrap().remove(removed);
-            }
-            assert_eq!(Json::Object(got), want, "{section}");
+            assert_eq!(aliases["claude"][0].name, text);
+            assert_eq!(aliases["claude"][0].alias, "public");
         }
-        // A payload rule's model name is a Go string too, but its params are untyped:
-        // a `models` list nested in them keeps its YAML types.
         let doc = crate::config::config_value(
             "requests:\n  payload:\n    override:\n      - models: [{name: 7}]\n        params: {metadata: {models: [{name: 123, alias: false}]}}\n",
-        )
-        .unwrap();
+        ).unwrap();
         let rule = &doc["requests"]["payload"]["override"][0];
         assert_eq!(rule["models"][0]["name"], Value::from("7"));
         let nested = &rule["params"]["metadata"]["models"][0];
@@ -1614,11 +1603,10 @@ mod tests {
         assert_eq!(credential.metadata["unknown"]["quota_probe"]["keep"], true);
     }
 
-    /// Go's synthesizer lowercases with `strings.ToLower`, which maps U+0130 (İ) to a
-    /// plain `i`; Rust's `to_lowercase` would give `i` plus a combining dot. Expected
-    /// values are Go's: `strings.ToLower("HİGH") == "high"`.
+    /// Saved credentials retain existing Unicode normalization at their file boundary.
+    /// Changing these identities would alter provider and exclusion lookup for existing files.
     #[test]
-    fn file_type_and_exclusions_lowercase_like_go() {
+    fn saved_credentials_keep_existing_unicode_normalization() {
         let cfg = Config::default();
         let raw = r#"{"type":"HİGH","excluded_models":["MİNİ"]}"#;
         let c = from_file(&cfg, Path::new("/auth"), Path::new("/auth/a.json"), raw.as_bytes())

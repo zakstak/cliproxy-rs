@@ -587,12 +587,11 @@ async fn codex_images_read_the_original_request_before_rewriting_it() {
     );
 }
 
-/// xAI keeps Go's Images ingress, and the Codex rules decide nothing for it: a repeated
-/// `stream` on an xAI model still reaches xAI. A repeated `model` cannot move a request
-/// between providers: Go's first `model` picks xAI, and then only the xAI credential is
-/// used; a first Codex `model` meets the Codex rules and nothing is sent anywhere.
+/// Credential isolation policy: duplicate routing members cannot move a request
+/// across providers or expose the other provider's credential. Existing xAI ingress
+/// keeps first-model selection, while Codex validates its own stricter contract.
 #[tokio::test]
-async fn xai_images_keep_go_ingress_and_duplicates_cannot_cross_providers() {
+async fn duplicate_image_routing_members_cannot_cross_provider_credentials() {
     let auth_dir = AuthDir::new();
     let (codex_url, codex_calls) = recording_upstream().await;
     let (xai_url, xai_calls) = recording_upstream().await;

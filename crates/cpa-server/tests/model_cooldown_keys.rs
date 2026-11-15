@@ -747,32 +747,63 @@ mod migrated_leases {
         let dir = auth_dir(name);
         let meta = json!({"type": "claude", "access_token": "sk-ant-oat01-FAKE", "account_uuid": "synthetic"});
         let c = Credential::from_file(&dir, &dir.join("a.json"), meta.as_object().unwrap().clone()).unwrap();
-        let now = SystemTime::now();
-        let record = |model: &str, millis: u64, quota: Quota| Record {
-            provider: "claude".into(),
-            auth_id: c.id.clone(),
-            model: model.into(),
-            status: "cooling".into(),
-            next_retry_after: Some(now + Duration::from_millis(millis)),
-            quota,
-            ..Default::default()
-        };
-        let mut records = vec![record(
-            bounded,
-            100,
-            Quota {
-                exceeded: true,
-                reason: "quota".into(),
-                next_recover_at: Some(now + Duration::from_secs(3600)),
-                trust_windows: Some(1),
-                ..Default::default()
-            },
-        )];
-        records.extend(unbounded.map(|m| record(m, 200, Quota::default())));
-        cpa_server::cooldown_store::save(&dir, records, now).unwrap();
-        let store = CredentialStore::new(vec![c.clone()]);
-        store.configure_cooldown_store(Some(dir.clone()));
-        std::thread::sleep(Duration::from_millis(300));
+        // A short saved deadline can expire during disk IO on a loaded machine.
+        // Establish the restored state before exercising migration; retry only that
+        // fixture creation when an absent record's real deadline already elapsed.
+        let store = (0..8)
+            .find_map(|_| {
+                let now = SystemTime::now();
+                let record = |model: &str, millis: u64, quota: Quota| Record {
+                    provider: "claude".into(),
+                    auth_id: c.id.clone(),
+                    model: model.into(),
+                    status: "cooling".into(),
+                    next_retry_after: Some(now + Duration::from_millis(millis)),
+                    quota,
+                    ..Default::default()
+                };
+                let mut records = vec![record(
+                    bounded,
+                    100,
+                    Quota {
+                        exceeded: true,
+                        reason: "quota".into(),
+                        next_recover_at: Some(now + Duration::from_secs(3600)),
+                        trust_windows: Some(1),
+                        ..Default::default()
+                    },
+                )];
+                records.extend(unbounded.map(|m| record(m, 200, Quota::default())));
+                cpa_server::cooldown_store::save(&dir, records.clone(), now).unwrap();
+                let store = CredentialStore::new(vec![c.clone()]);
+                store.configure_cooldown_store(Some(dir.clone()));
+                let restored = store.cooldowns(&c.id);
+                let mut expired_before_observation = false;
+                for record in &records {
+                    if restored.iter().any(|state| state.model == record.model) {
+                        continue;
+                    }
+                    assert!(
+                        SystemTime::now() >= record.next_retry_after.unwrap(),
+                        "live fixture record was not restored: {record:?}; states: {restored:?}"
+                    );
+                    expired_before_observation = true;
+                }
+                if expired_before_observation {
+                    return None;
+                }
+                assert_eq!(restored.len(), records.len(), "complete restored fixture");
+                let deadline = records
+                    .iter()
+                    .filter_map(|record| record.next_retry_after)
+                    .max()
+                    .unwrap();
+                if let Ok(remaining) = deadline.duration_since(SystemTime::now()) {
+                    std::thread::sleep(remaining);
+                }
+                Some(store)
+            })
+            .expect("saved cooldown fixtures expired during IO on all eight setup attempts");
         Setup {
             dir,
             store,

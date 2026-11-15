@@ -170,7 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn encodes_like_go_encode_resp_array() {
+    fn resp_arrays_count_bytes_and_preserve_argument_order() {
+        // RESP lengths count UTF-8 bytes, not Unicode scalar values.
+        assert_eq!(
+            encode(&["SET", "日本", ""]),
+            b"*3\r\n$3\r\nSET\r\n$6\r\n\xe6\x97\xa5\xe6\x9c\xac\r\n$0\r\n\r\n"
+        );
         assert_eq!(
             encode(&["CERTIFICATE", "REQUEST", "id", ""]),
             b"*4\r\n$11\r\nCERTIFICATE\r\n$7\r\nREQUEST\r\n$2\r\nid\r\n$0\r\n\r\n"

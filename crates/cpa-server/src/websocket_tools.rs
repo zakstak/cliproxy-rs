@@ -360,7 +360,8 @@ mod tests {
     }
 
     #[test]
-    fn session_key_follows_go_priority() {
+    // Product policy: Tool-history caches use explicit session identity before request-derived fallback to keep independent conversations isolated.
+    fn tool_history_keys_prefer_explicit_session_identity() {
         assert_eq!(
             session_key(&headers(&[("x-client-request-id", " req "), ("session-id", "s")])),
             "req"

@@ -137,7 +137,9 @@ impl TrustedProxies {
                 parse_cidr(entry)
             } else {
                 parse_ip(entry).and_then(|ip| {
-                    let bits = if go_bytes(ip).len() == 4 { 32 } else { 128 };
+                    // A literal names one host. Choose the prefix before mapped IPv6
+                    // addresses are reduced to IPv4 for membership comparisons.
+                    let bits = if ip.is_ipv4() { 32 } else { 128 };
                     parse_cidr(&format!("{entry}/{bits}"))
                 })
             };
@@ -198,16 +200,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mapped_entries_and_v4_cidrs_follow_go_byte_lengths() {
-        let mapped = TrustedProxies::new(&["::ffff:127.0.0.1".into()]);
-        // Go turns this into ::/32: IPv6 loopback matches, IPv4 never does.
-        assert!(mapped.contains("::1".parse().unwrap()));
-        assert!(!mapped.contains("127.0.0.1".parse().unwrap()));
-        let v4 = TrustedProxies::new(&["10.0.0.0/8".into()]);
-        assert!(v4.contains("::ffff:10.1.2.3".parse().unwrap()));
-        assert!(!v4.contains("11.0.0.1".parse().unwrap()));
-        let v4_in_v6 = TrustedProxies::new(&["::ffff:10.0.0.0/104".into()]);
-        assert!(v4_in_v6.contains("10.9.9.9".parse().unwrap()));
+    fn mapped_address_literals_trust_only_the_exact_canonical_host() {
+        for last in [1, 23, 254] {
+            let canonical = std::net::Ipv4Addr::new(192, 0, 2, last);
+            let mapped = canonical.to_ipv6_mapped();
+            let trusted = TrustedProxies::new(&[mapped.to_string()]);
+            assert!(trusted.contains(canonical.into()), "{mapped}: canonical host");
+            assert!(trusted.contains(mapped.into()), "{mapped}: mapped host");
+            let neighbor = std::net::Ipv4Addr::new(192, 0, 2, last ^ 1);
+            for outside in [
+                IpAddr::V4(neighbor),
+                IpAddr::V6(neighbor.to_ipv6_mapped()),
+                "::1".parse().unwrap(),
+                "::2".parse().unwrap(),
+            ] {
+                assert!(!trusted.contains(outside), "{mapped}: must not trust {outside}");
+                assert_eq!(
+                    trusted.client_ip(Some(SocketAddr::new(outside, 1234)), |_| Some(b"127.0.0.1")),
+                    outside.to_canonical().to_string(),
+                    "{mapped}: untrusted {outside} must not spoof loopback"
+                );
+            }
+            assert_eq!(
+                trusted.client_ip(Some(SocketAddr::new(mapped.into(), 1234)), |_| Some(b"198.51.100.7")),
+                "198.51.100.7",
+                "the exact mapped host can supply a forwarded client"
+            );
+        }
+    }
+
+    /// Trusted CIDRs apply to explicit network boundaries, including canonical IPv4-mapped peers.
+    #[test]
+    fn trusted_network_boundaries_reject_spoofed_forwarding() {
+        for (network, inside, outside) in [
+            ("10.0.0.0/8", "10.1.2.3", "11.0.0.1"),
+            ("10.0.0.0/8", "::ffff:10.1.2.3", "::1"),
+            ("::ffff:10.0.0.0/104", "10.9.9.9", "11.0.0.1"),
+            ("2001:db8::/32", "2001:db8::1", "2001:db9::1"),
+            ("::ffff:127.0.0.1/128", "127.0.0.1", "::1"),
+        ] {
+            let trusted = TrustedProxies::new(&[network.into()]);
+            assert!(trusted.contains(inside.parse().unwrap()), "{network}: {inside}");
+            assert!(!trusted.contains(outside.parse().unwrap()), "{network}: {outside}");
+            let peer = SocketAddr::new(outside.parse().unwrap(), 1234);
+            assert_eq!(
+                trusted.client_ip(Some(peer), |_| Some(b"127.0.0.1")),
+                peer.ip().to_canonical().to_string(),
+                "untrusted peer must not spoof a forwarded IP"
+            );
+        }
         assert_eq!(TrustedProxies::new(&["bogus".into()]), TrustedProxies::default());
     }
 }

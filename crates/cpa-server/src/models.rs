@@ -314,16 +314,26 @@ pub fn rfc3339(seconds: i64) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn rfc3339_matches_go() {
-        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
-        assert_eq!(rfc3339(1_759_276_800), "2025-10-01T00:00:00Z");
-        assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
-        assert_eq!(rfc3339(1_709_210_096), "2024-02-29T12:34:56Z");
+    // Generated client JSON is a schema contract; member order and escape spelling are not.
+    fn assert_json(actual: impl AsRef<str>, expected: impl AsRef<str>) {
+        let actual: serde_json::Value = serde_json::from_str(actual.as_ref()).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(expected.as_ref()).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
-    fn list_shapes_follow_go_marshal() {
+    fn model_timestamps_encode_the_expected_instant() {
+        for seconds in [0, 1_759_276_800, 951_782_400, 1_709_210_096, -1] {
+            let encoded = rfc3339(seconds);
+            assert_eq!(
+                chrono::DateTime::parse_from_rfc3339(&encoded).unwrap().timestamp(),
+                seconds
+            );
+        }
+    }
+
+    #[test]
+    fn model_lists_match_client_json_schemas() {
         let spec = Spec {
             id: "gpt-x".into(),
             owned_by: "openai".into(),
@@ -338,47 +348,39 @@ mod tests {
             context_length: 10,
             ..Spec::default()
         };
-        assert_eq!(
+        assert_json(
             openai_list([&spec].into_iter()),
-            r#"{"data":[{"created":5,"id":"gpt-x","object":"model","owned_by":"openai"}],"object":"list"}"#
+            r#"{"data":[{"created":5,"id":"gpt-x","object":"model","owned_by":"openai"}],"object":"list"}"#,
         );
-        assert_eq!(
+        assert_json(
             claude_list([&spec, &claude].into_iter(), false),
-            r#"{"data":[{"display_name":"A","id":"claude-a","max_input_tokens":10,"max_tokens":64000,"object":"model","owned_by":"anthropic","type":"model"},{"created_at":"1970-01-01T00:00:05Z","display_name":"B","id":"claude-fable-5-dd-x-tpg","max_input_tokens":200000,"max_tokens":64000,"object":"model","owned_by":"openai","type":"model"}],"first_id":"claude-a","has_more":false,"last_id":"claude-fable-5-dd-x-tpg"}"#
+            r#"{"data":[{"display_name":"A","id":"claude-a","max_input_tokens":10,"max_tokens":64000,"object":"model","owned_by":"anthropic","type":"model"},{"created_at":"1970-01-01T00:00:05Z","display_name":"B","id":"claude-fable-5-dd-x-tpg","max_input_tokens":200000,"max_tokens":64000,"object":"model","owned_by":"openai","type":"model"}],"first_id":"claude-a","has_more":false,"last_id":"claude-fable-5-dd-x-tpg"}"#,
         );
     }
 
     /// Go `WriteModelListResponse`'s detail selection, recorded with encoding/json (Go
     /// 1.26): keys fold, the last match wins, a mistyped field fails its whole decode.
     #[test]
-    fn detail_selection_decodes_the_catalog_like_go() {
-        for (body, id, want) in [
-            (
-                r#"{"Data":[{"id":"a" , "n":1.50}]}"#,
-                "a",
-                Ok(Some(r#"{"id":"a" , "n":1.50}"#)),
-            ),
-            (r#"{"data":[{"id":"a"}],"DATA":null}"#, "a", Ok(None)),
-            (r#"{"data":"x","models":[{"id":"a"}]}"#, "a", Err(())),
-            (
-                r#"{"data":[{"id":1},{"ID":"a","id":null}]}"#,
-                "a",
-                Ok(Some(r#"{"ID":"a","id":null}"#)),
-            ),
-            (
-                r#"{"models":[{"id":"","slug":"s"}],"data":[{"slug":"s","id":"t"}]}"#,
-                "s",
-                Ok(Some(r#"{"id":"","slug":"s"}"#)),
-            ),
-            (r#"{"data":[{"id":"a","slug":7}]}"#, "a", Ok(None)),
-            ("[]", "a", Err(())),
-            ("null", "a", Ok(None)),
-            (r#"{"data":[{"id":"\u0061"}]}"#, "a", Ok(Some(r#"{"id":"\u0061"}"#))),
-            (r#"{"data":[{"id":"k"}]}"#, "\u{212a}", Ok(None)),
-            (r#"{"dat\u0061":[{"id":"a"}]}"#, "a", Ok(Some(r#"{"id":"a"}"#))),
-        ] {
-            let got = select_detail(body.as_bytes(), id).map(|e| e.map(|e| std::str::from_utf8(e).unwrap()));
-            assert_eq!(got, want, "{body}");
+    fn model_details_select_exact_identifiers_and_preserve_the_raw_record() {
+        for list in ["data", "models"] {
+            for id in ["model-a", "model-<b>", "unicode-α"] {
+                let record = format!(
+                    r#"{{"id":{}, "context_length":1.50e5,"extension":{{"keep":true}}}}"#,
+                    serde_json::to_string(id).unwrap()
+                );
+                let body = format!(r#"{{"{list}":[{{"id":"other"}},{record}]}}"#);
+                assert_eq!(select_detail(body.as_bytes(), id).unwrap().unwrap(), record.as_bytes());
+                assert!(select_detail(body.as_bytes(), "missing").unwrap().is_none());
+                assert!(
+                    select_detail(body.as_bytes(), &id.to_ascii_uppercase())
+                        .unwrap()
+                        .is_none()
+                );
+            }
         }
+        for malformed in ["[]", "{broken", r#"{"data":"wrong-type"}"#] {
+            assert!(select_detail(malformed.as_bytes(), "model-a").is_err());
+        }
+        assert!(select_detail(br#"{"data":[]}"#, "model-a").unwrap().is_none());
     }
 }

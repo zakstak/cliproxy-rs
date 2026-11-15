@@ -342,7 +342,7 @@ fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn stream::GoStream> {
     Box::new(events(ctx, None))
 }
 
-/// The Go-shaped line translator behind [`stream_with_bridge`], for golden tests.
+/// The line-oriented translator behind [`stream_with_bridge`].
 #[doc(hidden)]
 pub fn go_stream_with_bridge(ctx: &ResponseCtx<'_>, bridge: Option<Bridge>) -> Box<dyn stream::GoStream> {
     Box::new(events(ctx, bridge))
@@ -694,10 +694,10 @@ mod tests {
         value.exists().then(|| String::from_utf8_lossy(&value.raw).into_owned())
     }
 
-    /// Go `ConvertOpenAIResponsesRequestToCodex`: only priority (alias fast) and
-    /// ultrafast survive, so a translated client's flex falls back to the default tier.
+    /// The translated-route service-tier policy is separate from native passthrough.
+    /// See docs/codex/CONTRACT.md, translated route permitted transformations.
     #[test]
-    fn translated_clients_keep_gos_service_tier_rule() {
+    fn translated_service_tiers_follow_the_route_policy() {
         for (tier, want) in [
             (r#""priority""#, Some(r#""priority""#)),
             (r#"" Fast ""#, Some(r#""priority""#)),

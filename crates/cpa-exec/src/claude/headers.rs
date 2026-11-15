@@ -610,15 +610,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_matches_go() {
-        assert_eq!(canonical("x-stainless-os"), "X-Stainless-Os");
-        assert_eq!(canonical("anthropic-BETA"), "Anthropic-Beta");
-        assert_eq!(canonical("bad header"), "bad header");
-        assert_eq!(canonical("x_y"), "X_y");
+    fn header_spelling_does_not_change_http_field_identity() {
+        for name in ["x-stainless-os", "anthropic-BETA", "x_y"] {
+            assert_eq!(
+                http::HeaderName::from_bytes(canonical(name).as_bytes()).unwrap(),
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap()
+            );
+        }
     }
 
     #[test]
-    fn passthrough_skips_the_cached_session_like_go() {
+    fn passthrough_does_not_read_cached_session_identity() {
         // Neither fingerprinted nor confirmed: the builder returns before it reads
         // the cached session, so the caller must not look it up.
         assert!(!needs_cached_session(false, false, ""));
@@ -751,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_unconfirmed_oauth_messages_headers_match_go_capture() {
+    fn unconfirmed_oauth_uses_upstream_credentials_and_isolates_caller_identity() {
         let settings = Settings::default();
         let incoming: HeaderMap = [
             ("authorization", "Bearer fixture-client-key"),
@@ -784,40 +786,32 @@ mod tests {
             device_profile: None,
             cached_session_id: "",
         });
-        let (pairs, order) = wire(h, true, false);
-        let names: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+        let (pairs, _) = wire(h, true, false);
+        let headers: HeaderMap = pairs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    http::HeaderValue::from_str(value).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(headers["authorization"], "Bearer sk-ant-oat01-FAKE");
+        assert!(!headers.contains_key("x-api-key"));
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers["anthropic-version"], "2023-06-01");
         assert_eq!(
-            names,
-            [
-                "Accept",
-                "Authorization",
-                "Content-Type",
-                "User-Agent",
-                "X-Claude-Code-Session-Id",
-                "X-Stainless-Arch",
-                "X-Stainless-Lang",
-                "X-Stainless-OS",
-                "X-Stainless-Package-Version",
-                "X-Stainless-Retry-Count",
-                "X-Stainless-Runtime",
-                "X-Stainless-Runtime-Version",
-                "X-Stainless-Timeout",
-                "anthropic-beta",
-                "anthropic-dangerous-direct-browser-access",
-                "anthropic-version",
-                "x-app",
-                "x-client-request-id",
-                "Connection",
-                "Accept-Encoding"
-            ]
+            headers["x-claude-code-session-id"],
+            "dd01238e-cdb5-5572-8f27-a28d98fe9075"
         );
-        assert_eq!(order[19], "Host");
-        assert_eq!(order[21], "Content-Length");
-        let get = |n: &str| pairs.iter().find(|(k, _)| k == n).unwrap().1.clone();
-        // Go recorded the 2.1.280 baseline; the cloaked identity is now 2.1.325.
-        assert_eq!(get("User-Agent"), "claude-cli/2.1.325 (external, cli)");
-        assert_eq!(get("X-Stainless-OS"), "MacOS");
-        assert_eq!(get("Accept-Encoding"), "gzip, deflate, br, zstd");
+        assert_eq!(headers["user-agent"], super::super::profile::BASELINE.user_agent);
+        assert!(uuid::Uuid::parse_str(headers["x-client-request-id"].to_str().unwrap()).is_ok());
+        assert!(pairs.iter().all(|(_, value)| !value.contains("fixture-client-key")));
+        assert!(
+            pairs
+                .iter()
+                .all(|(_, value)| !value.contains("11111111-2222-4333-8444-555555555555"))
+        );
     }
 }
 

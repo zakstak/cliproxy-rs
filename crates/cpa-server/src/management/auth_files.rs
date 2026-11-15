@@ -2615,12 +2615,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn go_time_trims_fraction_like_rfc3339nano() {
+    fn saved_auth_timestamps_preserve_the_instant_and_nanoseconds() {
         use chrono::TimeZone;
-        let t = chrono::Utc.timestamp_opt(1_700_000_000, 120_000_000).unwrap();
-        assert_eq!(go_time(t), "2023-11-14T22:13:20.12Z");
-        let t = chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-        assert_eq!(go_time(t), "2023-11-14T22:13:20Z");
+        for nanos in [0, 1, 120_000_000, 123_456_789, 999_999_999] {
+            let instant = chrono::Utc.timestamp_opt(1_700_000_000, nanos).unwrap();
+            let stored = go_time(instant);
+            let parsed = chrono::DateTime::parse_from_rfc3339(&stored).unwrap();
+            assert_eq!(parsed.with_timezone(&chrono::Utc), instant);
+        }
     }
 
     fn management(name: &str, files: &[(&str, &str)]) -> (Arc<Management>, std::path::PathBuf) {
