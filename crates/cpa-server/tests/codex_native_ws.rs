@@ -7139,10 +7139,9 @@ async fn a_continuation_needs_the_socket_that_holds_its_response() {
     }
 }
 
-// N1 (#111): assertions the native-protection audit found missing
-// (docs/codex/N1-NATIVE-PROTECTIONS.md). Each test pins a protection the
-// proxy already has; none of them changes behaviour. Frames are hand-authored in the
-// shapes of the pinned first-party decoders cited on each test.
+// Native Codex protection regressions (#111). Frames are hand-authored in the
+// shapes of the first-party decoders cited on each test. See
+// docs/codex/CONTRACT.md for socket ownership and credential isolation.
 
 /// One upstream socket as the N1 recording upstream saw it.
 #[derive(Debug, Clone, Default)]

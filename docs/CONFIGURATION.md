@@ -1,6 +1,6 @@
 # Configuration
 
-cliproxy-rs reads one YAML file, `config.yaml`. Pass its path with `--config`; without it, the server reads `config.yaml` in the current directory. It accepts CLIProxyAPI's v8 layout (shown here) and the older flat layout, and every setting in CLIProxyAPI's [`config.example.yaml`](https://github.com/router-for-me/CLIProxyAPI/blob/6fecc6e5567912661654a4eaf9b8f5436facd1c2/config.example.yaml) is accepted. Settings for features that are not ported yet are kept in the file but have no effect.
+cliproxy-rs reads one YAML file, `config.yaml`. Pass its path with `--config`; without it, the server reads `config.yaml` in the current directory. It accepts CLIProxyAPI's v8 layout (shown here) and the older flat layout for supported features. Removed providers, native plugins, and some Codex settings are refused; see [Moving from Go](MIGRATING-FROM-GO.md) and the [Codex settings contract](codex/CONTRACT.md#settings).
 
 The server watches the file and applies most changes within a second, without a restart. `server.host`, `server.port`, `server.tls` and `server.trusted-proxies` are read at start, so restart after changing them. When the dashboard or the Management API changes a setting, only that key is rewritten; the rest of the file, comments included, stays as it was. The first such save of a file in an older layout moves its settings to the current layout, with their comments, and writes Windows (CRLF) line endings as LF. Saves through the older `/v0/management` setting endpoints are the exception: as in CLIProxyAPI, they keep a file that has no current-layout sections in its older layout. When the file uses YAML that cannot be moved line by line, such as anchors, that save writes the file again from its values: the comments at the top are kept, and other comments may be lost.
 
@@ -37,7 +37,7 @@ observability:
 | `tls.enable`, `tls.cert`, `tls.key` | Serve HTTPS on the same port with this certificate and key file. |
 | `max-request-body-bytes` | The largest request body accepted, in bytes; `0` (the default) or a negative value sets no limit. A larger body gets `413` before it is processed: on the client routes and the Management API. As in Go, a streamed body whose JSON value or multipart form ends before the limit is handled from the bytes before it. Changes apply to the next request. The client routes also stop at 64 MiB whatever this says. The older top-level `max-request-body-bytes` also works; the one under `server` wins. |
 | `github-token` | A GitHub token. CLIProxyAPI sends it to the GitHub API ahead of the `GITHUB_TOKEN` environment variable: on its release checks, its panel downloads and plugin store requests that no `plugins.store-auth` rule covers. cliproxy-rs keeps the setting but sends it nowhere: its release check sends no token, its dashboard is built in, and it has no plugin store. Management API config reads show it, as in CLIProxyAPI. The older top-level `github-token` also works; the one under `server` wins. |
-| `trusted-proxies` | Addresses of reverse proxies or tunnels whose `X-Forwarded-For` header is trusted. Set it when a tunnel on the same machine forwards requests, for example `[127.0.0.1, "::1"]`. See [running it safely](GETTING-STARTED.md#running-it-safely). |
+| `trusted-proxies` | Addresses of reverse proxies or tunnels whose `X-Forwarded-For` header is trusted. Set it when a tunnel on the same machine forwards requests, for example `[127.0.0.1, "::1"]`. See [running it safely](INSTALL.md#running-it-safely). |
 
 ## access
 
@@ -58,7 +58,7 @@ observability:
 | Setting | What it does |
 |---|---|
 | `auth-dir` | The folder for account sign-in files, `~/.cli-proxy-api` by default. `~` is expanded. The server watches it, so a file added, edited or removed there takes effect without a restart. |
-| `providers.codex.signin-with-chatgpt-identifier` | The agent name sent when binding Sign in with ChatGPT tokens to a Codex credential (`POST /v8/management/oauth/siwc/bind`), `CLIProxyAPI` when empty. It is shown on the consent screen only; unlike CLIProxyAPI, cliproxy-rs does not put it in the `User-Agent` of Sign in with ChatGPT requests ([docs/codex/IDENTITY.md](codex/IDENTITY.md)). Legacy spelling: `codex.signin-with-chatgpt-identifier`. Go also uses it as the SIWC request User-Agent prefix; cliproxy-rs does not send SIWC requests yet. |
+| `providers.codex.signin-with-chatgpt-identifier` | The agent name sent when binding Sign in with ChatGPT tokens to a Codex credential (`POST /v8/management/oauth/siwc/bind`), `CLIProxyAPI` when empty. It is shown on the consent screen only. SIWC requests use the [Codex identity policy](codex/IDENTITY.md). Legacy spelling: `codex.signin-with-chatgpt-identifier`. |
 | `providers.codex.header-defaults.user-agent` | Refused when set (legacy spelling `codex-header-defaults.user-agent`). Codex requests send the caller's own `User-Agent` or `cliproxy-rs/<version>`, and no setting chooses another identity ([docs/codex/IDENTITY.md](codex/IDENTITY.md)). A file that sets it does not load, a reload that adds it keeps the running config, and a Management API write that sets it is refused. CLIProxyAPI accepts it. `providers.codex.header-defaults.beta-features` still applies. |
 | `providers.codex.chatgpt-keep-alive` | A cliproxy-rs addition, `true` by default (also when absent or null). Ordinary Codex HTTP requests reuse idle connections: up to 2 to `chatgpt.com` per proxy, kept for 90 seconds, so later requests skip the TCP and TLS handshake. `false` opts out: every Codex request opens its own connection, as CLIProxyAPI does, and pooled connections close at the next Codex HTTP request. Requests under a client authority always open their own connection. A change applies from the next request, without a restart. Go starts with the key in the file and ignores it. A config edit through Go's v8 Management API moves the key into a comment, so an explicit `false` no longer applies when you return to cliproxy-rs. Edits through Go's v0 endpoints keep it. Setting the key through Go's v8 API is refused, as for any key Go does not know. |
 
@@ -168,7 +168,7 @@ The legacy top-level `pprof` mapping works too. `/debug/pprof/` lists the routes
 the raw query or a POST body, separated by `+`. Go runtime profiles return plain-text
 `501` answers. CPU `profile?seconds=30` requires a Unix build with
 `cargo build --release -p cliproxy --features cpa-server/pprof` and returns a pprof
-protobuf. Default builds, published release binaries and Docker images exclude the
+protobuf. Default builds and the local Docker image exclude the
 profiler and symbol resolver. Their `symbol` route consumes POST bodies but returns
 only `num_symbols: 1`, without resolving any names, including shared-library names.
 With the feature, an unstripped build gives more symbol names. Do not use another
@@ -212,5 +212,6 @@ This fork has no native plugin support. A `plugins` section, in either layout an
 - `MANAGEMENT_PASSWORD`: the management key, instead of `management.secret-key`.
 - `TOKIO_WORKER_THREADS`: the number of request threads, instead of `worker-threads`.
 - `RUST_LOG`: overrides the log level, for example `RUST_LOG=debug`.
+- `CLIPROXY_NO_UPDATE_CHECK=1`: disables explicit checks for the upstream Rust project's latest release.
 - A `.env` file in the working directory is loaded at start, as in CLIProxyAPI.
 - `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` keep the config and the account files in PostgreSQL, an S3-compatible bucket or a git repository, as in CLIProxyAPI. When the store has no config yet, the local one (or `config.example.yaml`) seeds it after a plaintext management key is replaced with its bcrypt hash and legacy settings that a v8 setting overrides are removed. A file in which the key's value would still appear as another setting's value, for example through a YAML anchor, is refused and the server does not start; comments and keys are not checked.

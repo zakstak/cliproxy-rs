@@ -15,7 +15,7 @@ Tested against unmodified CLIProxyAPI at commit `6fecc6e` (v8.0.10), both the re
 
 - It does not use the deprecated `/v0/management` API, so Go servers older than v8 are not supported.
 - It has no plugin controls: cliproxy-rs removed native plugin support, and the server reports `X-CPA-SUPPORT-PLUGIN: 0`.
-- It keeps no history beyond what the server reports (twenty 10-minute buckets per credential). The live usage view reads the server's usage queue, which removes those records for other consumers; it asks before starting.
+- It keeps the traffic history the server reports (twenty 10-minute buckets per credential). The live usage view uses cliproxy-rs's non-destructive feed and keeps events in the tab only. Go has no such feed, so the live view is disabled there.
 - "Check quota" asks the provider for usage through the server (`/requests/api-call`) only when you press it.
 - It does not update itself. Build and replace the file by hand.
 

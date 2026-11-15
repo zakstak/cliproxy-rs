@@ -6,7 +6,7 @@
 //! `codex-api/src/endpoint/responses_websocket.rs:906-925` (the WebSocket read order) and
 //! `protocol/src/error.rs:470-534` (`retry_policy`). The contract pin `44ccf394573c` does
 //! not have these rules. They are adopted as source-refresh evidence
-//! (docs/codex/FP1-SOURCE-REFRESH.md, docs/codex/FP2-TERMINAL-ERRORS.md); the pin does
+//! (docs/codex/CONTRACT.md, "Responses, errors and interruption"); the pin does
 //! not move.
 //!
 //! First-party Codex reads a failure in one of two ways, and the proxy keeps them apart:

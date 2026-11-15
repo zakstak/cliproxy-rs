@@ -1,16 +1,21 @@
-# cliproxy-rs documentation
+# Documentation
 
-New here? Start with [Getting started](GETTING-STARTED.md).
+## Run the proxy
 
-| Page | For |
-|---|---|
-| [Getting started](GETTING-STARTED.md) | Installing, a first config, connecting an account and a tool, running it safely |
-| [Use it with your tools](CLIENTS.md) | Claude Code, Codex CLI, Amp, OpenCode, Cursor, Cline, Zed and more, plus the SDKs |
-| [Several accounts](MULTI-ACCOUNT.md) | Routing strategies, session affinity, cooldowns, the quota view, per-account proxies, remote access |
-| [Configuration](CONFIGURATION.md) | The `config.yaml` settings you are most likely to change |
-| [Install](INSTALL.md) | Supported hosts (Linux and the Linux container), building from source, Docker, manual configuration, starting at login |
-| [Moving from CLIProxyAPI](MIGRATING-FROM-GO.md) | Switching from the Go server and back |
-| [Differences from CLIProxyAPI](DIFFERENCES-FROM-GO.md) | What behaves differently on purpose, and what cliproxy-rs adds |
-| [Features this fork does not adopt](NOT-ADOPTED.md) | Researched Go v8.0.67 features this fork declines, why, and what would reopen each decision |
-| [Codex wire contract](codex/CONTRACT.md) | What Codex routes send and deliver, per endpoint and transport, from first-party Codex and OpenAI's documentation |
-| [Compatibility](PARITY.md) | What works today, and the historical item-by-item audit against CLIProxyAPI v8.0.35 |
+- [Install and run](INSTALL.md): source builds, Docker, first config, services, and safe access.
+- [Agent-assisted setup](AI-SETUP.md): installation without overwriting an existing setup or exposing keys.
+- [Client settings](CLIENTS.md): Claude Code, Codex CLI, Amp, other tools, and SDKs.
+- [Configuration](CONFIGURATION.md): supported settings and reload behaviour.
+- [Several accounts](MULTI-ACCOUNT.md): routing, affinity, cooldowns, quotas, and remote access.
+- [Moving from Go CLIProxyAPI](MIGRATING-FROM-GO.md): migration, credential safety, and switching back.
+- [Differences from Go](DIFFERENCES-FROM-GO.md): operator-visible changes and limitations.
+- [Claude cache telemetry](CLAUDE-CACHE-TELEMETRY.md): collection, privacy, and offline replay.
+
+## Develop the fork
+
+- [Contributing](../CONTRIBUTING.md): build requirements and local checks.
+- [Fork workflow](FORK.md): branches, upstream integration, and local-build policy.
+- [Codex wire contract](codex/CONTRACT.md): payloads, transports, endpoint profiles, and fixture rules.
+- [Codex identity and transport](codex/IDENTITY.md): headers, credential isolation, and TLS policy.
+- [Features not adopted](NOT-ADOPTED.md): current omissions and the reasons for them.
+- [Dashboard development](../ui/README.md) and [design system](../ui/DESIGN.md).

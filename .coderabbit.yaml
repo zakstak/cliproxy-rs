@@ -15,7 +15,6 @@ reviews:
     - "!ui/package-lock.json"
     - "!ui/dist/**"
     - "!ui/dist-panel/**"
-    - "!docs/parity-audit/status.md"
     - "!crates/cpa-core/src/config/schema.json"
     - "!crates/**/tests/fixtures/**"
     - "!crates/**/testdata/**"
@@ -23,8 +22,8 @@ reviews:
   path_instructions:
     - path: "crates/**/*.rs"
       instructions: |
-        - Check that behaviour matches Go CLIProxyAPI v8.0.35 (commit ae3ee3be): HTTP routes, status codes, response shapes and headers, config.yaml and credential file formats, and the v8 Management API. Flag a difference that has no entry in docs/DIFFERENCES-FROM-GO.md or an explicit partial or missing item in docs/parity-audit/manual.tsv.
-        - Check that a Rust value never silently differs from Go's for the same input. Refusing an input Go accepts is acceptable only with a DIFFERENCES-FROM-GO.md entry.
+        - Follow AGENTS.md's compatibility policy. Preserve working clients, config.yaml and credential files, HTTP routes and response shapes, and the v8 Management API. Provider documentation, first-party clients and verified wire behaviour decide provider behaviour; Go v8.0.35 is a source, not an oracle.
+        - On Codex routes, follow docs/codex/CONTRACT.md. Flag operator-visible changes from Go without an entry in docs/DIFFERENCES-FROM-GO.md.
         - Check that request preparation and config loading stay linear in input size: flag code that rescans a JSON body or YAML document for each element.
         - Check that tests use local mock upstreams and a private auth-dir, and cannot reach the network or ~/.cli-proxy-api.
     - path: "{crates/cpa-exec/src/claude.rs,crates/cpa-exec/src/claude/**,crates/cpa-translate/src/*claude*.rs,crates/cpa-server/src/claude.rs,crates/cpa-common/src/signature/claude*.rs}"

@@ -66,9 +66,9 @@ Inside the container the config is `/data/config.yaml`. In that config:
 - Set `oauth.auth-dir` to `/data/auth` so credentials persist in the mounted volume.
 - Set `management.allow-remote: true` if you want the dashboard. Docker forwards the published port from its bridge network, so even requests from your own machine reach the server from a non-local address, and with `allow-remote: false` the management API refuses them ("remote management disabled"). Publishing the port on `127.0.0.1` as above still keeps other machines out. The Go server behaves the same way in a container.
 
-The image declares no `VOLUME`, so `/data` persists only where you mount one: `-v` as above, a named Docker volume, or your host's volume feature. On Railway, attach a Railway Volume mounted at `/data`; Railway mounts volumes as root, so also set `RAILWAY_RUN_UID=0` on the service, as [Railway's volume docs](https://docs.railway.com/volumes#permissions) say for images that run as another user (the proxy then runs as root). Without a mount, credentials and dashboard changes stay in the container and are lost when it is removed. Images up to 0.2.5 declared `VOLUME ["/data"]`, so a container started from one without a mount kept `/data` in an anonymous volume; reattach or copy that volume before you recreate the container from a newer image.
+The image declares no `VOLUME`. Mount a host directory or named volume at `/data` to keep configuration and credentials when you replace the container.
 
-The server must be able to write to `/data`: it saves the hashed management key into `config.yaml` on first start, and the dashboard writes settings and credential files. If it cannot, the key stays in plain text and saves fail, which is what the `chown` above prevents. Publish the port on `127.0.0.1` unless other machines need access; see [running it safely](GETTING-STARTED.md#running-it-safely).
+The server must be able to write to `/data`: it saves the hashed management key into `config.yaml` on first start, and the dashboard writes settings and credential files. If it cannot, the key stays in plain text and saves fail, which is what the `chown` above prevents. Publish the port on `127.0.0.1` unless other machines need access; see [running it safely](#running-it-safely).
 
 ### Sign in to accounts from a container
 
@@ -168,13 +168,26 @@ After building the binary, set it up by hand:
      auth-dir: "~/.cliproxy-rs/auth"     # where account sign-ins are saved
    ```
 
-   Keep a copy of the management key: on first start the server replaces it in `config.yaml` with a bcrypt hash. Settings in CLIProxyAPI's [`config.example.yaml`](https://github.com/router-for-me/CLIProxyAPI/blob/main/config.example.yaml) are accepted, except those that configure a removed provider ([DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md#removed-providers)), and settings for features listed as not yet supported have no effect; [CONFIGURATION.md](CONFIGURATION.md) explains the common ones.
+   Keep a copy of the management key: on first start the server replaces it in `config.yaml` with a bcrypt hash. [CONFIGURATION.md](CONFIGURATION.md) describes supported settings. Configs that enable removed providers, native plugins, or refused Codex settings fail with migration guidance; see [Moving from Go](MIGRATING-FROM-GO.md).
 2. Start the server: `cliproxy --config config.yaml`. With no `--config`, it reads `config.yaml` in the current directory. Check it with `curl http://127.0.0.1:8317/healthz`, which answers `{"status":"ok"}`.
-3. Connect accounts with `--claude-login`, `--codex-login`, `--codex-device-login`, `--meta-login` or `--xai-login`, or connect accounts from the dashboard at `/management.html`. Add `--no-browser` on a machine without a browser.
+3. Open `/management.html` and sign in with your management key. Add provider API keys or connect accounts. Terminal sign-in flags are `--claude-login`, `--codex-login`, `--codex-device-login`, `--meta-login`, and `--xai-login`. Add `--no-browser` on a machine without a browser. Read [Accounts and provider terms](../README.md#accounts-and-provider-terms) before connecting a subscription.
+4. Point your tool at the proxy using the separate client key. The dashboard's **Use with tools** page and [CLIENTS.md](CLIENTS.md) have the settings.
 
 Go-style single-dash flags such as `-config config.yaml` work too.
 
 The server reloads `config.yaml` and the credential directory when they change. Set `RUST_LOG=debug` for more detailed logs; the default level is `info`.
+
+## Running it safely
+
+- Set `access.api-keys`. With an empty list, anyone who can reach the proxy can use its accounts.
+- Keep `server.host: "127.0.0.1"` for local use. An empty host listens on every interface. For another machine, use an [SSH tunnel or private network](MULTI-ACCOUNT.md#reach-the-proxy-from-other-machines). An SSH tunnel from your computer is `ssh -L 8317:127.0.0.1:8317 you@server`.
+- Set `management.secret-key` or `MANAGEMENT_PASSWORD` to enable management. Keep the management key separate from client keys. `management.allow-remote` defaults to `false`.
+- Behind a local reverse proxy or tunnel, set `server.trusted-proxies` to its addresses, for example `[127.0.0.1, "::1"]`, and restart. Otherwise forwarded requests appear local: remote-management restrictions cannot distinguish them, and failed management logins share one address's lockout.
+- Use HTTPS or an encrypted tunnel for network access. The proxy supports `server.tls` for direct HTTPS.
+- Protect `config.yaml`, credential files, backups, and request logs. Account files contain usable tokens. A copied credential directory still refers to the same accounts and can rotate their refresh tokens.
+- The dashboard is embedded. Model catalogs are downloaded at start and every three hours; `--local-model` disables those downloads. `CLIPROXY_NO_UPDATE_CHECK=1` also disables the dashboard's explicit upstream release check.
+
+For experiments, use a disposable checkout, a different loopback port, and a new empty `oauth.auth-dir`. Use fake credentials and loopback mock upstreams for tests. Keep external network access blocked during tests, as described in [CONTRIBUTING.md](../CONTRIBUTING.md#building-and-testing).
 
 ## Start at login
 
