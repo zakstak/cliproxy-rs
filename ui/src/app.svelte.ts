@@ -6,7 +6,7 @@ import { LatestRead, type ReadResult } from "./latest";
 import { api, connect, disconnect, transport } from "./api";
 import { reconcile, type Data, type Window } from "./core";
 import { signInHelp } from "./api";
-import { parseLivePage, type Request } from "./records";
+import { parseLivePage, retainRequests, type Request } from "./records";
 import { client, explain, type Applied, type CallError, type ConfigWrite, type WriteError } from "./server";
 import { configuredAccounts } from "./configured-accounts";
 import { isUnsaved, type Draft } from "./draft";
@@ -110,6 +110,8 @@ class Watch {
   /** When watching last stopped; 0 while watching. Time after it is not captured. */
   stoppedAt = $state(0);
   requests = $state.raw<Request[]>([]);
+  /** History through this completion time was discarded locally and is unknown. */
+  retainedAfter = $state(0);
   gaps = $state.raw<{ from: number; to: number }[]>([]);
   /** False when the server has usage statistics off and so reports no requests. */
   statistics = $state(true);
@@ -164,9 +166,9 @@ class Watch {
       const now = Date.now();
       if (page.gap) this.gaps = [...this.gaps, { from: this.#readAt, to: now }];
       if (page.requests.length || page.gap) {
-        this.requests = [...this.requests, ...page.requests]
-          .filter((r) => r.at > now - HOUR)
-          .slice(-2000);
+        const retained = retainRequests([...this.requests, ...page.requests], { cutoff: now - HOUR, retainedAfter: this.retainedAfter });
+        this.requests = retained.requests;
+        this.retainedAfter = retained.retainedAfter;
         this.gaps = this.gaps.filter((g) => g.to > now - HOUR);
       }
       this.#cursor = page.cursor;
@@ -182,6 +184,7 @@ class Watch {
   clear() {
     this.stop();
     this.requests = [];
+    this.retainedAfter = 0;
     this.gaps = [];
     this.since = 0;
     this.resumedAt = 0;

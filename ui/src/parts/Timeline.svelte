@@ -48,7 +48,7 @@
   const ROW = 11;
   const PAD = 8;
   const AXIS = 22;
-  const whyText: Record<Blind["why"], string> = { before: "Before this tab was watching", gap: "Not captured", stopped: "Not watching" };
+  const whyText: Record<Blind["why"], string> = { before: "Before this tab was watching", gap: "Not captured", stopped: "Not watching", retained: "Older request history discarded locally" };
   /** Cut `text` to `fit` characters with an ellipsis. */
   const cut = (text: string, fit: number) => (text.length > fit ? `${text.slice(0, Math.max(1, fit - 1))}…` : text);
   /**

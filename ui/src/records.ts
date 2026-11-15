@@ -1,12 +1,13 @@
 // Parsing at the boundary: the two things Logs reads are a text line and a usage record.
 // Both come from the server as loose data and leave here as named types.
+import { median } from "./observe.ts";
 
 /** `[2026-11-15 14:02:11] [a1b2c3d4] [info ] message` (crates/cpa-server/src/logging.rs). */
 export type LogLine = {
   n: number;
   raw: string;
-  /** Milliseconds, or 0 when the line has no timestamp (a continuation line). */
-  at: number;
+  /** Server-local wall clock, without a reported timezone; never an absolute instant. */
+  timestamp: string;
   /** The last 8 characters of the request ID; empty for lines outside a request. */
   id: string;
   level: "error" | "warn" | "info" | "debug" | "trace" | "";
@@ -21,13 +22,13 @@ const levels = new Set(["error", "warn", "info", "debug", "trace"]);
 
 export function parseLine(raw: string, n: number): LogLine {
   const m = raw.match(/^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] \[([^\]]*)\] \[(\w+)\s*\] (?:\[[^\]]*:\d+\] )?(.*)$/s);
-  if (!m) return { n, raw, at: 0, id: "", level: "", message: raw, access: null, own: false };
+  if (!m) return { n, raw, timestamp: "", id: "", level: "", message: raw, access: null, own: false };
   const level = levels.has(m[3]) ? (m[3] as LogLine["level"]) : "";
   const a = m[4].match(/^\s*(\d{3}) \|\s*(\S+) \|\s*(\S+) \| (\w+)\s+"?(.*?)"?$/);
   return {
     n,
     raw,
-    at: Date.parse(m[1].replace(" ", "T")) || 0,
+    timestamp: m[1],
     id: /[^-]/.test(m[2]) ? m[2] : "",
     level,
     message: m[4],
@@ -55,6 +56,7 @@ export type Request = {
   effort: string;
   latency: number;
   ttft: number;
+  usageReported: boolean;
   /** Input splits into uncached, cache read and cache write; output includes reasoning. */
   tokens: { input: number; uncached: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number };
   /** Milliseconds from the start of the request, in order, for the stages the server timed. */
@@ -117,6 +119,7 @@ export function parseRequest(record: unknown, n: number): Request | null {
     effort: text(record.reasoning_effort),
     latency: count(record.latency_ms),
     ttft: count(record.ttft_ms),
+    usageReported: typeof record.usage_observed === "boolean" ? record.usage_observed : isObject(tokens) || isObject(input) || isObject(output),
     tokens: {
       input: isObject(input) ? count(input.total_tokens) : uncached + cacheRead + cacheWrite,
       uncached,
@@ -131,6 +134,30 @@ export function parseRequest(record: unknown, n: number): Request | null {
     }),
     raw,
   };
+}
+
+/** Counters include reported usage from failed streams; timing describes successful requests. */
+export function requestTotals(requests: Request[]) {
+  const ok = requests.filter((r) => !r.failed);
+  const reported = requests.filter((r) => r.usageReported);
+  const sum = (pick: (r: Request) => number) => reported.reduce((n, r) => n + pick(r), 0);
+  return {
+    requests: requests.length, failed: requests.length - ok.length, usageReports: reported.length,
+    input: sum((r) => r.tokens.input), cached: sum((r) => r.tokens.cacheRead),
+    output: sum((r) => r.tokens.output), reasoning: sum((r) => r.tokens.reasoning),
+    ttft: median(ok.map((r) => r.ttft)), slowest: Math.max(0, ...ok.map((r) => r.ttft)),
+  };
+}
+
+/** Keep a complete suffix of completion times. Dropped records and timestamp ties make
+ * everything through their latest completion unobserved, including out-of-order records. */
+export function retainRequests(requests: Request[], options: { cutoff: number; retainedAfter: number; limit?: number }) {
+  const { cutoff, retainedAfter, limit = 2000 } = options;
+  const after = Math.max(cutoff, retainedAfter);
+  const recent = requests.filter((r) => r.at + r.latency > after);
+  const evicted = recent.slice(0, Math.max(0, recent.length - limit));
+  const boundary = Math.max(after, ...evicted.map((r) => r.at + r.latency));
+  return { retainedAfter: boundary, requests: recent.slice(-limit).filter((r) => r.at + r.latency > boundary) };
 }
 
 /** One answer of the live feed. Anything else throws, so a wrong server is not an empty feed. */

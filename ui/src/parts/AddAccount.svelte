@@ -6,7 +6,7 @@
   import { authUrl, label, mask, provider, signIns, span, type Data } from "../core";
   import { accountName as credName, providerEndpoint } from "../account";
   import { app, message } from "../app.svelte";
-  import { configWrite, explain } from "../server";
+  import { configWrite, explain, type ConfigWrite } from "../server";
   import { canCheck, check, key, limits, wait } from "../limits";
   import Copy from "./Copy.svelte";
   import Meter from "./Meter.svelte";
@@ -165,18 +165,27 @@
     e.preventDefault();
     callbackError = await app.act(() => api("/oauth/callback", "POST", { provider: p, redirect_url: callback.trim() }));
   }
+  let keyAttempt: { snapshot: string; op: ConfigWrite; done: string } | null = null;
   async function addKey(e: SubmitEvent) {
     e.preventDefault();
-    const groups = app.setting<Data[]>(`api-keys/${p}`, []);
     const secret = form.key.trim();
-    const group: Data = { name: form.name.trim(), keys: [{ "api-key": secret }], "base-url": form.url.trim() || providerEndpoint(p) };
-    const op = configWrite({ path: `api-keys/${p}`, before: groups, next: [...groups, group], what: `Adding ${P} API key ${mask(secret)}`, href: "#accounts" });
-    const error = await app.write(op, `${P} API key ${group.name} · ${mask(secret)} added.`);
+    const selected = p;
+    const snapshot = JSON.stringify([selected, form.name, form.key, form.url]);
+    if (!keyAttempt || keyAttempt.snapshot !== snapshot) {
+      const groups = app.setting<Data[]>(`api-keys/${selected}`, []);
+      const group: Data = { name: form.name.trim(), keys: [{ "api-key": secret }], "base-url": form.url.trim() || providerEndpoint(selected) };
+      keyAttempt = {
+        snapshot,
+        op: configWrite({ path: `api-keys/${selected}`, before: groups, next: [...groups, group], what: `Adding ${P} API key ${mask(secret)}`, href: "#accounts" }),
+        done: `${P} API key ${group.name} · ${mask(secret)} added.`,
+      };
+    }
+    const error = await app.write(keyAttempt.op, keyAttempt.done);
     formError = error ? explain(error) : "";
     if (error) return void tick().then(() => dialog?.querySelector<HTMLElement>(".key-error")?.focus());
     await app.accounts.load(true);
     // Open the new key's account, so the user sees it under the name it has everywhere.
-    close((app.accounts.data || []).find((a) => a.account === secret && provider(a) === p));
+    close((app.accounts.data || []).find((a) => a.account === secret && provider(a) === selected));
   }
   async function upload(input: HTMLInputElement) {
     const files = [...(input.files || [])];
@@ -226,14 +235,14 @@
         </label>
       </div>
     {:else if step.kind === "key"}
-      <form class="stack" onsubmit={addKey}>
+      <form class="stack" onsubmit={addKey} oninput={() => { keyAttempt = null; formError = ""; }}>
         <label class="field">Name<input type="text" required bind:value={form.name} placeholder="For example, Console key" /></label>
         <label class="field">{P} API key<input type="password" autocomplete="off" required bind:value={form.key} /></label>
         <details>
           <summary class="small">Use a different endpoint</summary>
           <label class="field">Base URL<input type="url" bind:value={form.url} placeholder="Provider default" /></label>
         </details>
-        {#if formError}<p class="notice bad small key-error" role="alert" tabindex="-1"><span class="dot bad"></span><span>The key was not added: {formError}</span></p>{/if}
+        {#if formError}<p class="notice bad small key-error" role="alert" tabindex="-1"><span class="dot bad"></span><span>Could not confirm the key was added: {formError}</span></p>{/if}
         <div class="row">
           <button class="btn primary" aria-disabled={app.busy}>{formError ? "Try again" : "Add API key"}</button>
           <button type="button" class="btn" onclick={() => ((step = { kind: "choose" }), (formError = ""))}>Back</button>

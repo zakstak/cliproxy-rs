@@ -91,7 +91,7 @@ try {
     addGroup.getByRole("button", { name: "Add group", exact: true }).click(),
   ]);
   const codexGroups = await api("/config/api-keys/codex");
-  assert.equal(codexGroups[0]["base-url"], "https://chatgpt.com/backend-api/codex");
+  assert.equal(codexGroups[0]["base-url"], "https://api.openai.com/v1");
   assert.ok(codexGroups[0].keys[0].auth_index, "real server assigns the configured key's identity");
   await main.getByRole("button", { name: "Delete group… Disposable Codex group", exact: true }).click();
   await Promise.all([
@@ -101,6 +101,36 @@ try {
   assert.deepEqual(await api("/config/api-keys/codex"), []);
   assert.equal((await api("/config/api-keys/claude")).length, 1, "removing a group preserves other providers");
   console.log("PASS provider-key creation, server identity and exact group removal");
+
+  // A PUT that landed but lost its response must retry the frozen append, not append again.
+  await route("accounts");
+  await main.getByRole("button", { name: "Add account", exact: true }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("radio", { name: "Codex", exact: true }).check();
+  await dialog.getByRole("radio", { name: /^Use a Codex API key/ }).check();
+  await dialog.getByRole("button", { name: "Continue", exact: true }).click();
+  await dialog.getByRole("textbox", { name: "Name", exact: true }).fill("Lost-response test");
+  await dialog.getByLabel("Codex API key", { exact: true }).fill("sk-fake-codex-lost-response");
+  let keyPuts = 0;
+  const dropAnswer = async intercepted => {
+    if (intercepted.request().method() !== "PUT") return intercepted.continue();
+    keyPuts++;
+    if (keyPuts !== 1) return intercepted.continue();
+    const answer = await intercepted.fetch();
+    assert.ok(answer.ok());
+    await intercepted.abort("connectionfailed");
+  };
+  await page.route("**/config/api-keys/codex", dropAnswer);
+  await dialog.getByRole("button", { name: "Add API key", exact: true }).click();
+  await dialog.getByText(/Could not confirm the key was added/).waitFor();
+  assert.equal((await api("/config/api-keys/codex")).length, 1);
+  await dialog.getByRole("button", { name: "Try again", exact: true }).click();
+  await dialog.waitFor({ state: "hidden" });
+  assert.equal(keyPuts, 1, "retry recognizes the first write and sends no second PUT");
+  assert.equal((await api("/config/api-keys/codex")).length, 1, "retry does not duplicate the key group");
+  await page.unroute("**/config/api-keys/codex", dropAnswer);
+  await page.keyboard.press("Escape");
+  console.log("PASS Add account retries an unanswered successful key write without duplication");
 
   await route("settings");
   const strategy = main.getByLabel("Which account takes the next request");
@@ -160,6 +190,31 @@ try {
   assert.equal(await page.getByRole("dialog").count(), 0);
   assert.match(await page.evaluate(() => document.activeElement?.textContent.trim()), /operator@example.invalid/);
   assert.equal(await page.evaluate(k => JSON.stringify([localStorage, sessionStorage]).includes(k), key), false);
+  // Synthetic feed stress at the HTTP boundary; the rest of this suite uses the real server.
+  let supplied = false;
+  await page.route("**/observability/usage/live?*", async intercepted => {
+    const now = Date.now();
+    const records = supplied ? [] : Array.from({ length: 2101 }, (_, n) => ({
+      timestamp: new Date(now - 2201 + n).toISOString(), latency_ms: 1,
+      request_id: `failed-stream-${n}`, model: "reported-failure", failed: true,
+      usage_observed: true, tokens: { input_tokens: 9, output_tokens: 6 },
+    }));
+    supplied = true;
+    await intercepted.fulfill({ json: { cursor: "0123456789abcdef.2101", records, gap: false, usage_statistics_enabled: true } });
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await route("logs");
+  await main.getByText("Older request history was discarded locally.", { exact: false }).waitFor();
+  await main.getByText("18K", { exact: true }).first().waitFor();
+  await main.getByText("12K", { exact: true }).first().waitFor();
+  await main.getByRole("button", { name: /^Trends/ }).click();
+  assert.ok(await main.locator(".trend .unknown").count() >= 4);
+  const chart = main.getByRole("group", { name: /^Input tokens chart:/ });
+  await chart.focus();
+  await page.keyboard.press("Home");
+  await main.locator(".trend").filter({ hasText: "Input tokens" }).getByText("Unknown", { exact: true }).waitFor();
+  await page.screenshot({ path: `${out}/ledger-retention-failed-streams.png`, fullPage: true });
+  console.log("PASS synthetic >2000-record eviction is visibly unknown; failed-stream usage totals remain 18K/12K");
   assert.ok(writes.length >= 3);
   assert.deepEqual(errors, []);
   console.log("PASS keyboard detail dismissal and focus return; no management key in storage");

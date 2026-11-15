@@ -5,14 +5,15 @@
 // Pure: covered by observe.test.ts.
 
 export type Span = { from: number; to: number };
-export type Blind = Span & { why: "before" | "gap" | "stopped" };
+export type Blind = Span & { why: "before" | "gap" | "stopped" | "retained" };
 
 /** Time in [from, to] this tab did not see, merged where reasons overlap, oldest first. */
-export function blindSpans(from: number, to: number, w: { since: number; gaps: Span[]; stoppedAt: number }): Blind[] {
+export function blindSpans(from: number, to: number, w: { since: number; gaps: Span[]; stoppedAt: number; retainedAfter?: number }): Blind[] {
   const raw: Blind[] = [];
   if (!w.since) raw.push({ from, to, why: "before" });
   else if (w.since > from) raw.push({ from, to: Math.min(w.since, to), why: "before" });
   for (const g of w.gaps) raw.push({ from: g.from, to: g.to, why: "gap" });
+  if (w.retainedAfter && w.retainedAfter > from) raw.push({ from, to: w.retainedAfter, why: "retained" });
   if (w.since && w.stoppedAt) raw.push({ from: w.stoppedAt, to, why: "stopped" });
   return raw
     .map((b) => ({ ...b, from: Math.max(from, b.from), to: Math.min(to, b.to) }))

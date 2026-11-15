@@ -11,6 +11,7 @@
   // dots), Home and End jump to the ends, Enter opens the request under a dot, Escape
   // leaves the readout. The figure above reads the step out, as the pointer does.
   import type { Request } from "../records";
+  import { watchedMs, type Blind } from "../observe";
   import type { Step } from "./types";
   import { niceMax, time } from "../fmt";
 
@@ -22,6 +23,7 @@
     to,
     size,
     steps = [],
+    blind = [],
     dots = [],
     names,
     tone = "none",
@@ -42,6 +44,7 @@
     /** Milliseconds per step. */
     size: number;
     steps?: Step[];
+    blind?: Blind[];
     dots?: { t: number; v: number; r: Request }[];
     /** Names of the two stacked parts, when there are two. */
     names?: [string, string];
@@ -73,9 +76,14 @@
     const near = dots.reduce((best, d) => (Math.abs(d.t - hover) < Math.abs(best.t - hover) ? d : best));
     return Math.abs(near.t - hover) < (to - from) / 10 ? near : undefined;
   });
-  const reading = $derived(
-    stepAt && read ? { value: read(stepAt), note: `${time(stepAt.t)} to ${time(stepAt.t + size)}` } : dotAt ? { value: fmt(dotAt.v), note: `${time(dotAt.t)}, ${dotAt.r.model}` } : null,
-  );
+  const reading = $derived.by(() => {
+    if (stepAt && read) {
+      const start = Math.max(from, stepAt.t), end = Math.min(to, stepAt.t + size);
+      const watched = watchedMs(start, end, blind);
+      return { value: watched === 0 ? "Unknown" : watched < end - start ? `At least ${read(stepAt)}` : read(stepAt), note: `${time(start)} to ${time(end)}` };
+    }
+    return dotAt ? { value: fmt(dotAt.v), note: `${time(dotAt.t)}, ${dotAt.r.model}` } : null;
+  });
   function move(e: PointerEvent) {
     const box = (e.currentTarget as HTMLElement).getBoundingClientRect();
     onhover(from + ((e.clientX - box.left) / box.width) * (to - from));
@@ -125,12 +133,13 @@
     onpointermove={move}
     onpointerleave={() => onhover(null)}
     role="group"
-    aria-label={`${title} chart: ${value}, ${note}. ${has ? hint : empty}`}
+    aria-label={`${title} chart: ${value}, ${note}. ${blind.length ? "Hatched time is unknown. " : ""}${has ? hint : empty}`}
     tabindex={has ? 0 : -1}
     onkeydown={key}
     onblur={() => keyed && ((keyed = false), onhover(null))}
   >
-    {#if has}<span class="tick" aria-hidden="true">{fmt(top)}</span>{:else}<span class="nodata">{empty}</span>{/if}
+    {#each blind as b}<span class="unknown" aria-hidden="true" style:left={`${(Math.max(from, b.from) - from) / (to - from) * 100}%`} style:width={`${(Math.min(to, b.to) - Math.max(from, b.from)) / (to - from) * 100}%`}></span>{/each}
+    {#if has}<span class="tick" aria-hidden="true">{fmt(top)}</span>{:else}<span class="nodata">{blind.length ? "No measurements; hatched time is unknown" : empty}</span>{/if}
     <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" aria-hidden="true">
       <line class="grid" x1="0" x2={W} y1="3.5" y2="3.5" />
       {#if stepAt}<rect class="band" x={x(stepAt.t)} y="0" width={x(stepAt.t + size) - x(stepAt.t)} height={H} />{/if}
@@ -220,6 +229,12 @@
   }
   .plot:focus-visible {
     outline-offset: 3px;
+  }
+  .unknown {
+    position: absolute;
+    inset-block: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(135deg, transparent 0 4px, var(--line) 4px 5px);
   }
   .tick,
   .nodata {

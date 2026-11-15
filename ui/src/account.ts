@@ -1,4 +1,4 @@
-import { credName, label, mask, provider, type Data } from "./core";
+import { credName, label, mask, provider, type Data } from "./core.ts";
 
 /**
  * A provider API key as the server lists it among credentials: account_type "api_key", the
@@ -26,11 +26,12 @@ export const accountWithProvider = (a: Data) => `${accountName(a)} (${label(prov
 /** Provider keys, opened at this key. */
 export const keyLink = (a: Data) => `#settings/keys?provider=${encodeURIComponent(provider(a))}&key=${encodeURIComponent(String(a.auth_index || ""))}`;
 
-/** Provider defaults from cpa-exec's first-party executors. An explicit endpoint also
+/** Developer-key endpoints, including the API-key profile in docs/codex/CONTRACT.md.
+ * An explicit endpoint also
  * makes Codex and xAI keys active: their config sanitizer requires a nonempty base URL. */
 export const providerEndpoint = (provider: string): string => ({
   claude: "https://api.anthropic.com",
-  codex: "https://chatgpt.com/backend-api/codex",
+  codex: "https://api.openai.com/v1",
   xai: "https://api.x.ai/v1",
   meta: "https://api.meta.ai/v1",
 }[provider] || "");

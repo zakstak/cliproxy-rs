@@ -9,7 +9,7 @@
   import { accountName as credName } from "../account";
   import { tick, untrack } from "svelte";
   import { focusAfter, find, retried } from "../focus";
-  import { blindSpans, median, rateText, watchedMs } from "../observe";
+  import { blindSpans, rateText, watchedMs } from "../observe";
   import Detail from "../parts/Detail.svelte";
   import Setup from "../parts/Setup.svelte";
   import { api } from "../api";
@@ -17,7 +17,7 @@
   import { credState, label, provider, type Data } from "../core";
   import { app, asData, watch, message, Res, server } from "../app.svelte";
   import { configWrite, explain } from "../server";
-  import { parseLine, type LogLine, type Request } from "../records";
+  import { parseLine, requestTotals, type LogLine, type Request } from "../records";
   import { compact, duration, num, percent, plural, pretty, time, when } from "../fmt";
   import { span as ago } from "../core";
   import Copy from "../parts/Copy.svelte";
@@ -181,23 +181,9 @@
   let hoverT = $state<number | null>(null);
   const ended = (r: Request) => r.at + r.latency;
   const inWindow = $derived(shownRequests.filter((r) => ended(r) > from && r.at < to));
-  const total = $derived.by(() => {
-    const ok = inWindow.filter((r) => !r.failed);
-    const sum = (pick: (r: Request) => number) => ok.reduce((n, r) => n + pick(r), 0);
-    return {
-      requests: inWindow.length,
-      failed: inWindow.length - ok.length,
-      input: sum((r) => r.tokens.input),
-      cached: sum((r) => r.tokens.cacheRead),
-      output: sum((r) => r.tokens.output),
-      reasoning: sum((r) => r.tokens.reasoning),
-      succeeded: ok.length,
-      ttft: median(ok.map((r) => r.ttft)),
-      slowest: Math.max(0, ...ok.map((r) => r.ttft)),
-    };
-  });
+  const total = $derived(requestTotals(inWindow));
   /** What of the window this tab saw; counts over the rest are unknown, not zero. */
-  const blind = $derived(blindSpans(from, to, { since: watch.since, gaps: watch.gaps, stoppedAt: watch.state === "off" ? watch.stoppedAt : 0 }));
+  const blind = $derived(blindSpans(from, to, { since: watch.since, retainedAfter: watch.retainedAfter, gaps: watch.gaps, stoppedAt: watch.state === "off" ? watch.stoppedAt : 0 }));
   const watched = $derived(watchedMs(from, to, blind));
   const windowName = $derived(span === 60 ? "hour" : `${span} minutes`);
   /** The window cut into 30 steps on clock boundaries; a request counts where it finished. */
@@ -215,8 +201,8 @@
     return out;
   }
   const requestSteps = $derived(steps((r) => (r.failed ? [0, 1] : [1, 0])));
-  const inputSteps = $derived(steps((r) => [r.tokens.cacheRead, r.tokens.input - r.tokens.cacheRead]));
-  const outputSteps = $derived(steps((r) => [r.tokens.output, 0]));
+  const inputSteps = $derived(steps((r) => r.usageReported ? [r.tokens.cacheRead, r.tokens.input - r.tokens.cacheRead] : [0, 0]));
+  const outputSteps = $derived(steps((r) => [r.usageReported ? r.tokens.output : 0, 0]));
   const firstTokens = $derived(inWindow.filter((r) => !r.failed && r.ttft > 0).map((r) => ({ t: r.at + r.ttft, v: r.ttft, r })));
   const laneState = (a: Data): Lane["state"] => (a.disabled || a.configured_only ? "off" : credState(a, to).lamp);
   /** A lane for every account that can take requests, in the server's order so lanes stay put. */
@@ -224,7 +210,7 @@
     ...accounts.filter((a) => (!account || a.auth_index === account) && (!a.disabled || inWindow.some((r) => r.auth === a.auth_index))).map((a) => ({ key: String(a.auth_index), name: credName(a), sub: label(provider(a)), state: laneState(a) })),
     ...[...new Set(inWindow.map((r) => r.auth))].filter((k) => !accounts.some((a) => a.auth_index === k)).map((k) => ({ key: k, name: nameOf(k), sub: "", state: "off" as const })),
   ]);
-  const windowGaps = $derived(watch.gaps.filter((g) => g.to > from && g.from < to));
+  const windowGaps = $derived(blind.filter((g) => g.why === "gap" || g.why === "retained"));
   /** On first run there is nothing to watch: the screen offers setup instead of empty charts. */
   $effect(() => {
     if (app.accounts.data && !app.accounts.data.length) app.setupStarted = true;
@@ -249,17 +235,17 @@
   const ISSUES_SHOWN = $derived(app.wide ? 3 : app.short ? 0 : 1);
   const servingCount = $derived(accounts.filter((a) => !a.disabled && credState(a, to).lamp === "ok").length);
   const unknownKeys = $derived(accounts.filter((a) => a.configured_only && !a.disabled).length);
-  /** Failed requests the server log remembers from before this tab watched, by status. */
-  const earlier = $derived.by(() => {
-    const failed = lines.filter((l) => l.access && !l.own && l.access.status >= 400 && l.at < (watch.since || Infinity));
+  /** Server wall clocks have no timezone; these entries may overlap the absolute-time live feed. */
+  const loggedFailures = $derived.by(() => {
+    const failed = lines.filter((l) => l.access && !l.own && l.access.status >= 400);
     const by = new Map<number, number>();
     for (const l of failed) by.set(l.access!.status, (by.get(l.access!.status) || 0) + 1);
-    return { count: failed.length, since: lines.find((l) => l.at)?.at ?? 0, by: [...by.entries()].sort((a, b) => b[1] - a[1]) };
+    return { count: failed.length, by: [...by.entries()].sort((a, b) => b[1] - a[1]) };
   });
 
-  type Row = { kind: "request"; at: number; r: Request } | { kind: "gap"; at: number; from: number };
+  type Row = { kind: "request"; at: number; r: Request } | { kind: "gap"; at: number; from: number; retained: boolean };
   const rows = $derived<Row[]>(
-    [...inWindow.map((r): Row => ({ kind: "request", at: ended(r), r })), ...windowGaps.map((g): Row => ({ kind: "gap", at: g.to, from: g.from }))].sort((a, b) => b.at - a.at),
+    [...inWindow.map((r): Row => ({ kind: "request", at: ended(r), r })), ...windowGaps.map((g): Row => ({ kind: "gap", at: g.to, from: g.from, retained: g.why === "retained" }))].sort((a, b) => b.at - a.at),
   );
   function showWaiting() {
     document.getSelection()?.removeAllRanges();
@@ -315,7 +301,7 @@
     app.go("logs/server");
     reveal();
   }
-  const day = (t: number) => new Date(t).toLocaleDateString("en-US", { weekday: "long", day: "numeric", month: "long" });
+  const logTime = (l: LogLine) => l.timestamp.slice(11) || "—";
   const linesFor = (id: string) => (id ? lines.filter((l) => l.id && id.endsWith(l.id)) : []);
   const watchedFor = (id: string) => (id ? watch.requests.find((r) => r.id.endsWith(id)) : undefined);
 
@@ -472,11 +458,11 @@
           <!-- svelte-ignore a11y_no_noninteractive_tabindex: the scrolling log must be reachable by keyboard -->
           <div class="scroll loglines" bind:this={scroller} onscroll={() => (away = (scroller?.scrollTop ?? 0) > 24)} role="log" aria-label="Server log, newest first" aria-live="off" tabindex="0">
             {#each shownLines as l, i (l.n)}
-              {#if i > 0 && l.at && shownLines[i - 1].at && day(l.at) !== day(shownLines[i - 1].at)}<div class="logday">{day(l.at)}</div>{/if}
+              {#if i > 0 && l.timestamp && shownLines[i - 1].timestamp && l.timestamp.slice(0, 10) !== shownLines[i - 1].timestamp.slice(0, 10)}<div class="logday">{l.timestamp.slice(0, 10)}</div>{/if}
               <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions: the time is the row's button; the row click is a larger target for the same action -->
               <div class="logline {l.level}" class:sel={selLine === l.n} onclick={(e) => openLine(l, e.currentTarget.querySelector("button"))}>
-                <button class="t" data-line={l.n} aria-expanded={selLine === l.n} aria-label={`${l.at ? time(l.at) : "No time"}, ${l.level || "line"}: open this line`} onclick={(e) => (e.stopPropagation(), openLine(l, e.currentTarget))}
-                  >{l.at ? time(l.at) : "—"}</button
+                <button class="t" data-line={l.n} aria-expanded={selLine === l.n} aria-label={`${l.timestamp ? `${logTime(l)} server local time` : "No time"}, ${l.level || "line"}: open this line`} onclick={(e) => (e.stopPropagation(), openLine(l, e.currentTarget))}
+                  >{logTime(l)}</button
                 >
                 <span class="lvl">{l.level}</span>
                 {@render body(l)}
@@ -518,7 +504,7 @@
             <section class="issues" aria-labelledby="issues-title">
               {#if !issues.length}
                 <p class="row small muted" id="issues-title">
-                  <span class="dot ok"></span>No reported issues: {plural(servingCount, "account")} reported ready{unknownKeys ? `; ${plural(unknownKeys, "configured key")} with unknown health` : ""}. No watched request failed in the last {ISSUE_WINDOW / 60_000} minutes.
+                  <span class="dot ok"></span>No reported issues: {plural(servingCount, "account")} reported ready{unknownKeys ? `; ${plural(unknownKeys, "configured key")} with unknown health` : ""}. No retained request failed in the last {ISSUE_WINDOW / 60_000} minutes.
                 </p>
               {:else}
                 <h2 id="issues-title">{plural(issues.length, "issue")} now</h2>
@@ -538,10 +524,10 @@
                   <button class="link small justify-self-start" aria-expanded={allIssues} onclick={() => (allIssues = !allIssues)}>{allIssues ? (ISSUES_SHOWN ? `Show the first ${ISSUES_SHOWN}` : "Hide them") : ISSUES_SHOWN ? `Show ${issues.length - ISSUES_SHOWN} more` : `Show ${issues.length === 1 ? "it" : "them"}`}</button>
                 {/if}
               {/if}
-              {#if earlier.count && (app.wide || allIssues || !issues.length)}
+              {#if loggedFailures.count && (app.wide || allIssues || !issues.length)}
                 <p class="small muted">
-                  Before this tab was watching, the server log has {plural(earlier.count, "failed request")} since {when(earlier.since)}:
-                  {earlier.by.map(([status, n]) => `${n} with ${status}`).join(", ")}. <a href="#logs/server" onclick={() => (kind = "problems")}>Open the server log</a>
+                  The loaded server log has {plural(loggedFailures.count, "failed request entry", "failed request entries")}:
+                  {loggedFailures.by.map(([status, n]) => `${n} with ${status}`).join(", ")}. These can overlap watched requests. <a href="#logs/server" onclick={() => (kind = "problems")}>Open the server log</a>
                 </p>
               {/if}
             </section>
@@ -550,8 +536,8 @@
               <div class="flex flex-wrap items-center gap-x-6 gap-y-1">
                   <dl class="grid grow basis-full grid-cols-2 gap-x-4 gap-y-1 sm:flex sm:basis-auto sm:flex-wrap sm:gap-x-7">
                     <div class="flex min-w-0 flex-wrap items-baseline gap-x-1.5"><dt class="small muted">Requests</dt><dd class="font-semibold">{num(total.requests)}</dd><dd class="small {total.failed ? 'code-status bad' : 'muted'}">{total.failed} failed</dd></div>
-                    <div class="flex min-w-0 flex-wrap items-baseline gap-x-1.5"><dt class="small muted">Input</dt><dd class="font-semibold">{total.succeeded ? compact(total.input) : "—"}</dd><dd class="small muted">{total.succeeded ? `${percent(total.cached, total.input)} cached` : ""}</dd></div>
-                    <div class="flex min-w-0 flex-wrap items-baseline gap-x-1.5"><dt class="small muted">Output</dt><dd class="font-semibold">{total.succeeded ? compact(total.output) : "—"}</dd></div>
+                    <div class="flex min-w-0 flex-wrap items-baseline gap-x-1.5"><dt class="small muted">Input</dt><dd class="font-semibold">{total.usageReports ? compact(total.input) : "—"}</dd><dd class="small muted">{total.usageReports ? `${percent(total.cached, total.input)} cached` : ""}</dd></div>
+                    <div class="flex min-w-0 flex-wrap items-baseline gap-x-1.5"><dt class="small muted">Output</dt><dd class="font-semibold">{total.usageReports ? compact(total.output) : "—"}</dd></div>
                     <div class="flex min-w-0 flex-wrap items-baseline gap-x-1.5"><dt class="small muted">First token</dt><dd class="font-semibold">{total.ttft === null ? "—" : duration(total.ttft)}</dd><dd class="small muted">{total.ttft === null ? "" : "median"}</dd></div>
                   </dl>
               </div>
@@ -559,7 +545,7 @@
               {#if blind.length}
                 <p class="small muted watched">
                   <span class="hatch-key" aria-hidden="true"></span>
-                  <span>{watched ? `Watched ${ago(watched)} of the last ${windowName}` : `Nothing watched in the last ${windowName}`}{watch.state === "off" ? ", not watching now" : ""}, so these counts are lower bounds.</span>
+                  <span>{watched ? `Watched ${ago(watched)} of the last ${windowName}` : `Nothing watched in the last ${windowName}`}{watch.state === "off" ? ", not watching now" : ""}, so these counts are lower bounds. {watch.retainedAfter > from ? "Older request history was discarded locally." : ""}</span>
                 </p>
               {/if}
             </section>
@@ -575,36 +561,36 @@
                     steps={requestSteps}
                     fmt={compact}
                     read={(s) => `${num(s.a + s.b)}${s.b ? `, ${num(s.b)} failed` : ""}`}
-                    {from} {to} {size} hover={hoverT} onhover={(t) => (hoverT = t)}
+                    {from} {to} {size} {blind} hover={hoverT} onhover={(t) => (hoverT = t)}
                   />
                   <Trend
                     title="Input tokens"
-                    value={total.succeeded ? compact(total.input) : "—"}
-                    note={total.succeeded ? `${percent(total.cached, total.input)} read from cache` : "no finished requests"}
+                    value={total.usageReports ? compact(total.input) : "—"}
+                    note={total.usageReports ? `${percent(total.cached, total.input)} read from cache` : "no reported usage"}
                     names={["From cache", "Not cached"]}
                     tone="light"
                     steps={inputSteps}
                     fmt={compact}
                     read={(s) => `${compact(s.a + s.b)}, ${percent(s.a, s.a + s.b)} cached`}
-                    {from} {to} {size} hover={hoverT} onhover={(t) => (hoverT = t)}
+                    {from} {to} {size} {blind} hover={hoverT} onhover={(t) => (hoverT = t)}
                   />
                   <Trend
                     title="Output tokens"
-                    value={total.succeeded ? compact(total.output) : "—"}
-                    note={!total.succeeded ? "no finished requests" : total.reasoning ? `${compact(total.reasoning)} reasoning` : "no reasoning tokens"}
+                    value={total.usageReports ? compact(total.output) : "—"}
+                    note={!total.usageReports ? "no reported usage" : total.reasoning ? `${compact(total.reasoning)} reasoning` : "no reasoning tokens"}
                     steps={outputSteps}
                     fmt={compact}
                     read={(s) => compact(s.a)}
-                    {from} {to} {size} hover={hoverT} onhover={(t) => (hoverT = t)}
+                    {from} {to} {size} {blind} hover={hoverT} onhover={(t) => (hoverT = t)}
                   />
                   <Trend
                     title="Time to first token"
                     value={total.ttft === null ? "—" : duration(total.ttft)}
-                    note={total.ttft === null ? "no finished requests" : `median; slowest ${duration(total.slowest)}`}
+                    note={total.ttft === null ? "no successful timing" : `median; slowest ${duration(total.slowest)}`}
                     dots={firstTokens}
                     fmt={duration}
                     empty="No finished requests in this window"
-                    {from} {to} {size} hover={hoverT} onhover={(t) => (hoverT = t)} onpick={(r) => openRequest(r, document.activeElement)}
+                    {from} {to} {size} {blind} hover={hoverT} onhover={(t) => (hoverT = t)} onpick={(r) => openRequest(r, document.activeElement)}
                   />
                 </div>
                 <Timeline {lanes} requests={inWindow} {from} {to} {blind} selected={selRequest} hover={hoverT} onhover={(t) => (hoverT = t)} onpick={(r) => openRequest(r, document.activeElement)} />
@@ -639,7 +625,7 @@
                 <tbody>
                   {#each rows as row (row.kind === "request" ? row.r.n : `gap-${row.at}`)}
                     {#if row.kind === "gap"}
-                      <tr class="gap-row"><td colspan="9"><span class="dot warn"></span> Not captured: requests between {time(row.from)} and {time(row.at)}. This tab was hidden, behind or not watching.</td></tr>
+                      <tr class="gap-row"><td colspan="9"><span class="dot warn"></span> {row.retained ? "Discarded locally" : "Not captured"}: requests between {time(row.from)} and {time(row.at)}. {row.retained ? "Older request history exceeded this tab’s retention limit." : "This tab was hidden, behind or not watching."}</td></tr>
                     {:else}
                       {@const r = row.r}
                       <tr class="clickable" class:failed={r.failed} class:sel={selRequest === r.n} onclick={(e) => openRequest(r, e.currentTarget.querySelector("button"))}>
@@ -649,9 +635,9 @@
                         <td class="c-acct">{nameOf(r.auth)} <span class="faint">{label(r.provider)}</span></td>
                         <td class="num c-dur">{duration(r.latency)}</td>
                         <td class="num c-wide">{r.ttft ? duration(r.ttft) : "—"}</td>
-                        <td class="num c-mid">{r.failed ? "—" : num(r.tokens.input)}</td>
-                        <td class="num c-wide">{r.failed ? "—" : percent(r.tokens.cacheRead, r.tokens.input)}</td>
-                        <td class="num c-mid">{r.failed ? "—" : num(r.tokens.output)}</td>
+                        <td class="num c-mid">{r.usageReported ? num(r.tokens.input) : "—"}</td>
+                        <td class="num c-wide">{r.usageReported ? percent(r.tokens.cacheRead, r.tokens.input) : "—"}</td>
+                        <td class="num c-mid">{r.usageReported ? num(r.tokens.output) : "—"}</td>
                       </tr>
                     {/if}
                   {/each}
@@ -681,7 +667,7 @@
       <Detail label="Log line details" {modal} item={`line-${line.n}`} onclose={close} {returnTo}>
         {#snippet head()}
           <h2 data-detail-title tabindex="-1">{line.access ? `${line.access.status} ${line.access.method} ${line.access.path}` : "Log line"}</h2>
-          <p class="small muted">{line.at ? `${when(line.at)}:${String(new Date(line.at).getSeconds()).padStart(2, "0")}` : "No timestamp"}{line.level ? `, ${line.level}` : ""}</p>
+          <p class="small muted">{line.timestamp ? `${line.timestamp} (server local time; timezone not reported)` : "No timestamp"}{line.level ? `, ${line.level}` : ""}</p>
         {/snippet}
         <section>
           <pre class="code tall">{line.raw}</pre>
@@ -702,7 +688,7 @@
             <h3>Same request <span class="mono faint">{line.id}</span></h3>
             {#if seen}
               <p class="small">
-                This tab watched it: <span class="mono">{seen.model}</span> on {nameOf(seen.auth)}{seen.failed ? "" : `, ${num(seen.tokens.input + seen.tokens.output)} tokens`}.
+                This tab watched it: <span class="mono">{seen.model}</span> on {nameOf(seen.auth)}{seen.usageReported ? `, ${num(seen.tokens.input + seen.tokens.output)} tokens` : ""}.
                 <button class="link" onclick={() => jumpToRequest(seen)}>Model, timing and tokens</button>
               </p>
             {/if}
@@ -711,7 +697,7 @@
                 {#each related as l (l.n)}
                   <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions: the time is the row's button -->
                   <div class="logline {l.level}" onclick={() => openLine(l)}>
-                    <button class="t" onclick={(e) => (e.stopPropagation(), openLine(l))}>{time(l.at)}</button><span class="lvl">{l.level}</span>{@render body(l)}
+                    <button class="t" onclick={(e) => (e.stopPropagation(), openLine(l))}>{logTime(l)}</button><span class="lvl">{l.level}</span>{@render body(l)}
                   </div>
                 {/each}
               </div>
@@ -767,7 +753,7 @@
             <p class="small muted">Time since the request arrived. The server timed only the stages listed.</p>
           {:else}<p class="small muted">Took {duration(r.latency)}{r.ttft ? `, first token after ${duration(r.ttft)}` : ""}. The server reported no stage timings for this request.</p>{/if}
         </section>
-        {#if !r.failed}
+        {#if r.usageReported}
           <section>
             <h3>Tokens</h3>
             <dl class="facts">
@@ -782,7 +768,7 @@
         {:else}
           <section>
             <h3>Tokens</h3>
-            <p class="small muted">Not reported: the request failed before the provider counted tokens.</p>
+            <p class="small muted">The provider did not report usage for this request.</p>
           </section>
         {/if}
         <section>
@@ -792,7 +778,7 @@
               {#each related as l (l.n)}
                 <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions: the time is the row's button -->
                 <div class="logline {l.level}" onclick={() => jumpToLine(l)}>
-                  <button class="t" onclick={(e) => (e.stopPropagation(), jumpToLine(l))}>{time(l.at)}</button><span class="lvl">{l.level}</span>{@render body(l)}
+                  <button class="t" onclick={(e) => (e.stopPropagation(), jumpToLine(l))}>{logTime(l)}</button><span class="lvl">{l.level}</span>{@render body(l)}
                 </div>
               {/each}
             </div>
