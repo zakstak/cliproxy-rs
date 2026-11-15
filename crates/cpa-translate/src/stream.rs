@@ -414,10 +414,10 @@ mod tests {
         out
     }
 
-    /// Chunks and frames recorded from Go's responsesSSEFramer (the Kimi device fixtures
-    /// responses-stream-clamp and responses-stream-data-only-frames).
+    /// Responses clients receive named SSE events with exactly one terminating blank line.
+    /// Values are specified here from the event schema, independently of translator output.
     #[test]
-    fn responses_framer_matches_recorded_go_frames() {
+    fn responses_framer_keeps_event_order_payload_and_terminal_boundaries() {
         let clamp: [&[u8]; 9] = [
             b"event: response.created\n",
             b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\"}}\n",
@@ -435,6 +435,26 @@ mod tests {
                 b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_2\"}}\n\n".to_vec(),
                 b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n".to_vec(),
                 b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\"}}\n\n".to_vec(),
+            ]
+        );
+        let complete = clamp.concat();
+        assert_eq!(responses(&[&complete]), responses(&clamp));
+        let parsed: Vec<serde_json::Value> = responses(&clamp)
+            .iter()
+            .map(|frame| {
+                let data = frame
+                    .split(|&b| b == b'\n')
+                    .find_map(|line| line.strip_prefix(b"data: "))
+                    .unwrap();
+                serde_json::from_slice(data).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            parsed,
+            vec![
+                serde_json::json!({"type":"response.created","response":{"id":"resp_2"}}),
+                serde_json::json!({"type":"response.output_text.delta","delta":"hi"}),
+                serde_json::json!({"type":"response.completed","response":{"id":"resp_2"}}),
             ]
         );
         // Data-only events stay separate frames; the invalid tail is dropped on flush.
@@ -464,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_framer_matches_go_joining() {
+    fn responses_framer_buffers_partial_events_and_flushes_once() {
         assert_eq!(
             responses(&[b"event: a", b"data: {}", b""]),
             [b"event: a\ndata: {}\n\n".to_vec()]

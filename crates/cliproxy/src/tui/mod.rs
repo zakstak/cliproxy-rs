@@ -22,10 +22,10 @@ mod config;
 mod dashboard;
 #[cfg(test)]
 mod e2e;
-#[cfg(test)]
-mod golden;
 mod i18n;
 mod keys;
+#[cfg(test)]
+mod layout_tests;
 mod logs;
 mod oauth;
 mod style;

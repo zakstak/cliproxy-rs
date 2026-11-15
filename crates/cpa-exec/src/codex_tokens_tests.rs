@@ -1,5 +1,5 @@
-//! Replays tests/fixtures/codex_tokens_go.json: Go's `CodexExecutor.CountTokens` at
-//! 6fecc6e (tests/reference/codex_client/README.md), through the Rust executor.
+//! Local token-estimate behavior uses independently specified text examples.
+//! These estimates are never evidence of provider-reported usage.
 
 use super::*;
 use bytes::Bytes;
@@ -44,41 +44,112 @@ fn request(v: &Value) -> ExecRequest {
     }
 }
 
+/// These counts use tiktoken's ordinary-text vocabulary: "hello" is one token and
+/// "hello world" is two in both supported encodings. Each extraction position is
+/// tested alone so an unrelated field cannot compensate for a missing segment.
+#[test]
+fn token_text_extraction_counts_each_supported_segment_and_ignores_nontext_inputs() {
+    for encoding in [Encoding::O200kBase, Encoding::Cl100kBase] {
+        for body in [
+            serde_json::json!({"instructions":"  hello  "}),
+            serde_json::json!({"input":[{"type":"message","content":[{"type":"input_text","text":"hello"}]}]}),
+            serde_json::json!({"input":[{"type":"function_call","name":"hello"}]}),
+            serde_json::json!({"input":[{"type":"function_call","arguments":"hello"}]}),
+            serde_json::json!({"input":[{"type":"function_call_output","output":"hello"}]}),
+            serde_json::json!({"input":[{"type":"reasoning","text":"hello"}]}),
+            serde_json::json!({"tools":[{"name":"hello"}]}),
+            serde_json::json!({"tools":[{"description":"hello"}]}),
+            serde_json::json!({"tools":[{"parameters":"hello"}]}),
+            serde_json::json!({"tools":[{"parameters":{}}]}),
+            serde_json::json!({"text":{"format":{"name":"hello"}}}),
+            serde_json::json!({"text":{"format":{"schema":"hello"}}}),
+            serde_json::json!({"text":{"format":{"schema":{}}}}),
+        ] {
+            assert_eq!(
+                count_input_tokens(encoding, body.to_string().as_bytes()).unwrap(),
+                1,
+                "{body}"
+            );
+        }
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"instructions":" \t\n "}),
+            serde_json::json!({"input":[{"type":"message","content":[{"type":"input_image","image_url":"https://example.invalid/image.png"}]}]}),
+        ] {
+            assert_eq!(
+                count_input_tokens(encoding, body.to_string().as_bytes()).unwrap(),
+                0,
+                "{body}"
+            );
+        }
+        assert_eq!(
+            count_input_tokens(encoding, br#"{"instructions":"hello world"}"#).unwrap(),
+            2
+        );
+        assert_eq!(
+            count_input_tokens(
+                encoding,
+                br#"{"instructions":" hello ","input":[{"type":"function_call_output","output":" world "}]}"#
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(count_input_tokens(encoding, b"").unwrap(), 0);
+    }
+}
+
 #[tokio::test]
-async fn count_tokens_matches_go() {
-    let vectors: Vec<Value> = serde_json::from_str(include_str!("../tests/fixtures/codex_tokens_go.json")).unwrap();
-    assert_eq!(vectors.len(), 30);
-    // Nothing is sent: the base URL is unroutable and the token stays unused.
+async fn token_estimates_cover_native_and_translated_clients_without_upstream_traffic() {
+    let mock = crate::codex_testkit::Mock::start().await;
     let credential = Credential {
-        id: "codex-tokens.json".into(),
+        id: "local-count.json".into(),
         provider: "codex".into(),
-        source: Source::File("/fake/codex-tokens.json".into()),
+        source: Source::File("/fake/local-count.json".into()),
         disabled: false,
-        label: "codex".into(),
-        attributes: [("base_url".to_owned(), "http://127.0.0.1:1".to_owned())].into(),
+        label: "local".into(),
+        attributes: [("base_url".to_owned(), mock.url.clone())].into(),
         metadata: Default::default(),
         revision: 0,
     };
     let executor = crate::codex::CodexExecutor::new().unwrap();
     let cfg = Config::default();
-    for v in &vectors {
-        assert!(v["err"].is_null(), "Go failed: {v}");
-        let response = executor.execute(&credential, request(v), &cfg).await.unwrap();
-        let ResponseBody::Buffered(body) = response.body else {
-            panic!("buffered count expected")
-        };
-        assert_eq!(
-            std::str::from_utf8(&body).unwrap(),
-            v["out"].as_str().unwrap(),
-            "{} {}",
-            v["from"],
-            v["model"]
-        );
+    // Each source describes exactly the same text. Counts are local estimates, not
+    // provider-reported usage; no real credential or auth directory is loaded.
+    for model in ["gpt-5.5", "gpt-5.5(high)", "gpt-4.1-mini", "gpt-4o-mini", "gpt-4", "o3"] {
+        for (format, body) in [
+            (
+                "openai-response",
+                r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello world"}]}]}"#,
+            ),
+            ("openai", r#"{"messages":[{"role":"user","content":"hello world"}]}"#),
+            (
+                "claude",
+                r#"{"max_tokens":32,"messages":[{"role":"user","content":"hello world"}]}"#,
+            ),
+        ] {
+            let vector = serde_json::json!({"from":format,"response":"openai-response","model":model,"in":body});
+            let response = executor.execute(&credential, request(&vector), &cfg).await.unwrap();
+            assert_eq!(response.status, 200);
+            assert_eq!(response.headers[crate::codex::LOCAL_TOKEN_COUNT], "local-estimate");
+            let ResponseBody::Buffered(body) = response.body else {
+                panic!("local token count is buffered")
+            };
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({"response":{"usage":{"input_tokens":2,"output_tokens":0,"total_tokens":2}}})
+            );
+        }
     }
+    assert!(
+        mock.take().is_empty(),
+        "local counting never contacts the selected provider"
+    );
 }
 
+/// This is the proxy's local-estimate model policy, not a claim about provider usage.
 #[test]
-fn encodings_follow_go_model_prefixes() {
+fn local_estimate_models_choose_the_documented_tokenizer_family() {
     for (model, want) in [
         ("gpt-5.5", Encoding::O200kBase),
         (" GPT-4.1-mini", Encoding::O200kBase),

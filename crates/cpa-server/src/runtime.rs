@@ -4147,32 +4147,49 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Go `nextRefreshCheckAt` skips `AuthKind() == apikey` for every provider. The
-    /// kinds are Go's `AuthKind` goldens (tests/fixtures/server_go.json `auth_kind`).
+    /// Only enabled saved OAuth-like credentials participate in refresh; configured
+    /// API keys and disabled credentials cannot schedule a refresh.
     #[test]
-    fn refresh_skips_api_key_kinds_like_go() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        let mut kinds = std::collections::BTreeSet::new();
-        for case in fixture["auth_kind"].as_array().unwrap() {
-            let meta = serde_json::json!({"type": "kimi"}).as_object().unwrap().clone();
-            let mut c = Credential::from_file(Path::new("/a"), Path::new("/a/x.json"), meta).unwrap();
-            c.metadata = case["metadata"].as_object().cloned().unwrap_or_default();
-            c.attributes = case["attributes"]
-                .as_object()
-                .map(|a| {
-                    a.iter()
-                        .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let kind = case["kind"].as_str().unwrap();
-            kinds.insert(kind);
-            assert_eq!(refresh_candidate(&c), kind != "apikey", "case {case}");
-            c.disabled = true;
-            assert!(!refresh_candidate(&c));
+    fn refresh_requires_an_enabled_file_credential_without_an_api_key() {
+        for provider in ["claude", "codex", "xai", "meta"] {
+            for (metadata, attributes, expected) in [
+                (
+                    serde_json::json!({"access_token":"fake-oauth"}),
+                    serde_json::json!({}),
+                    true,
+                ),
+                (
+                    serde_json::json!({"email":"a@example.test"}),
+                    serde_json::json!({}),
+                    true,
+                ),
+                (serde_json::json!({}), serde_json::json!({"api_key":"fake-api"}), false),
+                (
+                    serde_json::json!({"access_token":"fake-oauth"}),
+                    serde_json::json!({"auth_kind":"apikey"}),
+                    false,
+                ),
+                (serde_json::json!({}), serde_json::json!({"auth_kind":"oauth"}), true),
+            ] {
+                let mut c = cred("refresh.json", provider, false);
+                c.metadata = metadata.as_object().unwrap().clone();
+                c.attributes = attributes
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
+                    .collect();
+                assert_eq!(refresh_candidate(&c), expected, "{provider}: {attributes}");
+                c.disabled = true;
+                assert!(!refresh_candidate(&c));
+                c.disabled = false;
+                c.source = Source::Config {
+                    section: format!("{provider}-api-key"),
+                    index: 0,
+                };
+                assert!(!refresh_candidate(&c), "config keys never refresh");
+            }
         }
-        assert!(kinds.contains("apikey") && kinds.contains("oauth"), "{kinds:?}");
     }
 
     fn cred(id: &str, provider: &str, disabled: bool) -> Credential {
@@ -5038,7 +5055,8 @@ pub(crate) mod tests {
     /// Go `nextModelPoolOffset` (conductor_models.go): per-key cursor, no advance for
     /// single-entry pools or blank keys, reset to zero at the int32 guard.
     #[test]
-    fn pool_offsets_rotate_per_key_like_go() {
+    // Product policy: Pool selection advances independently per key; stale refreshes merge only safe fields and cannot overwrite a newer credential revision.
+    fn pool_offsets_rotate_independently_per_key() {
         let rt = crate::testing::runtime(
             Config::parse("").unwrap(),
             Vec::new(),
@@ -5061,11 +5079,10 @@ pub(crate) mod tests {
         assert_eq!(rt.next_pool_offset("d", 3), 1);
     }
 
-    /// Go `Manager.persist` after `MarkResult`: the auth file gains `"disabled": false`
-    /// in `json.Marshal` form (sorted keys, float64 numbers, HTML escaping, no newline)
-    /// once, and is not rewritten while it already holds that JSON.
+    /// First use persists the enabled flag without changing credential metadata.
+    /// Equivalent later use and watcher reconciliation leave the revision alone.
     #[test]
-    fn first_use_persists_disabled_in_go_marshal_form() {
+    fn first_use_persists_enabled_state_without_changing_credential_meaning() {
         let dir = std::env::temp_dir().join(format!(
             "persist-{}-{}",
             std::process::id(),
@@ -5086,10 +5103,15 @@ pub(crate) mod tests {
             .unwrap()
             .complete(Outcome::Success);
         let written = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            written,
-            r#"{"big":1000,"disabled":false,"email":"a\u003cb\u003e@x.invalid","n":1.5,"nested":{"a":[true,null],"z":1},"type":"claude"}"#
-        );
+        let mut expected: Value = serde_json::from_str(original).unwrap();
+        expected["disabled"] = false.into();
+        let actual: Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(actual["email"], expected["email"]);
+        assert_eq!(actual["nested"], expected["nested"]);
+        assert_eq!(actual["type"], expected["type"]);
+        assert_eq!(actual["disabled"], false);
+        assert_eq!(actual["n"].as_f64(), expected["n"].as_f64());
+        assert_eq!(actual["big"].as_f64(), expected["big"].as_f64());
         let current = store.get("a.json").unwrap();
         assert_eq!(current.revision, revision, "a neutral write keeps the revision");
         assert_eq!(current.metadata.get("disabled"), Some(&Value::Bool(false)));
@@ -7209,7 +7231,8 @@ pub(crate) mod tests {
     /// Go `mergeAuthContent` and `CredentialRefreshPatch.Apply` for a refresh that lost
     /// the race to another edit (metadata_merge_test.go, refresh_patch_test.go).
     #[test]
-    fn a_stale_refresh_merges_like_go() {
+    // Product policy: Pool selection advances independently per key; stale refreshes merge only safe fields and cannot overwrite a newer credential revision.
+    fn a_stale_refresh_merges_safe_fields_without_overwriting_new_tokens() {
         use serde_json::json;
         let map = |v: Value| v.as_object().unwrap().clone();
         let codex = json!({"type": "codex", "access_token": "a", "refresh_token": "r", "account_id": "acct", "email": "e@x", "plan_type": "plus"});

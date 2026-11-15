@@ -692,7 +692,7 @@ mod tests {
 
     /// Packets captured from Go's zeroconf advertiser on a dummy interface (README.md).
     #[test]
-    fn decodes_compressed_packets_from_go_zeroconf() {
+    fn dns_compression_decodes_captured_service_records() {
         let packets: serde_json::Value =
             serde_json::from_str(include_str!("../../tests/fixtures/discovery_go_packets.json")).unwrap();
         let decode = |k: &str| {
@@ -782,28 +782,30 @@ mod tests {
     }
 
     #[test]
-    fn lookup_answers_match_zeroconf_order_and_flush_bits() {
+    fn mdns_unique_records_flush_caches_and_goodbye_records_expire_immediately() {
+        // RFC 6762 sections 10.1 and 10.2: shared PTR records do not flush caches;
+        // unique address, SRV, and TXT records do. Goodbye records have TTL zero.
         let svc = service();
-        let mut m = Message::default();
-        svc.lookup(&mut m, TTL, true);
-        let kinds: Vec<(u16, u32)> = m.answers.iter().map(|r| (r.class, r.ttl)).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                (CLASS_IN | CLASS_FLUSH, TTL),
-                (CLASS_IN | CLASS_FLUSH, TTL),
-                (CLASS_IN, TTL),
-                (CLASS_IN, TTL),
-                (CLASS_IN, TTL),
-                (CLASS_IN | CLASS_FLUSH, 120),
-                (CLASS_IN | CLASS_FLUSH, 120),
-            ]
-        );
-        let mut bye = Message::default();
-        svc.lookup(&mut bye, 0, true);
-        assert!(bye.answers.iter().all(|r| r.ttl == 0));
+        let mut answer = Message::default();
+        svc.lookup(&mut answer, TTL, true);
+        let mut counts = HashMap::new();
+        for record in &answer.answers {
+            let unique = matches!(
+                record.data,
+                RData::A(_) | RData::Aaaa(_) | RData::Srv { .. } | RData::Txt(_)
+            );
+            assert_eq!(record.class & CLASS_FLUSH != 0, unique);
+            assert_eq!(record.class & !CLASS_FLUSH, CLASS_IN);
+            assert!(record.ttl > 0);
+            *counts.entry(if unique { "unique" } else { "shared" }).or_insert(0) += 1;
+        }
+        assert_eq!(counts["unique"], 4);
+        assert_eq!(counts["shared"], 3);
+        let mut goodbye = Message::default();
+        svc.lookup(&mut goodbye, 0, true);
+        assert_eq!(goodbye.answers.len(), answer.answers.len());
+        assert!(goodbye.answers.iter().all(|record| record.ttl == 0));
     }
-
     #[test]
     fn collector_stops_after_256_entries_and_merges_duplicates() {
         let mut c = Collector::default();

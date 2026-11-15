@@ -2,8 +2,8 @@
 //!
 //! Each tick freezes the registry and publishes the executions as bounded frames: sorted
 //! aggregates per (credential, model, accounted) and, space permitting, sorted request
-//! details. Frames carry Go's exact JSON bytes, so part sizes and truncation decisions
-//! match Go. When the aggregates cannot fit, one `overflow` frame reports the group count.
+//! details. Encoded frame sizes determine truncation. When the aggregates cannot fit,
+//! one `overflow` frame reports the group count.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock};
@@ -479,27 +479,15 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos as u64)
     }
 
-    /// Go's frames byte for byte (go_auth_golden.json), part and overflow alike: the
-    /// field order, tags and required keys Go `TestCredentialInFlightWireContractFixture`
-    /// pins. (`TestCredentialInFlightWireContractRejectsInvalidJSON` checks Home's
-    /// decoder; a node only writes these frames.) The golden also runs the inputs of
-    /// Go's encoder tests, named after them:
-    /// `TestEncodeHomeInFlightFreezePreservesPartitionsAndBarrier`,
-    /// `…UsesOverflowWithoutPartialAggregates`, `…UsesDeterministicBoundedMultipartFrames`,
-    /// `…OverflowsWhenFinalAggregatePartExceedsPartCount`,
-    /// `…TruncatesDetailsBeforeTotalOverflow`, `…BoundsStringsAndExcludesSensitiveFields`,
-    /// `…OverflowsForRawAggregateKey`, `…KeepsRawAggregateGroupsDistinct`,
-    /// `…DropsInvalidDetailsWithoutDiscardingAggregates`,
-    /// `…CanonicalizesUnaccountedModelsWithFallback` and
-    /// `…SetsGlobalDetailTruncationMetadata` (their zero start times become the epoch:
-    /// a Rust scope always records its start).
+    /// Complete snapshots preserve aggregates and bound optional detail frames.
     #[test]
-    fn frames_match_go_bytes() {
-        let doc: Json = serde_json::from_str(include_str!("../tests/fixtures/go_auth_golden.json")).unwrap();
-        for case in doc["inflight"].as_array().unwrap() {
+    fn snapshot_scenarios_preserve_complete_aggregates_with_bounded_safe_details() {
+        // These historical inputs contain no recorded output. The independent model
+        // below counts executions and verifies the public snapshot schema and caps.
+        let doc: Json = serde_json::from_str(include_str!("../tests/fixtures/inflight_inputs.json")).unwrap();
+        for case in doc["cases"].as_array().unwrap() {
             let name = case["name"].as_str().unwrap();
-            let c = &case["cfg"];
-            let n = |k: &str| c[k].as_u64().unwrap() as usize;
+            let n = |key: &str| case["cfg"][key].as_u64().unwrap() as usize;
             let cfg = PublisherConfig {
                 snapshot_interval: Duration::from_secs(2),
                 max_part_bytes: n("max_part_bytes"),
@@ -509,99 +497,185 @@ mod tests {
                 max_details: n("max_details"),
                 max_string_bytes: n("max_string_bytes"),
             };
-            let executions = case["observations"]
+            let executions: Vec<Observation> = case["observations"]
                 .as_array()
-                .map(|list| {
-                    list.iter()
-                        .map(|o| Observation {
-                            request_id: o["request_id"].as_str().unwrap().into(),
-                            credential_id: o["credential_id"].as_str().unwrap().into(),
-                            model: o["model"].as_str().unwrap().into(),
-                            request_kind: o["request_kind"].as_str().unwrap().into(),
-                            started_at: time(o["started_unix_nano"].as_i64().unwrap()),
-                            accounted: o["accounted"].as_bool().unwrap(),
-                        })
-                        .collect()
+                .into_iter()
+                .flatten()
+                .map(|o| Observation {
+                    request_id: o["request_id"].as_str().unwrap().into(),
+                    credential_id: o["credential_id"].as_str().unwrap().into(),
+                    model: o["model"].as_str().unwrap().into(),
+                    request_kind: o["request_kind"].as_str().unwrap().into(),
+                    started_at: time(o["started_unix_nano"].as_i64().unwrap()),
+                    accounted: o["accounted"].as_bool().unwrap(),
                 })
-                .unwrap_or_default();
+                .collect();
             let freeze = Freeze {
                 revision: case["revision"].as_i64().unwrap(),
                 barrier_revision: case["barrier"].as_i64().unwrap(),
                 executions,
             };
-            let got: Vec<String> = encode(&freeze, time(case["observed_unix_nano"].as_i64().unwrap()), &cfg)
-                .into_iter()
-                .map(|f| String::from_utf8(f).unwrap())
-                .collect();
-            let want: Vec<String> = serde_json::from_value(case["frames"].clone()).unwrap();
-            assert_eq!(got, want, "{name}");
+            let observed = time(case["observed_unix_nano"].as_i64().unwrap());
+            // Canonical spellings present in these input vectors are explicit; the
+            // checker does not call the production normalization or packing helpers.
+            let model = |o: &Observation| match (o.accounted, o.model.as_str()) {
+                (false, "GPT-5(high)" | "GPT-5(HIGH)") => "gpt-5".to_owned(),
+                (false, "   ") => "unknown".to_owned(),
+                _ => o.model.clone(),
+            };
+            let mut expected = BTreeMap::new();
+            for o in &freeze.executions {
+                *expected
+                    .entry((o.credential_id.clone(), model(o), o.accounted))
+                    .or_insert(0u64) += 1;
+            }
+            let frames = encode(&freeze, observed, &cfg);
+            assert!(!frames.is_empty(), "{name}");
+            assert_eq!(
+                frames,
+                encode(&freeze, observed, &cfg),
+                "{name}: deterministic snapshot"
+            );
+            let docs: Vec<Json> = frames.iter().map(|raw| serde_json::from_slice(raw).unwrap()).collect();
+            for frame in &docs {
+                assert_eq!(frame["revision"], freeze.revision, "{name}");
+                assert_eq!(frame["barrier_revision"], freeze.barrier_revision, "{name}");
+                assert_eq!(
+                    SystemTime::from(DateTime::parse_from_rfc3339(frame["observed_at"].as_str().unwrap()).unwrap()),
+                    observed,
+                    "{name}"
+                );
+            }
+            if docs[0]["kind"] == "overflow" {
+                assert_eq!(docs.len(), 1, "{name}: no partial aggregate revision");
+                assert_eq!(
+                    docs[0]["aggregate_group_count"].as_u64().unwrap_or(0),
+                    expected.len() as u64,
+                    "{name}"
+                );
+                assert!(
+                    docs[0].get("aggregates").is_none() && docs[0].get("details").is_none(),
+                    "{name}"
+                );
+                // Generous bounds on ordinary inputs must never discard a snapshot.
+                assert!(
+                    cfg.max_part_bytes < 262144
+                        || cfg.max_aggregate_groups < expected.len()
+                        || cfg.max_string_bytes < 256,
+                    "{name}: unexpected overflow"
+                );
+                continue;
+            }
+            assert!(frames.len() <= cfg.max_part_count, "{name}");
+            assert!(frames.iter().all(|raw| raw.len() <= cfg.max_part_bytes), "{name}");
+            assert!(
+                frames.iter().map(Vec::len).sum::<usize>() <= cfg.max_revision_bytes,
+                "{name}"
+            );
+            let mut actual = BTreeMap::new();
+            let mut details = Vec::new();
+            for (index, frame) in docs.iter().enumerate() {
+                assert_eq!(frame["kind"], "part", "{name}");
+                assert_eq!(frame["part_index"], index, "{name}");
+                assert_eq!(frame["part_count"], docs.len(), "{name}");
+                for aggregate in frame["aggregates"].as_array().into_iter().flatten() {
+                    let status = aggregate["status"].as_str().unwrap();
+                    assert!(matches!(status, "accounted" | "unaccounted"), "{name}");
+                    let key = (
+                        aggregate["credential_id"].as_str().unwrap().to_owned(),
+                        aggregate["model"].as_str().unwrap().to_owned(),
+                        status == "accounted",
+                    );
+                    assert!(
+                        actual.insert(key, aggregate["count"].as_u64().unwrap()).is_none(),
+                        "{name}: duplicate aggregate group"
+                    );
+                }
+                details.extend(frame["details"].as_array().into_iter().flatten());
+            }
+            assert_eq!(actual, expected, "{name}: all accounting partitions survive");
+            assert!(details.len() <= cfg.max_details, "{name}");
+            for detail in &details {
+                let fields = detail.as_object().unwrap();
+                assert_eq!(fields.len(), 5, "{name}: snapshot details contain only public fields");
+                for field in ["request_id", "credential_id", "model", "request_kind"] {
+                    let value = detail[field].as_str().unwrap();
+                    assert!(
+                        !value.trim().is_empty() && value.len() <= cfg.max_string_bytes,
+                        "{name}: {field}"
+                    );
+                }
+                let instant =
+                    SystemTime::from(DateTime::parse_from_rfc3339(detail["started_at"].as_str().unwrap()).unwrap());
+                assert!(
+                    freeze.executions.iter().any(|o| o.started_at == instant
+                        && o.request_id.starts_with(detail["request_id"].as_str().unwrap())
+                        && o.credential_id == detail["credential_id"]
+                        && model(o) == detail["model"]),
+                    "{name}: detail is backed by an execution"
+                );
+            }
+            if details.len() < freeze.executions.len() {
+                assert!(
+                    docs.iter().all(|frame| frame["details_truncated"] == true),
+                    "{name}: every part reports global truncation"
+                );
+            }
         }
     }
-
     #[test]
-    fn fixture_frames_decode_into_the_contract() {
-        // internal/home/testdata/credential_in_flight_contract.json: the part frame's
-        // aggregates and details re-encode byte for byte through this module's writers.
-        let doc: Json =
-            serde_json::from_str(include_str!("../tests/fixtures/credential_in_flight_contract.json")).unwrap();
-        let part = &doc["part"];
-        let observed = DateTime::parse_from_rfc3339(part["observed_at"].as_str().unwrap()).unwrap();
-        assert_eq!(rfc3339_nano(observed.with_timezone(&Utc)), "2026-07-21T12:00:00Z");
+    fn snapshot_counts_shared_credentials_and_preserves_each_request_instant() {
         let cfg = PublisherConfig::from_config(&CredentialInFlight::default()).unwrap();
+        let observed = time(1_784_635_200_000_000_000);
         let freeze = Freeze {
             revision: 7,
             barrier_revision: 11,
-            executions: vec![
-                Observation {
-                    request_id: "req-1".into(),
-                    credential_id: "cred-a".into(),
+            executions: (1..=2)
+                .map(|n| Observation {
+                    request_id: format!("request-{n}"),
+                    credential_id: "credential-a".into(),
                     model: "gpt-5".into(),
                     request_kind: "sse".into(),
-                    started_at: SystemTime::from(DateTime::parse_from_rfc3339("2026-07-21T11:59:58Z").unwrap()),
+                    started_at: observed - Duration::from_secs(n),
                     accounted: true,
-                },
-                Observation {
-                    request_id: "req-2".into(),
-                    credential_id: "cred-a".into(),
-                    model: "gpt-5".into(),
-                    request_kind: "sse".into(),
-                    started_at: SystemTime::from(DateTime::parse_from_rfc3339("2026-07-21T11:59:59Z").unwrap()),
-                    accounted: true,
-                },
-            ],
-        };
-        let frames = encode(&freeze, SystemTime::from(observed), &cfg);
-        let frame: Json = serde_json::from_slice(&frames[0]).unwrap();
-        assert_eq!(frame["kind"], "part");
-        assert_eq!(
-            frame["aggregates"][0],
-            part["aggregates"][0]
-                .clone()
-                .as_object()
-                .map(|a| {
-                    let mut a = a.clone();
-                    a.insert("count".into(), 2.into());
-                    Json::Object(a)
                 })
-                .unwrap()
+                .collect(),
+        };
+        let frames = encode(&freeze, observed, &cfg);
+        assert_eq!(frames.len(), 1);
+        let frame: Json = serde_json::from_slice(&frames[0]).unwrap();
+        assert_eq!(
+            frame["aggregates"],
+            serde_json::json!([{"credential_id":"credential-a","model":"gpt-5","status":"accounted","count":2}])
         );
-        assert_eq!(frame["details"][0], part["details"][0]);
+        let details = frame["details"].as_array().unwrap();
+        assert_eq!(details.len(), freeze.executions.len());
+        for execution in &freeze.executions {
+            let detail = details
+                .iter()
+                .find(|d| d["request_id"] == execution.request_id)
+                .unwrap();
+            assert_eq!(detail["credential_id"], execution.credential_id);
+            assert_eq!(detail["model"], execution.model);
+            assert_eq!(
+                SystemTime::from(DateTime::parse_from_rfc3339(detail["started_at"].as_str().unwrap()).unwrap()),
+                execution.started_at
+            );
+        }
     }
-
     #[test]
-    fn rfc3339_nano_trims_like_go() {
-        let t = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
-        assert_eq!(
-            rfc3339_nano(t("2026-07-21T12:00:00.120000000Z")),
-            "2026-07-21T12:00:00.12Z"
-        );
-        assert_eq!(
-            rfc3339_nano(t("2026-07-21T12:00:00.000000001Z")),
-            "2026-07-21T12:00:00.000000001Z"
-        );
-        assert_eq!(rfc3339_nano(t("2026-07-21T12:00:00Z")), "2026-07-21T12:00:00Z");
+    fn published_timestamps_round_trip_the_instant_at_nanosecond_precision() {
+        for input in [
+            "2026-07-21T12:00:00.120000000Z",
+            "2026-07-21T12:00:00.000000001Z",
+            "2026-07-21T12:00:00Z",
+            "2026-07-21T14:00:00.123456789+02:00",
+        ] {
+            let instant = DateTime::parse_from_rfc3339(input).unwrap().with_timezone(&Utc);
+            let encoded = rfc3339_nano(instant);
+            assert_eq!(DateTime::parse_from_rfc3339(&encoded).unwrap(), instant, "{input}");
+        }
     }
-
     /// Go `TestHomeInFlightPublisherConfigFromConfigValidatesAndUpdates`.
     #[test]
     fn publisher_config_from_defaults_is_valid() {

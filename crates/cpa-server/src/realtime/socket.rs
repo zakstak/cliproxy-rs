@@ -686,7 +686,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn upgrade_detection_and_subprotocols_follow_gorilla() {
+    // Product policy: RFC 6455 upgrade tokens and close-code validity govern the relay; transport EOF and malformed frames take different cleanup paths.
+    fn websocket_upgrade_requires_connection_and_upgrade_tokens() {
         let mut headers = HeaderMap::new();
         assert!(!is_upgrade(&headers));
         headers.insert(header::CONNECTION, "keep-alive, Upgrade".parse().unwrap());
@@ -702,7 +703,8 @@ mod tests {
     }
 
     #[test]
-    fn close_codes_follow_go() {
+    // Product policy: RFC 6455 upgrade tokens and close-code validity govern the relay; transport EOF and malformed frames take different cleanup paths.
+    fn websocket_closes_keep_valid_codes_and_replace_reserved_codes() {
         assert_eq!(
             close_details(End::Closed(Some((4001, "bye".into())))),
             (4001, "bye".into())
@@ -718,7 +720,8 @@ mod tests {
     }
 
     #[test]
-    fn read_errors_classify_like_gorilla() {
+    // Product policy: RFC 6455 upgrade tokens and close-code validity govern the relay; transport EOF and malformed frames take different cleanup paths.
+    fn websocket_read_failures_distinguish_disconnects_from_protocol_faults() {
         let io = |kind| std::io::Error::new(kind, "x");
         assert!(matches!(read_end(&io(std::io::ErrorKind::UnexpectedEof)), End::Gone));
         assert!(matches!(

@@ -1072,7 +1072,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rotation_names_and_timestamps_follow_go() {
+    // Product policy: Log files already on disk remain listable in chronological rotation order; malformed dates and unrelated names are excluded.
+    fn log_rotation_names_and_timestamps_validate_calendar_values() {
         assert_eq!(rotation_order("main.log.3"), Some(3));
         assert_eq!(rotation_order("main.log.x"), None);
         assert!(rotation_order("main-2026-10-02T10-20-30.123.log").is_some());
@@ -1086,7 +1087,8 @@ mod tests {
     }
 
     #[test]
-    fn request_log_names_order_like_go() {
+    // Product policy: Log files already on disk remain listable in chronological rotation order; malformed dates and unrelated names are excluded.
+    fn request_logs_sort_by_timestamp_then_collision_suffix() {
         assert!(newer(
             "v1-2026-10-02T100000-abcdefgh.log",
             5,

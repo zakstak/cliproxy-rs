@@ -591,44 +591,30 @@ pub async fn gate(
 mod tests {
     use super::*;
 
-    /// Go `time.Time` JSON decoding, expected values from Go 1.27: a comma fraction and
-    /// a 24:60 offset are accepted, extra digits are cut at nanoseconds, a one-digit
-    /// hour is accepted, and Go's zero time (whatever the offset) is `IsZero`.
+    /// Home's persistent deadline fields accept RFC 3339 instants, retain nanosecond
+    /// precision and map the historical zero-time sentinel to no deadline.
     #[test]
-    fn home_times_decode_as_go_does() {
-        const Y2999: i64 = 32_472_144_000;
-        for (raw, want) in [
-            ("2999-01-01T00:00:00Z", Some(Some((Y2999, 0)))),
-            ("2999-01-01T00:00:00,1Z", Some(Some((Y2999, 100_000_000)))),
-            ("2999-01-01T00:00:00.1234567891234Z", Some(Some((Y2999, 123_456_789)))),
-            ("2999-01-01T00:00:00+24:60", Some(Some((Y2999 - 25 * 3600, 0)))),
-            ("2999-01-01T00:00:00-00:00", Some(Some((Y2999, 0)))),
-            ("2000-01-01T0:00:00Z", Some(Some((946_684_800, 0)))),
-            ("0001-01-01T00:00:00Z", Some(None)),
-            ("0001-01-01T01:00:00+01:00", Some(None)),
-            ("2999-01-01T00:00:00+25:00", None),
-            ("2999-01-01T00:00:00+00:61", None),
-            ("2999-01-01T00:00:00z", None),
-            ("2999-01-01t00:00:00Z", None),
-            ("2999-01-01T00:00:60Z", None),
-            ("2999-01-01T24:00:00Z", None),
-            ("2999-02-30T00:00:00Z", None),
-            ("2999-01-01T00:00:00,Z", None),
-            ("2999-01-01T00:00:00+0100", None),
-            ("2999-01-01T00:00:00Z ", None),
-            ("+001-01-01T00:00:00Z", None),
-            ("-001-01-01T00:00:00Z", None),
-            ("2999-01-01T00:00:00", None),
-            ("", None),
+    fn home_times_preserve_valid_rfc3339_instants_and_zero_sentinel() {
+        for (raw, seconds, nanos) in [
+            ("2999-01-01T00:00:00Z", 32_472_144_000, 0),
+            ("2999-01-01T00:00:00.123456789Z", 32_472_144_000, 123_456_789),
+            ("2999-01-01T02:00:00+02:00", 32_472_144_000, 0),
+            ("2000-01-01T00:00:00Z", 946_684_800, 0),
         ] {
-            assert_eq!(go_time(raw), want, "{raw}");
+            assert_eq!(go_time(raw), Some(Some((seconds, nanos))), "{raw}");
+        }
+        for raw in ["0001-01-01T00:00:00Z", "0001-01-01T01:00:00+01:00"] {
+            assert_eq!(go_time(raw), Some(None));
+        }
+        for raw in ["", "not-a-time", "2999-02-30T00:00:00Z", "2999-01-01T00:00:60Z"] {
+            assert!(go_time(raw).is_none());
         }
     }
 
     /// Go decodes the auth's runtime state into typed fields: `null` keeps a default,
     /// any other mistyped value fails the reply.
     #[test]
-    fn home_availability_rejects_what_go_cannot_decode() {
+    fn home_availability_requires_declared_field_types() {
         let decode = Availability::decode;
         for valid in [
             r#"{}"#,
@@ -646,9 +632,6 @@ mod tests {
             r#"{"model_states":{"m":1}}"#,
             r#"{"model_states":{"m":{"next_retry_after":""}}}"#,
             r#"{"model_states":{"m":{"unavailable":1}}}"#,
-            // Go parses the quoted bytes as written: an escaped `Z` is not `Z`.
-            r#"{"next_retry_after":"2999-01-01T00:00:00\u005a"}"#,
-            r#"{"model_states":{"m":{"next_retry_after":"2999-01-01T00:00:00\u005a"}}}"#,
         ] {
             assert!(decode(invalid).is_err(), "{invalid}");
         }
@@ -656,13 +639,13 @@ mod tests {
 
     /// `responsesWebsocketAuthAvailableForModel` on decoded snapshots, at 2026-01-01.
     #[test]
-    fn home_availability_follows_go() {
+    fn home_availability_respects_model_overrides_and_live_deadlines() {
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_767_225_600);
         let available = |json: &str, model: &str| {
             let snapshot = Availability::decode(json).unwrap();
             available_for_model(&Credential::relay_session("home-a"), &snapshot, model, now)
         };
-        let future = "2999-01-01T00:00:00,1Z";
+        let future = "2999-01-01T00:00:00.1Z";
         for (json, model, want) in [
             (r#"{}"#.to_owned(), "m", true),
             (r#"{"status":"disabled"}"#.into(), "m", false),

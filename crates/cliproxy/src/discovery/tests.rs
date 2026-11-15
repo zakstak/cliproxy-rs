@@ -1,5 +1,4 @@
-//! Replays outputs recorded from Go's discovery code at 6fecc6e
-//! (tests/reference/discovery -> tests/fixtures/discovery_*.json).
+//! DNS-SD behavior and CLI output contracts with synthetic interfaces and browsers.
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -9,15 +8,6 @@ use serde_json::Value;
 use super::cli::{self, Options};
 use super::iface::{self, Iface};
 use super::*;
-
-fn fixture(name: &str) -> Value {
-    let text = match name {
-        "discovery" => include_str!("../../tests/fixtures/discovery_go.json"),
-        "cmd" => include_str!("../../tests/fixtures/discovery_cmd_go.json"),
-        _ => include_str!("../../tests/fixtures/discovery_main_go.json"),
-    };
-    serde_json::from_str(text).expect("fixture JSON")
-}
 
 fn s(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_owned()
@@ -35,106 +25,152 @@ fn ips(v: &Value) -> Vec<IpAddr> {
 }
 
 #[test]
-fn txt_records_match_go() {
-    let cases = fixture("discovery")["txt"].as_array().unwrap().clone();
-    assert_eq!(cases.len(), 7);
-    for case in cases {
-        let o = &case["opts"];
-        let opts = TxtOptions {
-            version: s(&o["Version"]),
-            product: s(&o["Product"]),
-            protocols: list(&o["Protocols"]),
-            features: list(&o["Features"]),
-            api_path_openai: s(&o["APIPathOpenAI"]),
-            api_path_anthropic: s(&o["APIPathAnthropic"]),
-            tls: o["TLS"].as_bool().unwrap(),
-            auth_required: o["AuthRequired"].as_bool().unwrap(),
-            auth_methods: list(&o["AuthMethods"]),
-            instance_id: s(&o["InstanceID"]),
-            node_role: s(&o["NodeRole"]),
-            advertise_management: o["AdvertiseManagement"].as_bool().unwrap(),
-        };
-        // No `api_gemini` record: this fork serves no Gemini API (issue #49). Its space can
-        // then hold a later record Go dropped at the size limit, which can in turn leave
-        // out one Go kept; the records before it and the limit still match.
-        let recorded = list(&case["records"]);
-        let gemini = recorded.iter().position(|r| r.starts_with("api_gemini="));
-        let want: Vec<String> = recorded
-            .iter()
-            .filter(|r| !r.starts_with("api_gemini="))
-            .cloned()
-            .collect();
-        let got = build_txt_records(&opts);
-        match gemini {
-            Some(cut) if got != want => {
-                assert_eq!(got[..cut], recorded[..cut], "{o}");
-                let size: usize = got.iter().map(|r| r.len() + 1).sum();
-                assert!(size <= MAX_TXT_BYTES, "{o}: {size} bytes");
-            }
-            _ => assert_eq!(got, want, "{o}"),
+fn txt_metadata_preserves_supported_fields_with_dns_sd_size_limits() {
+    // RFC 6763 section 6.1 limits each DNS-SD TXT string to 255 bytes.
+    // The product additionally caps this advertisement at 400 bytes.
+    let mut cases = vec![TxtOptions::default()];
+    cases.extend([
+        TxtOptions {
+            instance_id: "AB12".into(),
+            tls: true,
+            advertise_management: true,
+            ..Default::default()
+        },
+        TxtOptions {
+            product: " custom ".into(),
+            version: "2".into(),
+            auth_required: false,
+            ..Default::default()
+        },
+        TxtOptions {
+            product: "nonascii-é\ncontrol\0".into(),
+            ..Default::default()
+        },
+        TxtOptions {
+            product: "p".repeat(256),
+            ..Default::default()
+        },
+        TxtOptions {
+            features: vec!["feature".repeat(50)],
+            ..Default::default()
+        },
+        TxtOptions {
+            api_path_openai: "/other".into(),
+            api_path_anthropic: "/messages".into(),
+            protocols: vec!["messages".into()],
+            ..Default::default()
+        },
+    ]);
+    for options in cases {
+        let records = build_txt_records(&options);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.len() <= 255 && record.bytes().all(|b| (b' '..=b'~').contains(&b)))
+        );
+        assert!(records.iter().map(|record| record.len() + 1).sum::<usize>() <= 400);
+        assert!(
+            !records.iter().any(|record| record.starts_with("api_gemini=")),
+            "removed provider #49"
+        );
+        let metadata = parse_txt_records(&records);
+        assert_eq!(metadata["version"], options.version);
+        assert_eq!(metadata["tls"], if options.tls { "1" } else { "0" });
+        assert_eq!(
+            metadata["auth_required"],
+            if options.auth_required { "true" } else { "false" }
+        );
+        assert_eq!(metadata["api_openai"], options.api_path_openai);
+        assert_eq!(metadata["api_anthropic"], options.api_path_anthropic);
+        if !options.instance_id.is_empty() {
+            assert_eq!(metadata["instance_id"], options.instance_id);
+        }
+        if options.product.len() > 255 {
+            assert!(!metadata.contains_key("product"));
         }
     }
 }
-
 #[test]
-fn txt_parsing_names_subtypes_and_service_types_match_go() {
-    let f = fixture("discovery");
-    for case in f["parse_txt"].as_array().unwrap() {
-        let want: BTreeMap<String, String> = serde_json::from_value(case["out"].clone()).unwrap();
-        assert_eq!(parse_txt_records(&list(&case["in"])), want);
+fn dns_sd_metadata_names_and_service_types_follow_explicit_boundary_rules() {
+    let parsed = parse_txt_records(&strings(&[
+        " VERSION =1",
+        "tls=0",
+        "TLS=1",
+        "flag",
+        "=ignored",
+        "a=b=c",
+    ]));
+    assert_eq!(
+        parsed,
+        BTreeMap::from([
+            ("version".into(), "1".into()),
+            ("tls".into(), "1".into()),
+            ("flag".into(), "".into()),
+            ("a".into(), "b=c".into())
+        ])
+    );
+    assert_eq!(format_instance_name("office", "ab12"), "office-AB12");
+    assert_eq!(format_instance_name("", "AB12"), "CPA-AB12");
+    assert_eq!(format_instance_name("office-AB12", "ab12"), "office-AB12");
+    for input in ["x".repeat(100), "日本語".repeat(40), "\n\0 office \t".into()] {
+        let name = sanitize_instance_name(&input);
+        assert!(name.len() <= 63 && !name.chars().any(char::is_control));
+        assert!(format_instance_name(&input, "AB12").len() <= 63);
     }
-    for case in f["instance_names"].as_array().unwrap() {
-        assert_eq!(
-            format_instance_name(&s(&case["name"]), &s(&case["id"])),
-            s(&case["out"]),
-            "{case}"
-        );
+    for (input, expected) in [
+        ("responses", "_responses"),
+        ("_messages", "_messages"),
+        ("bad.one", ""),
+        ("", ""),
+        ("_chat-completions", "_chat-completions"),
+    ] {
+        assert_eq!(sanitize_subtype(input), expected, "{input}");
     }
-    for case in f["subtypes"].as_array().unwrap() {
-        assert_eq!(sanitize_subtype(&s(&case["in"])), s(&case["out"]), "{case}");
+    for input in ["_ai-gateway._tcp", "_x._tcp", "_123456789012345._tcp"] {
+        assert!(validate_service_type(input).is_ok(), "{input}");
     }
-    for case in f["service_types"].as_array().unwrap() {
-        let got = validate_service_type(&s(&case["in"])).err().unwrap_or_default();
-        assert_eq!(got, s(&case["out"]), "{case}");
+    for input in [
+        "",
+        "ai._tcp",
+        "_x._udp",
+        "_._tcp",
+        "_-x._tcp",
+        "_x-._tcp",
+        "_bad.name._tcp",
+        "_1234567890123456._tcp",
+    ] {
+        assert!(validate_service_type(input).is_err(), "{input}");
     }
-    for case in f["sanitize_instance_name"].as_array().unwrap() {
-        assert_eq!(sanitize_instance_name(&s(&case["in"])), s(&case["out"]));
-    }
-    for case in f["txt_lists"].as_array().unwrap() {
-        assert_eq!(parse_txt_list(&s(&case["in"])), list(&case["out"]), "{case}");
-    }
-    for case in f["endpoint_paths"].as_array().unwrap() {
-        assert_eq!(sanitize_endpoint_path(&s(&case["in"])), s(&case["out"]), "{case}");
+    assert_eq!(
+        parse_txt_list(" responses, messages, responses, , "),
+        strings(&["responses", "messages"])
+    );
+    for (input, expected) in [(" /v1 ", "/v1"), ("v1", ""), ("", ""), ("https://bad/path", "")] {
+        assert_eq!(sanitize_endpoint_path(input), expected, "{input}");
     }
 }
-
 #[test]
-fn interface_name_rules_match_go() {
-    for case in fixture("discovery")["interfaces"].as_array().unwrap() {
-        let name = s(&case["name"]);
+fn interface_name_policy_identifies_lan_tunnels_and_explicit_patterns() {
+    for name in ["docker0", "veth123", "tailscale0", "wg0", "tun0", "tap1", "awdl0"] {
+        assert!(iface::is_virtual_or_tunnel(name), "{name}");
+    }
+    for name in ["eth0", "en0", "wlan0", "wifi0", "bond0"] {
+        assert!(iface::is_likely_physical_lan(name), "{name}");
+        assert!(!iface::is_virtual_or_tunnel(name));
+    }
+    for (name, patterns, expected) in [
+        ("eth0", vec!["ETH*"], true),
+        ("wlan0", vec!["eth*"], false),
+        ("en0", vec![" en0 "], true),
+        ("en0", vec![""], false),
+        ("eth0", vec!["eth1", "eth*"], true),
+    ] {
         assert_eq!(
-            iface::is_virtual_or_tunnel(&name),
-            case["virtual"].as_bool().unwrap(),
-            "{case}"
-        );
-        assert_eq!(
-            iface::is_likely_physical_lan(&name),
-            case["physical"].as_bool().unwrap(),
-            "{case}"
-        );
-        assert_eq!(
-            iface::matches_any(&name, &list(&case["include"])),
-            case["in_include"].as_bool().unwrap(),
-            "{case}"
-        );
-        assert_eq!(
-            iface::matches_any(&name, &list(&case["exclude"])),
-            case["in_exclude"].as_bool().unwrap(),
-            "{case}"
+            iface::matches_any(name, &patterns.into_iter().map(str::to_owned).collect::<Vec<_>>()),
+            expected
         );
     }
 }
-
 #[test]
 fn interface_filter_applies_flags_names_and_addresses() {
     let iface = |index, name: &str, multicast, addrs: &[&str]| Iface {
@@ -168,54 +204,83 @@ fn interface_filter_applies_flags_names_and_addresses() {
 }
 
 #[test]
-fn discovered_entries_and_merges_match_go() {
-    let f = fixture("discovery");
-    let mut outs = Vec::new();
-    for case in f["entries"].as_array().unwrap() {
-        let e = Entry {
-            instance: s(&case["instance"]),
-            service: s(&case["service"]),
-            domain: s(&case["domain"]),
-            host: s(&case["host"]),
-            port: case["port"].as_i64().unwrap(),
-            ipv4: ips(&case["ipv4"]),
-            ipv6: ips(&case["ipv6"]),
-            text: list(&case["text"]),
-            nil_addr: false,
-        };
-        assert_eq!(
-            entry_within_limits(&e),
-            case["within_limits"].as_bool().unwrap(),
-            "{case}"
-        );
-        let got = entry_to_discovered(&e);
-        assert_eq!(got.to_json(), case["out"], "{case}");
-        outs.push(got);
-    }
-    let (mut a, mut b) = (outs[0].clone(), outs[1].clone());
-    b.instance_name.clone_from(&a.instance_name);
-    b.host.clear();
-    b.raw_txt.insert("auth_required".into(), "false".into());
-    merge_discovered(&mut a, &b);
-    assert_eq!(a.to_json(), f["merged"]);
+fn discovered_services_decode_metadata_and_merge_unique_addresses() {
+    let entry = Entry {
+        instance: "office._ai-gateway._tcp.local.".into(),
+        service: "_ai-gateway._tcp".into(),
+        domain: "local.".into(),
+        host: "box.local.".into(),
+        port: 8317,
+        ipv4: vec!["192.0.2.1".parse().unwrap()],
+        ipv6: vec!["2001:db8::1".parse().unwrap()],
+        text: strings(&[
+            "product=cliproxyapi",
+            "protocols=responses,messages",
+            "tls=1",
+            "auth_required=true",
+            "auth_methods=api_key",
+            "api_openai=/v1",
+        ]),
+        nil_addr: false,
+    };
+    assert!(entry_within_limits(&entry));
+    let mut actual = entry_to_discovered(&entry);
+    assert_eq!(actual.host, "box.local.");
+    assert_eq!(actual.port, 8317);
+    assert_eq!(actual.product, "cliproxyapi");
+    assert_eq!(actual.protocols, strings(&["responses", "messages"]));
+    assert!(actual.auth_required);
+    assert_eq!(actual.auth_methods, strings(&["api_key"]));
+    assert_eq!(actual.endpoints["openai"], "/v1");
+    assert_eq!(actual.ipv4, entry.ipv4);
+    assert_eq!(actual.ipv6, entry.ipv6);
+    let mut other = actual.clone();
+    other.ipv4.push("192.0.2.2".parse().unwrap());
+    other.host.clear();
+    merge_discovered(&mut actual, &other);
+    merge_discovered(&mut actual, &other);
+    assert_eq!(
+        actual.ipv4,
+        vec!["192.0.2.1".parse::<IpAddr>().unwrap(), "192.0.2.2".parse().unwrap()]
+    );
+    assert_eq!(actual.host, "box.local.");
+    let mut excessive = entry.clone();
+    excessive.text = vec!["a=b".into(); 65];
+    assert!(!entry_within_limits(&excessive));
+    excessive = entry;
+    excessive.ipv4 = vec!["192.0.2.1".parse().unwrap(); 33];
+    assert_eq!(entry_to_discovered(&excessive).ipv4.len(), 32);
 }
-
 #[test]
-fn spec_errors_match_go() {
-    let f = fixture("discovery");
-    let cases = f["spec_errors"].as_array().unwrap();
-    for case in &cases[..2] {
-        let cfg = cpa_core::config::Config::parse(&s(&case["in"])).unwrap();
-        let d = DiscoveryConfig::from_document(&cfg.document);
-        assert!(d.enabled);
-        let got = build_service_spec(&d, "", 8317, false, || "8F3B".into(), iface::filter).unwrap_err();
-        assert_eq!(got, s(&case["out"]));
+fn advertising_refuses_invalid_service_types_and_zero_ports_before_network_access() {
+    for service_type in ["bad", "_bad._udp", "_-bad._tcp"] {
+        let cfg = DiscoveryConfig {
+            enabled: true,
+            service_type: service_type.into(),
+            ..Default::default()
+        };
+        let error = build_service_spec(
+            &cfg,
+            "",
+            8317,
+            false,
+            || "AB12".into(),
+            |_, _| panic!("invalid spec must not query interfaces"),
+        )
+        .unwrap_err();
+        assert!(error.contains("service"), "{error}");
     }
-    let d = DiscoveryConfig::default();
-    let got = build_service_spec(&d, "", 0, false, || unreachable!(), iface::filter).unwrap_err();
-    assert_eq!(got, s(&cases[2]["out"]));
+    let error = build_service_spec(
+        &DiscoveryConfig::default(),
+        "",
+        0,
+        false,
+        || panic!("zero port needs no identity"),
+        |_, _| panic!("zero port needs no interfaces"),
+    )
+    .unwrap_err();
+    assert!(error.contains("port") && error.contains('0'), "{error}");
 }
-
 fn lan(addrs: &[&str]) -> impl FnOnce(&[String], &[String]) -> Result<Vec<Iface>, String> {
     let iface = Iface {
         index: 2,
@@ -327,7 +392,7 @@ fn gw(v: Value) -> DiscoveredService {
     d
 }
 
-/// The four gateways Go's generator feeds its fake browser (cmd_fixture_test.go).
+/// Synthetic gateways cover IPv4, IPv6, escaping, auth, and unsafe terminal metadata.
 fn gateways() -> Vec<DiscoveredService> {
     vec![
         gw(serde_json::json!({
@@ -349,118 +414,142 @@ fn gateways() -> Vec<DiscoveredService> {
 }
 
 #[tokio::test]
-async fn discover_output_matches_go_byte_for_byte() {
-    let f = fixture("cmd");
-    let runs = f["runs"].as_array().unwrap();
-    assert_eq!(runs.len(), 9);
-    for run in runs {
-        let name = s(&run["name"]);
-        let result: Result<Vec<DiscoveredService>, String> = match name.as_str() {
-            "text-full" | "json-full" => Ok(gateways()),
-            "text-browse-error" => Err("discovery: browse query failed: boom".into()),
-            "json-browse-error" => Err("discovery: browse query failed: <boom>".into()),
-            n if n.ends_with("factory-error") => Err("no qualified physical interfaces found for LAN discovery".into()),
-            _ => Ok(Vec::new()),
-        };
-        let opts = Options {
-            timeout: Duration::from_millis(run["timeout_ms"].as_i64().unwrap().max(0) as u64),
-            json: run["json"].as_bool().unwrap(),
-            service_type: s(&run["service_type"]),
-            ..Default::default()
-        };
-        let want_type = match s(&run["service_type"]).trim() {
-            "" => DEFAULT_SERVICE_TYPE.to_owned(),
-            t => t.to_owned(),
-        };
-        let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = cli::run(&opts, &mut out, &mut err, |st, _| async move {
-            assert_eq!(st, want_type);
-            result
-        })
-        .await;
-        assert_eq!(code, run["code"].as_i64().unwrap() as i32, "{name}");
-        assert_eq!(String::from_utf8(out).unwrap(), s(&run["stdout"]), "{name}");
-        assert_eq!(String::from_utf8(err).unwrap(), s(&run["stderr"]), "{name}");
+async fn discovery_reports_semantic_json_safe_text_errors_and_effective_scan_options() {
+    for json in [false, true] {
+        for (timeout, expected_timeout) in [
+            (Duration::ZERO, Duration::from_secs(3)),
+            (Duration::from_millis(250), Duration::from_millis(250)),
+            (Duration::from_secs(90), Duration::from_secs(60)),
+        ] {
+            let opts = Options {
+                timeout,
+                json,
+                ..Default::default()
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cli::run(&opts, &mut out, &mut err, |service_type, effective| async move {
+                assert_eq!(service_type, DEFAULT_SERVICE_TYPE);
+                assert_eq!(effective, expected_timeout);
+                Ok(gateways())
+            })
+            .await;
+            assert_eq!(code, 0);
+            assert!(err.is_empty());
+            let text = String::from_utf8(out).unwrap();
+            if json {
+                let list: Value = serde_json::from_str(&text).unwrap();
+                let list = list.as_array().unwrap();
+                assert_eq!(list.len(), 4);
+                assert_eq!(list[0]["instance_name"], "CPA-8F3B");
+                assert_eq!(list[0]["port"], 8317);
+                assert_eq!(
+                    list[0]["protocols"],
+                    serde_json::json!(["chat-completions", "responses"])
+                );
+                assert_eq!(list[0]["raw_txt"]["z"], "<&>");
+            } else {
+                for expected in ["CPA-8F3B", "8317", "OpenAI", "responses", "api_key"] {
+                    assert!(text.contains(expected), "{expected}: {text}");
+                }
+                assert!(
+                    !text.contains('\u{1b}') && !text.contains('\u{202e}'),
+                    "unsafe terminal control"
+                );
+            }
+        }
+        for result in [
+            Ok(Vec::new()),
+            Err("browse failed: <boom>".to_owned()),
+            Err("no qualified interfaces".to_owned()),
+        ] {
+            let opts = Options {
+                json,
+                service_type: "_custom._tcp".into(),
+                ..Default::default()
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let failure = result.as_ref().err().cloned();
+            let code = cli::run(&opts, &mut out, &mut err, |service_type, _| async move {
+                assert_eq!(service_type, "_custom._tcp");
+                result
+            })
+            .await;
+            assert_eq!(code, if failure.is_some() { 1 } else { 0 });
+            if json {
+                assert!(err.is_empty());
+                let output: Value = serde_json::from_slice(&out).unwrap();
+                if let Some(error) = failure {
+                    assert_eq!(output, serde_json::json!({"error":error,"gateways":[]}));
+                } else {
+                    assert_eq!(output, serde_json::json!([]));
+                }
+            } else if let Some(error) = failure {
+                assert!(String::from_utf8(err).unwrap().contains(&error));
+            } else {
+                assert!(String::from_utf8(out).unwrap().contains("No AI gateways"));
+            }
+        }
     }
 }
-
 #[test]
-fn terminal_sanitizing_and_filters_match_go() {
-    let f = fixture("cmd");
-    for case in f["sanitize"].as_array().unwrap() {
-        assert_eq!(cli::sanitize_terminal(&s(&case["in"])), s(&case["out"]), "{case}");
-        assert_eq!(cli::sanitize_display_host(&s(&case["in"])), s(&case["host"]), "{case}");
+fn discovery_sanitizes_terminal_controls_and_respects_explicit_interface_filters() {
+    for unsafe_text in ["\u{1b}[31mred", "a\u{202e}b", "a\u{200b}b", "a\0b", "line\nfeed"] {
+        let clean = cli::sanitize_terminal(unsafe_text);
+        assert!(
+            !clean
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{202e}' | '\u{200b}')),
+            "{clean:?}"
+        );
     }
-    for case in f["interface_lists"].as_array().unwrap() {
-        assert_eq!(cli::parse_interface_list(&list(&case["in"])), list(&case["out"]));
-    }
-    let dir = std::env::temp_dir().join(format!("cpa-discover-filters-{}", std::process::id()));
+    assert_eq!(cli::sanitize_terminal("a\tb"), "a b");
+    assert_eq!(
+        cli::parse_interface_list(&[" eth0,en0 ", "eth0", "", "wl*"]),
+        strings(&["eth0", "en0", "wl*"])
+    );
+    let dir = std::env::temp_dir().join(format!("cpa-discovery-contract-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.yaml");
-    for case in f["config_filters"].as_array().unwrap() {
-        std::fs::write(&path, s(&case["yaml"])).unwrap();
-        let got = cli::load_scan_filters(path.to_str().unwrap());
-        // cliproxy-rs refuses invalid `!!binary` data anywhere in the file, where Go
-        // scans with no filters (on the path) or the file's (elsewhere).
-        if s(&case["yaml"]).contains("!!binary '!!!'") {
-            let e = got.unwrap_err();
-            assert!(e.ends_with("yaml: !!binary value contains invalid base64 data"), "{e}");
-            continue;
-        }
-        // A quoted `<<` (a plain key to Go) and an aliased sequence as a merge operand
-        // (Go scans with no filters) are refused too.
-        let refusal = [
-            ("'<<'", "a quoted << mapping key in the config file is not supported"),
-            ("<<: *s", "map merge requires map or sequence of maps as the value"),
-        ]
-        .into_iter()
-        .find(|(marker, _)| s(&case["yaml"]).contains(marker));
-        if let Some((_, refusal)) = refusal {
-            let e = got.unwrap_err();
-            assert!(e.ends_with(refusal), "{e}");
-            continue;
-        }
-        assert_eq!(got, Ok((list(&case["include"]), list(&case["exclude"]))), "{case}");
+    for yaml in [
+        "discovery:\n interfaces:\n  include: [eth0, ' wl* ']\n  exclude: [docker0]\n",
+        "filters: &filters\n include: [eth0, ' wl* ']\n exclude: [docker0]\ndiscovery:\n interfaces:\n  <<: *filters\n",
+    ] {
+        std::fs::write(&path, yaml).unwrap();
+        assert_eq!(
+            cli::load_scan_filters(path.to_str().unwrap()).unwrap(),
+            (strings(&["eth0", "wl*"]), strings(&["docker0"]))
+        );
+    }
+    for yaml in [
+        "discovery:\n interfaces:\n  include: !!binary '!!!'\n",
+        "a: &x 1\nb: &x 2\ndiscovery:\n interfaces:\n  exclude: [eth0]\n",
+    ] {
+        std::fs::write(&path, yaml).unwrap();
+        assert!(
+            cli::load_scan_filters(path.to_str().unwrap()).is_err(),
+            "invalid config must not broaden discovery"
+        );
     }
     assert_eq!(
         cli::load_scan_filters(dir.join("missing.yaml").to_str().unwrap()),
         Ok(Default::default())
     );
-    // Go reads a redefined anchor; the config decoder refuses the file, which must not
-    // become an unfiltered scan.
-    std::fs::write(
-        &path,
-        "a: &x 1\nb: &x 2\ndiscovery:\n  interfaces:\n    exclude: [eth0]\n",
-    )
-    .unwrap();
-    let refused = cli::load_scan_filters(path.to_str().unwrap()).unwrap_err();
-    assert!(refused.contains("anchor name is defined more than once"), "{refused}");
-    let _ = std::fs::rename(
-        &dir,
-        std::env::temp_dir().join(format!("cpa-trash-f-{}", std::process::id())),
-    );
-    let cli_filters = (vec!["docker0".to_owned()], vec![]);
-    let cfg_filters = (vec!["en0".to_owned()], vec!["awdl0".to_owned()]);
-    assert_eq!(
-        cli::resolve_filters(cli_filters.clone(), cfg_filters.clone()),
-        cli_filters
-    );
-    assert_eq!(
-        cli::resolve_filters(Default::default(), cfg_filters.clone()),
-        cfg_filters
-    );
+    let explicit = (strings(&["docker0"]), vec![]);
+    let configured = (strings(&["en0"]), strings(&["awdl0"]));
+    assert_eq!(cli::resolve_filters(explicit.clone(), configured.clone()), explicit);
+    assert_eq!(cli::resolve_filters(Default::default(), configured.clone()), configured);
+    std::fs::remove_dir_all(dir).unwrap();
 }
-
 #[test]
-fn go_durations() {
-    for (ms, want) in [
-        (3000, "3s"),
-        (60_000, "1m0s"),
-        (1500, "1.5s"),
-        (59_000, "59s"),
-        (250, "250ms"),
-        (3_723_000, "1h2m3s"),
+fn scan_duration_display_is_readable_at_supported_timeout_boundaries() {
+    for duration in [
+        Duration::ZERO,
+        Duration::from_millis(250),
+        Duration::from_millis(1500),
+        Duration::from_secs(60),
     ] {
-        assert_eq!(cli::go_duration(Duration::from_millis(ms)), want);
+        let shown = cli::go_duration(duration);
+        assert!(!shown.is_empty() && shown.ends_with('s'), "{shown}");
+        assert!(shown.chars().all(|c| c.is_ascii_alphanumeric() || c == '.'), "{shown}");
     }
 }

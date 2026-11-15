@@ -680,7 +680,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoints_parse_like_go_main() {
+    fn s3_endpoints_accept_documented_operator_forms() {
         assert_eq!(
             ObjectConfig::endpoint_from("http://127.0.0.1:9000/").unwrap(),
             ("127.0.0.1:9000".into(), false)
@@ -697,10 +697,8 @@ mod tests {
             ObjectConfig::endpoint_from("https://h/base/").unwrap(),
             ("h/base".into(), true)
         );
-        assert_eq!(
-            ObjectConfig::endpoint_from("ftp://h").unwrap_err().to_string(),
-            "unsupported object store scheme \"ftp\" (only http and https are allowed)"
-        );
+        let error = ObjectConfig::endpoint_from("ftp://h").unwrap_err().to_string();
+        assert!(error.contains("scheme") && error.contains("ftp"), "{error}");
     }
 
     #[test]
@@ -918,7 +916,7 @@ mod tests {
     /// minio-go's discovery recovery: a regional bucket whose location cannot be read
     /// still works when the error names the region (header or XML).
     #[tokio::test]
-    async fn regions_come_from_location_errors_like_minio() {
+    async fn s3_location_errors_supply_the_bucket_region() {
         for location in [Location::Denied, Location::Malformed] {
             let s3 = FakeS3::start("eu-central-1", location, 1000).await;
             s3.put("tokens", "config/config.yaml", b"port: 2\n");

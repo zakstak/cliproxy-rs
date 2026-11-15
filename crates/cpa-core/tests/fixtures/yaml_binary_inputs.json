@@ -1,0 +1,342 @@
+[
+  {
+    "name": "plain secret",
+    "yaml": "management:\n  secret-key: secret\n"
+  },
+  {
+    "name": "binary v8 secret",
+    "yaml": "management:\n  secret-key: !!binary c2VjcmV0\n"
+  },
+  {
+    "name": "binary legacy secret",
+    "yaml": "remote-management:\n  secret-key: !!binary c2VjcmV0\n"
+  },
+  {
+    "name": "quoted binary secret",
+    "yaml": "management:\n  secret-key: !!binary 'c2VjcmV0'\n"
+  },
+  {
+    "name": "block binary secret",
+    "yaml": "management:\n  secret-key: !!binary |\n    c2Vj\n    cmV0\n"
+  },
+  {
+    "name": "verbatim binary secret",
+    "yaml": "management:\n  secret-key: !<tag:yaml.org,2002:binary> c2VjcmV0\n"
+  },
+  {
+    "name": "escaped binary secret",
+    "yaml": "management:\n  secret-key: !!bin%61ry c2VjcmV0\n"
+  },
+  {
+    "name": "short-form binary secret",
+    "yaml": "management:\n  secret-key: !<!!binary> c2VjcmV0\n"
+  },
+  {
+    "name": "escaped primary binary secret",
+    "yaml": "management:\n  secret-key: !%21binary c2VjcmV0\n"
+  },
+  {
+    "name": "named handle binary secret",
+    "yaml": "%TAG !e! tag:yaml.org,2002:\n---\nmanagement:\n  secret-key: !e!binary c2VjcmV0\n"
+  },
+  {
+    "name": "redefined secondary handle secret",
+    "yaml": "%TAG !! tag:example.com,2000:\n---\nmanagement:\n  secret-key: !!binary c2VjcmV0\n"
+  },
+  {
+    "name": "custom-tagged secret",
+    "yaml": "management:\n  secret-key: !keep c2VjcmV0\n"
+  },
+  {
+    "name": "non-specific tagged secret",
+    "yaml": "management:\n  secret-key: ! secret\n"
+  },
+  {
+    "name": "custom-tagged number secret",
+    "yaml": "management:\n  secret-key: !keep 0x1F\n"
+  },
+  {
+    "name": "custom-tagged port",
+    "yaml": "port: !keep 8317\n"
+  },
+  {
+    "name": "aliased custom-tagged secret",
+    "yaml": "proxy-url: &a !keep secret\nmanagement:\n  secret-key: *a\n"
+  },
+  {
+    "name": "redefined anchor around a binary secret",
+    "yaml": "a: &x unused\nb: &x {secret-key: !!binary c2VjcmV0}\nmanagement: *x\nc: &y {panel-github-repository: original, secret-key: other}\n"
+  },
+  {
+    "name": "redefined anchor",
+    "yaml": "a: &x 1\nb: &x 2\nport: *x\n"
+  },
+  {
+    "name": "alternating redefinitions over a binary scalar",
+    "yaml": "l0: &a !!binary c2VjcmV0\nl1: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\nl2: &a [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\nl3: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\nl4: &a [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\nl5: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\nl6: &a [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\nl7: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\nl8: &a [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\nl9: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\nend: &a []\n"
+  },
+  {
+    "name": "locally tagged api-keys key",
+    "yaml": "access: {!keep api-keys: [!!binary a2V5]}\n"
+  },
+  {
+    "name": "locally tagged port key",
+    "yaml": "!keep port: 1\n"
+  },
+  {
+    "name": "aliased port key",
+    "yaml": "name: &k port\n*k : 1\n"
+  },
+  {
+    "name": "non-specific null secret",
+    "yaml": "management:\n  secret-key: ! null\n"
+  },
+  {
+    "name": "non-specific quoted null secret",
+    "yaml": "management:\n  secret-key: ! 'null'\n"
+  },
+  {
+    "name": "non-specific number secret",
+    "yaml": "management:\n  secret-key: ! 0x1F\n"
+  },
+  {
+    "name": "non-specific port",
+    "yaml": "port: ! 8317\n"
+  },
+  {
+    "name": "literal null tag",
+    "yaml": "management:\n  secret-key: !<!!null> null\n"
+  },
+  {
+    "name": "literal null tag on text",
+    "yaml": "management:\n  secret-key: !<!!null> secret\n"
+  },
+  {
+    "name": "literal str tag",
+    "yaml": "management:\n  secret-key: !<!!str> 0x1F\n"
+  },
+  {
+    "name": "literal int tag",
+    "yaml": "port: !<!!int> 8317\n"
+  },
+  {
+    "name": "NUL in a binary tag",
+    "yaml": "management:\n  secret-key: !!binary%00x c2VjcmV0\n"
+  },
+  {
+    "name": "NUL in a tag directive",
+    "yaml": "%TAG !e! tag:yaml.org,2002:bin%00\n---\nmanagement:\n  secret-key: !e!ary c2VjcmV0\n"
+  },
+  {
+    "name": "NUL in a tag after a block scalar holding a quote",
+    "yaml": "note: |\n  \"\nmanagement:\n  secret-key: !%21binary%00x c2VjcmV0\n"
+  },
+  {
+    "name": "NUL escape in an untagged value",
+    "yaml": "management:\n  secret-key: secret%00\n"
+  },
+  {
+    "name": "NUL in a tag after a BOM",
+    "yaml": "﻿management:\n  secret-key: !%00 ~\n"
+  },
+  {
+    "name": "secret after a BOM",
+    "yaml": "﻿management:\n  secret-key: secret\n"
+  },
+  {
+    "name": "merge key",
+    "yaml": "<<:\n  management:\n    secret-key: secret\n"
+  },
+  {
+    "name": "canonically tagged merge key",
+    "yaml": "!!str <<:\n  management:\n    secret-key: secret\n"
+  },
+  {
+    "name": "canonically tagged port key",
+    "yaml": "!!str port: 1\n"
+  },
+  {
+    "name": "single-quoted merge key",
+    "yaml": "'<<':\n  port: 1\n"
+  },
+  {
+    "name": "double-quoted merge key",
+    "yaml": "\"<<\": {port: 1}\n"
+  },
+  {
+    "name": "escaped merge key",
+    "yaml": "\"\\x3c<\": {port: 1}\n"
+  },
+  {
+    "name": "literal block merge key",
+    "yaml": "? |-\n  <<\n: {port: 1}\n"
+  },
+  {
+    "name": "quoted merge key in an anchored section",
+    "yaml": "base: &b\n  '<<': {secret-key: secret}\nmanagement: *b\n"
+  },
+  {
+    "name": "merge of an aliased sequence",
+    "yaml": "defaults: &d [{port: 1}]\n<<: *d\n"
+  },
+  {
+    "name": "merge of a list holding an aliased sequence",
+    "yaml": "defaults: &d [{port: 1}]\n<<: [*d]\n"
+  },
+  {
+    "name": "merge of a list of aliased mappings",
+    "yaml": "a: &a {port: 1}\nb: &b {port: 2, proxy-url: http://p.lan:80}\n<<: [*a, *b]\n"
+  },
+  {
+    "name": "merge of an aliased mapping in a sequence",
+    "yaml": "list: [&a {port: 1}]\n<<: *a\n"
+  },
+  {
+    "name": "shadowed merge of an aliased sequence",
+    "yaml": "seq: &s [{port: 2}]\nserver: {port: 1}\n<<:\n  server: {<<: *s}\n"
+  },
+  {
+    "name": "shadowed scalar merge",
+    "yaml": "server: {port: 1}\n<<:\n  server: {<<: 5}\n"
+  },
+  {
+    "name": "merge of a locally tagged aliased mapping",
+    "yaml": "base: &a !keep {port: 1}\n<<: *a\n"
+  },
+  {
+    "name": "merge of a locally tagged mapping",
+    "yaml": "<<: !keep {port: 1}\n"
+  },
+  {
+    "name": "merge of a list holding a locally tagged mapping",
+    "yaml": "<<: [!keep {port: 1}]\n"
+  },
+  {
+    "name": "merge of a locally tagged sequence",
+    "yaml": "<<: !keep [{port: 1}]\n"
+  },
+  {
+    "name": "nested locally tagged merge",
+    "yaml": "inner: &i !keep {port: 1}\nouter: &o !keep {<<: *i}\n<<: *o\n"
+  },
+  {
+    "name": "binary secret through a tagged merge source",
+    "yaml": "base: &b !keep {secret-key: !!binary c2VjcmV0}\nmanagement:\n  <<: *b\n"
+  },
+  {
+    "name": "binary plugin pin through a tagged merge source",
+    "yaml": "base: &b !keep {version: !!binary MS4yLjM=}\nplugins:\n  configs:\n    x:\n      store:\n        <<: *b\n"
+  },
+  {
+    "name": "merge key inside a collection key",
+    "yaml": "extra:\n  ? {\"<<\": {port: 1}}\n  : ignored\nport: 2\n"
+  },
+  {
+    "name": "collection key",
+    "yaml": "extra: {? {a: 1} : x}\n"
+  },
+  {
+    "name": "non-specific document marker secret",
+    "yaml": "management:\n  secret-key: ! ---\n"
+  },
+  {
+    "name": "non-specific multi-line secret",
+    "yaml": "management:\n  secret-key: ! first\n\n    second\n"
+  },
+  {
+    "name": "non-specific boolean word secret",
+    "yaml": "management:\n  secret-key: ! yes\n"
+  },
+  {
+    "name": "non-specific tilde secret",
+    "yaml": "management:\n  secret-key: ! ~\n"
+  },
+  {
+    "name": "literal null tag on a tilde",
+    "yaml": "management:\n  secret-key: !<!!null> ~\n"
+  },
+  {
+    "name": "binary inside a mapping key",
+    "yaml": "x-review:\n  first: keep\n  ? {x: !!binary c2VjcmV0}\n  : ignored\n"
+  },
+  {
+    "name": "binary inside a mapping key under management",
+    "yaml": "management:\n  secret-key: plain\n  ? {x: !!binary c2VjcmV0}\n  : ignored\n"
+  },
+  {
+    "name": "binary proxy-url",
+    "yaml": "proxy-url: !!binary aHR0cDovL3Byb3h5Lmxhbjo4MA==\n"
+  },
+  {
+    "name": "binary api key",
+    "yaml": "api-keys: [plain, !!binary a2V5]\n"
+  },
+  {
+    "name": "aliased binary secret",
+    "yaml": "proxy-url: &a !!binary c2VjcmV0\nmanagement:\n  secret-key: *a\n"
+  },
+  {
+    "name": "binary secret through a merge",
+    "yaml": "defaults: &d\n  secret-key: !!binary c2VjcmV0\nmanagement:\n  <<: *d\n"
+  },
+  {
+    "name": "binary secret through an aliased section",
+    "yaml": "defaults: &d\n  secret-key: !!binary c2VjcmV0\nmanagement: *d\n"
+  },
+  {
+    "name": "unused bits",
+    "yaml": "management:\n  secret-key: !!binary YR==\n"
+  },
+  {
+    "name": "invalid base64",
+    "yaml": "management:\n  secret-key: !!binary 'c2VjcmV0!'\n"
+  },
+  {
+    "name": "missing padding",
+    "yaml": "management:\n  secret-key: !!binary YQ\n"
+  },
+  {
+    "name": "space in base64",
+    "yaml": "management:\n  secret-key: !!binary 'c2Vj cmV0'\n"
+  },
+  {
+    "name": "invalid base64 in an unknown setting",
+    "yaml": "extra: !!binary '!!!'\n"
+  },
+  {
+    "name": "binary unknown setting",
+    "yaml": "extra: !!binary c2VjcmV0\n"
+  },
+  {
+    "name": "not UTF-8",
+    "yaml": "management:\n  secret-key: !!binary /w==\n"
+  },
+  {
+    "name": "binary port",
+    "yaml": "port: !!binary ODMxNw==\n"
+  },
+  {
+    "name": "binary boolean",
+    "yaml": "debug: !!binary dHJ1ZQ==\n"
+  },
+  {
+    "name": "binary plugin pin",
+    "yaml": "plugins:\n  configs:\n    x:\n      store:\n        version: !!binary MS4yLjM=\n"
+  },
+  {
+    "name": "aliased binary plugin pin",
+    "yaml": "pin: &v !!binary MS4yLjM=\nplugins:\n  configs:\n    x:\n      store:\n        version: *v\n"
+  },
+  {
+    "name": "binary plugin pin through a merge",
+    "yaml": "base: &b\n  release-tag: !!binary djEuMi4z\nplugins:\n  configs:\n    x:\n      store:\n        <<: *b\n"
+  },
+  {
+    "name": "shadowed binary plugin pin",
+    "yaml": "defaults: &d {version: !!binary MS4yLjM=}\nplugins:\n  configs:\n    x:\n      store: {<<: *d, version: !keep 4.5.6}\n"
+  },
+  {
+    "name": "binary plugin setting",
+    "yaml": "plugins:\n  configs:\n    x:\n      store:\n        channel: !!binary c3RhYmxl\n"
+  }
+]

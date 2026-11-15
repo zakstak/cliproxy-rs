@@ -17,5 +17,6 @@
 - [Fork workflow](FORK.md): branches, upstream integration, and local-build policy.
 - [Codex wire contract](codex/CONTRACT.md): payloads, transports, endpoint profiles, and fixture rules.
 - [Codex identity and transport](codex/IDENTITY.md): headers, credential isolation, and TLS policy.
+- [Go parity test migration](GO-PARITY-REMOVAL.md) and [original inventory](GO-PARITY-TEST-INVENTORY.md): independent behavior coverage, dispositions and replacement difficulty.
 - [Features not adopted](NOT-ADOPTED.md): current omissions and the reasons for them.
 - [Dashboard development](../ui/README.md) and [design system](../ui/DESIGN.md).

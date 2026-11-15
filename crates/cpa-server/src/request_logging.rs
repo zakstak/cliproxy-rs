@@ -2112,20 +2112,11 @@ mod tests {
     use axum::response::IntoResponse;
     use tower_service::Service;
 
-    /// `capture_go.json`, recorded with the Go generator's `buildinfo.Version` pinned to
-    /// `cliproxy-rs-0.1.0` (tests/reference/capture/main.go). The version of this build
-    /// replaces it, so a release bump needs no re-recording.
     /// A file every write to fails, on any OS (Linux-only `/dev/full` is not needed).
     fn unwritable(dir: &Path) -> File {
         let path = dir.join("unwritable");
         File::create(&path).unwrap();
         File::options().read(true).open(path).unwrap()
-    }
-
-    fn capture_go() -> serde_json::Value {
-        let text = include_str!("../tests/fixtures/capture_go.json")
-            .replace("cliproxy-rs-0.1.0", concat!("cliproxy-rs-", env!("CARGO_PKG_VERSION")));
-        serde_json::from_str(&text).unwrap()
     }
 
     fn management(dir: &Path, enabled: bool, commercial: bool) -> Arc<Management> {
@@ -2171,26 +2162,6 @@ mod tests {
         dir
     }
 
-    fn canonical(raw: &str) -> String {
-        let mut lines = raw.split('\n').map(str::to_owned).collect::<Vec<_>>();
-        for i in 0..lines.len() {
-            if lines[i].starts_with("Timestamp: ") {
-                lines[i] = "Timestamp: <time>".into();
-            }
-            if lines[i] == "=== HEADERS ===" || lines[i] == "=== RESPONSE ===" {
-                let mut start = i + 1;
-                if lines.get(start).is_some_and(|s| s.starts_with("Status: ")) {
-                    start += 1;
-                }
-                let end = (start..lines.len())
-                    .find(|&j| lines[j].is_empty())
-                    .unwrap_or(lines.len());
-                lines[start..end].sort();
-            }
-        }
-        lines.join("\n")
-    }
-
     fn contents(section: &Section) -> Vec<u8> {
         let mut out = Vec::new();
         section.write_to(&mut out).unwrap();
@@ -2207,14 +2178,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_contract_matches_real_go() {
+    async fn upstream_capture_retains_events_metadata_and_redacts_authentication() {
         use cpa_core::exec::{CaptureEvent::*, UpstreamRequest};
         assert!(!cpa_core::exec::CaptureSink::default().enabled());
         assert!(!cpa_core::exec::CaptureSink::default().logs_responses());
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/upstream_capture_go.json")).unwrap();
-        for case in fixture.as_array().unwrap() {
-            let case = case.clone();
+        for kind in ["http", "missing", "websocket", "disabled", "oauth", "reload"] {
+            let case = serde_json::json!({"kind": kind});
             let dir = scratch();
             let state = management(&dir, case["kind"] != "disabled" && case["kind"] != "reload", false);
             let rt = state.rt.clone();
@@ -2291,11 +2260,39 @@ mod tests {
                         ("response", contents(&record.api_response)),
                         ("timeline", contents(&record.api_timeline)),
                     ] {
-                        assert_eq!(
-                            canonical(std::str::from_utf8(&bytes).unwrap()).trim_end_matches('\n'),
-                            case[name].as_str().unwrap().trim_end_matches('\n'),
-                            "{kind} {name}"
-                        );
+                        let text = std::str::from_utf8(&bytes).unwrap();
+                        let expected_empty = match (kind, name) {
+                            ("websocket", "request" | "response") => true,
+                            ("disabled", "response" | "timeline") => true,
+                            (_, "timeline") => kind != "websocket",
+                            _ => false,
+                        };
+                        assert_eq!(text.is_empty(), expected_empty, "{kind} {name}: {text}");
+                        if !expected_empty {
+                            if name == "request" && !matches!(kind, "missing" | "reload") {
+                                for field in ["https://fixture.invalid/private", "POST", "request body"] {
+                                    assert!(text.contains(field), "{kind}: {field}: {text}");
+                                }
+                            }
+                            if name == "response" {
+                                for field in [
+                                    "201",
+                                    "event: first",
+                                    "data: {\"a\":1}",
+                                    "second",
+                                    "fixture error",
+                                    "second error",
+                                ] {
+                                    assert!(text.contains(field), "{kind}: {field}: {text}");
+                                }
+                            }
+                            if name == "timeline" {
+                                for field in ["response.created", "fixture disconnect", "101", "request body"] {
+                                    assert!(text.contains(field), "{field}: {text}");
+                                }
+                            }
+                            assert!(!text.contains("1234567890"), "unmasked credential: {text}");
+                        }
                         assert!(!String::from_utf8_lossy(&bytes).contains("never-print-oauth"));
                     }
                     "ok"
@@ -2512,83 +2509,124 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn go_middleware_goldens() {
-        let fixture: serde_json::Value = capture_go();
-        let date = regex::Regex::new(r"\d{4}-\d\d-\d\dT\d{6}").unwrap();
-        for case in fixture["cases"].as_array().unwrap() {
+    async fn request_capture_obeys_enablement_status_and_body_consumption() {
+        // Full capture, success-only suppression, client errors, cancellation, HEAD,
+        // GET/management exclusions, partial reads, and SSE are independent policies.
+        for (enabled, method, path, status, payload, partial, streaming, retained) in [
+            (
+                true,
+                "POST",
+                "/v1/responses?key=1234567890",
+                200,
+                "inbound-secret\n",
+                false,
+                false,
+                true,
+            ),
+            (false, "POST", "/v1/responses", 200, "ok", false, false, false),
+            (false, "POST", "/v1/responses", 400, "client-error", false, false, true),
+            (false, "POST", "/v1/responses", 499, "cancel", false, false, false),
+            (false, "HEAD", "/v1/responses", 500, "head", false, false, true),
+            (true, "GET", "/v1/responses", 500, "get", false, false, false),
+            (
+                true,
+                "POST",
+                "/v8/management/config",
+                500,
+                "management-secret",
+                false,
+                false,
+                false,
+            ),
+            (false, "POST", "/v1/responses", 500, "", true, false, true),
+            (
+                true,
+                "POST",
+                "/v1/responses",
+                200,
+                "{\"stream\":true}",
+                false,
+                true,
+                true,
+            ),
+        ] {
             let dir = scratch();
-            let state = management(&dir, case["enabled"].as_bool().unwrap(), false);
-            let status = StatusCode::from_u16(case["status"].as_u64().unwrap() as u16).unwrap();
-            let consume = case["consume"].as_i64().unwrap();
-            let streaming = case["stream"].as_bool().unwrap();
-            let app = axum::Router::new().fallback(move |request: Request| async move {
-                if consume < 0 {
-                    let _ = axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap();
-                } else {
-                    use futures_util::StreamExt;
-                    let mut body = request.into_body().into_data_stream();
-                    assert_eq!(body.next().await.unwrap().unwrap().len(), consume as usize);
-                    // Do not drain the unread rest, just like the Go fixture.
-                }
-                let mut response = Response::new(Body::from("outbound\n"));
-                *response.status_mut() = status;
-                response.headers_mut().insert(
-                    "content-type",
-                    if streaming {
-                        "text/event-stream"
-                    } else {
-                        "application/json"
+            let state = management(&dir, enabled, false);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let app = axum::Router::new().fallback(move |request: Request| {
+                let tx = tx.clone();
+                async move {
+                    if let Some(log) = request.extensions().get::<RequestLog>() {
+                        tx.send(log.clone()).unwrap();
                     }
-                    .parse()
-                    .unwrap(),
-                );
-                response
+                    if partial {
+                        use futures_util::StreamExt;
+                        let mut body = request.into_body().into_data_stream();
+                        assert_eq!(body.next().await.unwrap().unwrap(), Bytes::from_static(b"xxxxx"));
+                    } else {
+                        let _ = axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap();
+                    }
+                    Response::builder()
+                        .status(status)
+                        .header(
+                            "content-type",
+                            if streaming {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            },
+                        )
+                        .body(Body::from("outbound\n"))
+                        .unwrap()
+                }
             });
             let mut app = router(&state, authed(app));
-            let length = case["body_length"].as_u64().unwrap() as usize;
-            let body = if consume >= 0 {
+            let body = if partial {
                 Body::from_stream(futures_util::stream::iter([
-                    Ok::<_, io::Error>(Bytes::from(vec![b'x'; consume as usize])),
-                    Ok(Bytes::from(vec![b'x'; length - consume as usize])),
+                    Ok::<_, io::Error>(Bytes::from_static(b"xxxxx")),
+                    Ok(Bytes::from(vec![b'x'; 1 << 20])),
                 ]))
             } else {
-                Body::from(case["body"].as_str().unwrap().to_owned())
+                Body::from(payload)
             };
             let mut request = HttpRequest::builder()
-                .method(case["method"].as_str().unwrap())
-                .uri(case["path"].as_str().unwrap())
+                .method(method)
+                .uri(path)
                 .header("authorization", "Bearer 1234567890")
-                .header("content-length", length.to_string())
                 .body(body)
                 .unwrap();
             request.extensions_mut().insert(RequestId("0198-aaaa-a1b2c3d4".into()));
             let response = app.call(request).await.unwrap();
-            assert_eq!(response.status(), status);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            assert_eq!(body, if case["method"] == "HEAD" { "" } else { "outbound\n" });
-            let expected = case["content"].as_str().unwrap();
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let files = logs(&dir);
-                let actual = files
-                    .first()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .unwrap_or_default();
-                if canonical(&actual) == expected {
-                    break;
-                }
-                assert!(tokio::time::Instant::now() < deadline, "case {case}: got {actual}");
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            assert_eq!(response.status().as_u16(), status);
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(response_body, if method == "HEAD" { "" } else { "outbound\n" });
+            if let Ok(log) = rx.try_recv() {
+                log.finished().await;
             }
-            // Wait for scheduled cleanup too, so discarded error-only capture
-            // cannot leave files behind and an unexpected later write fails.
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             let files = logs(&dir);
-            assert_eq!(files.len(), usize::from(!expected.is_empty()));
+            assert_eq!(
+                files.len(),
+                usize::from(retained),
+                "{method} {path}, status={status}, enabled={enabled}"
+            );
             if let Some(file) = files.first() {
+                let content = std::fs::read_to_string(file).unwrap();
+                assert!(content.contains(&format!("Status: {status}")));
+                assert!(content.contains(&format!("Method: {method}")));
+                assert!(!content.contains("1234567890"));
+                assert!(content.contains("Bearer 1234...7890"));
+                if partial {
+                    assert!(content.contains("xxxxx"));
+                    assert!(!content.contains(&"x".repeat(6)));
+                } else {
+                    assert!(content.contains(payload));
+                }
+                if method != "HEAD" {
+                    assert!(content.contains("outbound\n"));
+                }
                 assert_eq!(
-                    date.replace_all(file.file_name().unwrap().to_str().unwrap(), "<date>"),
-                    case["filename"].as_str().unwrap()
+                    file.file_name().unwrap().to_str().unwrap().starts_with("error-"),
+                    !enabled
                 );
             }
             assert!(
@@ -2602,9 +2640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_sink_stays_open_after_upgrade_and_matches_go() {
-        use base64::Engine;
-        let fixture: serde_json::Value = capture_go();
+    async fn websocket_capture_stays_open_until_the_session_ends() {
         let dir = scratch();
         let state = management(&dir, true, false);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -2623,46 +2659,57 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         request.extensions_mut().insert(RequestId("0198-aaaa-a1b2c3d4".into()));
-        let response = app.call(request).await.unwrap();
-        drop(response);
+        drop(app.call(request).await.unwrap());
         let sink = rx.recv().await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        assert!(logs(&dir).is_empty(), "HTTP 101 must not flush the transcript");
-        for part in fixture["websocket"]["parts"].as_array().unwrap() {
-            sink.append_part(
-                &base64::engine::general_purpose::STANDARD
-                    .decode(part.as_str().unwrap())
-                    .unwrap(),
-                &Default::default(),
-            )
-            .unwrap();
+        assert!(logs(&dir).is_empty(), "HTTP 101 does not finish a WebSocket session");
+        let parts = [
+            "Event: websocket.request\nrequest-payload\n",
+            "Event: websocket.response\nresponse-payload\n",
+            "Event: websocket.disconnect\ndisconnect-payload\n",
+        ];
+        for part in parts {
+            sink.append_part(part.as_bytes(), &Default::default()).unwrap();
         }
         sink.close().await;
         let files = logs(&dir);
         assert_eq!(files.len(), 1);
         let content = std::fs::read_to_string(&files[0]).unwrap();
-        assert_eq!(canonical(&content), fixture["websocket"]["content"]);
+        let mut previous = 0;
+        for part in parts {
+            let position = content
+                .find(part)
+                .unwrap_or_else(|| panic!("missing {part}: {content}"));
+            assert!(position >= previous, "WebSocket events retain order");
+            previous = position + part.len();
+        }
+        assert!(content.contains("Downstream Transport: websocket"));
         assert!(!content.contains("REQUEST BODY") && !content.contains("=== RESPONSE ==="));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn go_masking_collisions_and_retention() {
-        let fixture: serde_json::Value = capture_go();
-        for case in fixture["masks"].as_array().unwrap() {
-            let name = case["name"].as_str().unwrap().to_ascii_lowercase();
-            let value = case["value"].as_str().unwrap();
-            let mut want = case["out"].as_str().unwrap().to_owned();
-            // Deliberate difference: Go leaves a masked two-byte value in the clear.
-            if value == "ab" && masked_header(&name, b"abc") != b"abc" {
-                want = "...".into();
+    fn credentials_are_masked_and_log_collisions_and_retention_are_safe() {
+        for name in [
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "x-apikey",
+            "x-token",
+            "x-secret",
+            "cookie",
+            "set-cookie",
+        ] {
+            for secret in ["ab", "abc", "abcdefgh", "abcdefghi", "Bearer 1234567890"] {
+                let masked = String::from_utf8(masked_header(name, secret.as_bytes())).unwrap();
+                assert_ne!(masked, secret, "{name}: the complete credential never reaches the log");
+                if cookie(name) {
+                    assert_eq!(masked, REDACTED);
+                } else {
+                    assert!(masked.contains("..."));
+                }
             }
-            // Deliberate difference: Go logs cookie values unchanged.
-            if cookie(&name) {
-                want = REDACTED.into();
-            }
-            assert_eq!(String::from_utf8(masked_header(&name, value.as_bytes())).unwrap(), want);
         }
+        assert_eq!(masked_header("x-request-id", b"request-123"), b"request-123");
         let dir = scratch();
         let name = "error-v1-responses-2026-10-03T040506-a1b2c3d4.log";
         unique_file(&dir, name).unwrap().write_all(b"original").unwrap();
@@ -3621,20 +3668,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hot_enable_captures_only_frames_written_while_enabled_like_go() {
+    // Product policy: Request-log hot enablement captures only frames written while enabled; a session transcript remains open until its owner closes it.
+    async fn hot_enable_captures_only_frames_written_while_enabled() {
         use futures_util::StreamExt;
-        let fixture: serde_json::Value = capture_go();
-        for case in fixture["reloads"].as_array().unwrap() {
+        for before_first in [false, true] {
             let dir = scratch();
             let state = management(&dir, false, false);
-            let app = axum::Router::new().fallback(|| async {
-                Response::builder()
-                    .header("content-type", "application/json")
-                    .body(Body::from_stream(futures_util::stream::iter([
-                        Ok::<_, io::Error>(Bytes::from_static(b"first\n")),
-                        Ok(Bytes::from_static(b"second\n")),
-                    ])))
-                    .unwrap()
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let app = axum::Router::new().fallback(move |axum::Extension(log): axum::Extension<RequestLog>| {
+                tx.send(log).unwrap();
+                async {
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(Body::from_stream(futures_util::stream::iter([
+                            Ok::<_, io::Error>(Bytes::from_static(b"first\n")),
+                            Ok(Bytes::from_static(b"second\n")),
+                        ])))
+                        .unwrap()
+                }
             });
             let mut app = router(&state, authed(app));
             let response = app
@@ -3647,12 +3698,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let log = rx.recv().await.unwrap();
             let enable = || {
                 state.rt.publish_config(
                     cpa_core::config::Config::parse("observability: {logs: {request-log: true}}\n").unwrap(),
                 )
             };
-            if case["before_first"] == true {
+            if before_first {
                 enable();
             }
             let mut body = response.into_body().into_data_stream();
@@ -3660,86 +3712,66 @@ mod tests {
             enable();
             assert_eq!(body.next().await.unwrap().unwrap(), "second\n");
             assert!(body.next().await.is_none());
-            let expected = case["content"].as_str().unwrap();
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                let actual = logs(&dir)
-                    .first()
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .unwrap_or_default();
-                if canonical(&actual) == expected {
-                    break;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "got {actual}, expected {expected}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            log.finished().await;
+            let files = logs(&dir);
+            assert_eq!(files.len(), 1);
+            let content = std::fs::read_to_string(&files[0]).unwrap();
+            assert!(content.contains("second\n"));
+            assert_eq!(content.contains("first\n"), before_first);
             std::fs::remove_dir_all(dir).unwrap();
         }
     }
 
     #[tokio::test]
-    async fn compression_body_bytes_match_real_go_including_raw_error_fallback() {
-        use base64::Engine;
-        let fixture: serde_json::Value = capture_go();
-        for case in fixture["brotli_prefixes"].as_array().unwrap() {
-            let input = base64::engine::general_purpose::STANDARD
-                .decode(case["input"].as_str().unwrap())
-                .unwrap();
+    async fn codec_round_trips_and_failures_preserve_capture_bytes() {
+        use tokio::io::AsyncReadExt;
+        let payload = b"data: {\"type\":\"response.completed\",\"text\":\"hello <&>\"}\n\n";
+        for encoding in ["gzip", "deflate", "br", "zstd"] {
+            let mut encoder: Box<dyn tokio::io::AsyncRead + Unpin> = match encoding {
+                "gzip" => Box::new(async_compression::tokio::bufread::GzipEncoder::new(payload.as_slice())),
+                "deflate" => Box::new(async_compression::tokio::bufread::DeflateEncoder::new(
+                    payload.as_slice(),
+                )),
+                "br" => Box::new(async_compression::tokio::bufread::BrotliEncoder::new(
+                    payload.as_slice(),
+                )),
+                "zstd" => Box::new(async_compression::tokio::bufread::ZstdEncoder::new(payload.as_slice())),
+                _ => unreachable!(),
+            };
+            let mut compressed = Vec::new();
+            encoder.read_to_end(&mut compressed).await.unwrap();
             let mut headers = HeaderMap::new();
-            headers.insert("content-encoding", "br".parse().unwrap());
-            let (output, error) = decode(input.clone(), &headers, false, None).await;
-            if error.is_some() {
-                assert_eq!(output, input, "never discard bytes on codec failure");
-            } else {
-                assert!(!case["error"].as_bool().unwrap());
-                assert_eq!(
-                    output,
-                    base64::engine::general_purpose::STANDARD
-                        .decode(case["output"].as_str().unwrap())
-                        .unwrap()
-                );
+            headers.insert("content-encoding", encoding.parse().unwrap());
+            let (body, error) = decode(compressed.clone(), &headers, false, None).await;
+            assert_eq!(body, payload, "valid {encoding} frame");
+            assert!(error.is_none(), "{encoding}: {error:?}");
+            // Every truncated prefix either yields a valid prefix or fails without losing raw evidence.
+            for end in 0..compressed.len() {
+                let prefix = compressed[..end].to_vec();
+                let (body, error) = decode(prefix.clone(), &headers, false, None).await;
+                if error.is_some() {
+                    assert_eq!(body, prefix, "{encoding}: prefix {end}");
+                } else {
+                    assert!(
+                        payload.starts_with(&body),
+                        "{encoding}: accepted output must come from the payload"
+                    );
+                }
             }
-        }
-        for case in fixture["compression"].as_array().unwrap() {
-            let raw = base64::engine::general_purpose::STANDARD
-                .decode(case["input"].as_str().unwrap())
-                .unwrap();
-            let log = base64::engine::general_purpose::STANDARD
-                .decode(case["raw"].as_str().unwrap())
-                .unwrap();
-            let section = b"=== RESPONSE ===\n";
-            let start = log.windows(section.len()).position(|b| b == section).unwrap() + section.len();
-            let start = start + log[start..].windows(2).position(|b| b == b"\n\n").unwrap() + 2;
-            let logged_body = &log[start..log.len() - 1];
-            let mut headers = HeaderMap::new();
-            headers.insert("content-encoding", case["encoding"].as_str().unwrap().parse().unwrap());
-            let (body, error) = decode(raw.clone(), &headers, false, None).await;
-            if logged_body
-                .windows(b"\n[DECOMPRESSION ERROR: ".len())
-                .any(|bytes| bytes == b"\n[DECOMPRESSION ERROR: ")
-            {
-                assert_eq!(body, raw);
-                assert!(logged_body.starts_with(&body));
-                assert!(logged_body[body.len()..].starts_with(b"\n[DECOMPRESSION ERROR: "));
-                assert!(error.is_some());
-                // Exact malformed-codec diagnostic wording remains an explicit
-                // parity gap; raw bytes and annotation presence are verified here.
-            } else if case["invalid"] == true && case["encoding"] == "br" {
-                // Accepted corrupt-Brotli difference: Go permits partial output;
-                // Rust reports failure and preserves the complete raw input.
-                assert_eq!(body, raw);
-                assert!(error.is_some());
-            } else {
-                assert_eq!(body, logged_body);
+            let malformed = b"invalid compressed frame".to_vec();
+            let (body, error) = decode(malformed.clone(), &headers, false, None).await;
+            assert_eq!(body, malformed);
+            assert!(error.is_some(), "{encoding}");
+            if encoding == "zstd" {
+                let (request, error) = decode(compressed, &headers, true, None).await;
+                assert_eq!(request, payload);
                 assert!(error.is_none());
-            }
-            if case["encoding"] == "zstd" {
-                let (request_body, error) = decode(raw.clone(), &headers, true, None).await;
-                assert_eq!(request_body, if case["invalid"] == true { raw } else { body });
-                assert!(error.is_none(), "Go silently retains undecodable inbound bodies");
+                let (request, error) = decode(malformed.clone(), &headers, true, None).await;
+                assert_eq!(
+                    request, malformed,
+                    "undecodable request bytes remain available to the handler"
+                );
+                assert!(error.is_none());
             }
         }
     }

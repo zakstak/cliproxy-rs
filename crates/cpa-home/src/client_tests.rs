@@ -1,6 +1,5 @@
-//! Client tests against the fake Home. Expected values come from
-//! `tests/fixtures/go_home_golden.json`, produced by running Go's internal/home code
-//! (see `tests/fixtures/README.md`).
+//! Home protocol tests against a private local peer. JSON fields are compared as
+//! values; RESP argument ordering, membership identity, and lease behavior remain exact.
 
 use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
@@ -8,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use serde_json::Value as Json;
+use serde_json::{Value as Json, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{Client, DispatchRequest, Recovery, ReleaseFrame, SetOptions, parse_cluster_nodes, set_args};
@@ -16,31 +15,12 @@ use crate::config::{CredentialConcurrency, HomeConfig};
 use crate::error::Error;
 use crate::fake::{self, FakeHome, Reply};
 
-fn golden() -> Json {
-    serde_json::from_str(include_str!("../tests/fixtures/go_home_golden.json")).unwrap()
-}
-
-fn golden_case<'a>(doc: &'a Json, section: &str, name: &str) -> &'a Json {
-    doc[section]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == name)
-        .unwrap_or_else(|| panic!("golden {section}/{name}"))
-}
-
 fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
     pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
 
-/// Go `TestAuthDispatchRequestIncludesCount`, `…DefaultsCountToOne`,
-/// `…IncludesCredentialPolicy`, `…IncludesExcludedAuthIDs`,
-/// `…IncludesEmptyExcludedAuthIDs`, `…IncludesPinnedAuthID`,
-/// `…DistinguishesLegacyAndRetryRoundProtocol`, `…IncludesParentSessionID` and
-/// `…IncludesNodeKind`, as Go's exact request bytes.
 #[test]
-fn dispatch_request_json_matches_go_bytes() {
-    let doc = golden();
+fn dispatch_requests_preserve_required_fields_and_optional_distinctions() {
     let excluded = Some(vec!["auth-a".to_owned(), "auth-b".to_owned()]);
     let cases: Vec<(&str, DispatchRequest)> = vec![
         (
@@ -120,182 +100,231 @@ fn dispatch_request_json_matches_go_bytes() {
         // case-insensitive header map cannot express; it is not ported.
     ];
     for (name, request) in cases {
-        let want = golden_case(&doc, "dispatch_requests", name)["json"].as_str().unwrap();
-        assert_eq!(String::from_utf8(request.to_json()).unwrap(), want, "{name}");
+        let got: Json = serde_json::from_slice(&request.to_json()).unwrap();
+        assert_eq!(got["type"], "auth", "{name}");
+        assert_eq!(got["model"], request.model.trim(), "{name}");
+        assert_eq!(
+            got["count"],
+            if request.excluded_auth_ids.is_some() {
+                1
+            } else {
+                request.count.max(1)
+            },
+            "{name}"
+        );
+        assert_eq!(got["concurrency_protocol"], 1, "{name}");
+        for (field, input) in [
+            ("session_id", &request.session_id),
+            ("parent_session_id", &request.parent_session_id),
+            ("credential_policy", &request.credential_policy),
+            ("pinned_auth_id", &request.pinned_auth_id),
+        ] {
+            if input.trim().is_empty() {
+                assert!(got.get(field).is_none(), "{name}: {field}");
+            } else {
+                assert_eq!(got[field], input.trim(), "{name}: {field}");
+            }
+        }
+        match request.retry_round {
+            Some(round) => assert_eq!(got["retry_round"], round.max(0), "{name}"),
+            None => assert!(got.get("retry_round").is_none(), "{name}"),
+        }
+        match request.excluded_auth_ids {
+            Some(ids) => assert_eq!(got["excluded_auth_ids"], json!(ids), "{name}"),
+            None => assert!(got.get("excluded_auth_ids").is_none(), "{name}"),
+        }
+        if name == "headers" {
+            assert_eq!(
+                got["headers"],
+                json!({"authorization":"Bearer x", "x-empty":"", "x-multi":"a, b", "x-node-kind":"subagent"})
+            );
+            assert_eq!(got["node_kind"], "subagent");
+        } else {
+            assert!(got.get("headers").is_none(), "{name}");
+            assert!(got.get("node_kind").is_none(), "{name}");
+        }
     }
 }
 
-/// Go `TestBuildKVSetArgs`.
 #[test]
-fn kv_set_args_match_go() {
-    let doc = golden();
-    let ms = Duration::from_millis;
+fn redis_set_arguments_preserve_options_and_round_expiry_up() {
+    let duration = Duration::from_millis;
     let cases = [
-        ("plain", "k", SetOptions::default()),
+        (SetOptions::default(), vec!["k", "v"]),
         (
-            "ex_ceil",
-            "k",
             SetOptions {
-                ex: ms(1500),
+                ex: duration(1500),
                 ..Default::default()
             },
+            vec!["k", "v", "EX", "2"],
         ),
         (
-            "px_ceil",
-            "k",
             SetOptions {
                 px: Duration::from_micros(1500),
                 ..Default::default()
             },
+            vec!["k", "v", "PX", "2"],
         ),
         (
-            "nx_xx",
-            "k",
             SetOptions {
                 nx: true,
+                ex: duration(2000),
+                ..Default::default()
+            },
+            vec!["k", "v", "EX", "2", "NX"],
+        ),
+        (
+            SetOptions {
                 xx: true,
+                px: duration(250),
                 ..Default::default()
             },
+            vec!["k", "v", "PX", "250", "XX"],
         ),
-        (
-            "ex_px",
-            "k",
-            SetOptions {
-                ex: ms(1000),
-                px: ms(1000),
-                ..Default::default()
-            },
-        ),
-        ("empty_key", "  ", SetOptions::default()),
-        (
-            "ex_nx",
-            " k ",
-            SetOptions {
-                ex: ms(2000),
-                nx: true,
-                ..Default::default()
-            },
-        ),
-        (
-            "px_xx",
-            "k",
-            SetOptions {
-                px: ms(250),
-                xx: true,
-                ..Default::default()
-            },
-        ),
-        // Go's "negative" case has no unsigned Duration equivalent.
     ];
-    for (name, key, opts) in cases {
-        let want = golden_case(&doc, "kv_set_args", name);
-        match set_args(key, b"v", opts) {
-            Ok(args) => {
-                let got: Vec<String> = args.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-                let want: Vec<String> = serde_json::from_value(want["args"].clone()).unwrap();
-                assert_eq!(got, want, "{name}");
-            }
-            Err(error) => assert_eq!(error.to_string(), want["error"].as_str().unwrap(), "{name}"),
+    for (options, expected) in cases {
+        let actual = set_args(" k ", b"v", options).unwrap();
+        assert_eq!(
+            actual,
+            expected.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>()
+        );
+    }
+    for options in [
+        SetOptions {
+            nx: true,
+            xx: true,
+            ..Default::default()
+        },
+        SetOptions {
+            ex: duration(1),
+            px: duration(1),
+            ..Default::default()
+        },
+    ] {
+        assert!(set_args("k", b"v", options).is_err());
+    }
+    assert!(set_args("  ", b"v", SetOptions::default()).is_err());
+}
+#[test]
+fn enrollment_jwt_validates_required_claims_and_accepts_base64url_padding() {
+    use base64::Engine;
+    let claims = json!({"certificate_id":" cert-1 ","cluster_id":"cluster-a","ca_fingerprint":"AB:cd ef","enrollment_secret":"placeholder-secret","ip":" 10.0.0.1 ","port":8443,"iat":1700000000});
+    let token = |value: &Json, padded: bool| {
+        let bytes = serde_json::to_vec(value).unwrap();
+        let engine = if padded {
+            &base64::engine::general_purpose::URL_SAFE
+        } else {
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+        };
+        format!("h.{}.s", engine.encode(bytes))
+    };
+    for padded in [false, true] {
+        let raw = token(&claims, padded);
+        for raw in [raw.clone(), format!("  {raw}\n")] {
+            let actual = crate::cert::parse_claims(&raw).unwrap();
+            assert_eq!(serde_json::to_value(actual).unwrap(), claims);
         }
     }
-}
-
-#[test]
-fn jwt_claims_match_go() {
-    let doc = golden();
-    for case in doc["jwt"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        let got = crate::cert::parse_claims(case["raw"].as_str().unwrap());
-        match (&case["error"], got) {
-            (Json::Null, Ok(claims)) => {
-                assert_eq!(serde_json::to_value(&claims).unwrap(), case["claims"], "{name}");
-            }
-            (Json::String(want), Err(error)) => {
-                // Decoder messages differ between Go and serde; validation ones must not.
-                if want.starts_with("home jwt") {
-                    assert_eq!(&error.to_string(), want, "{name}");
-                }
-            }
-            (want, got) => panic!("{name}: want {want:?}, got {got:?}"),
-        }
+    for field in [
+        "certificate_id",
+        "cluster_id",
+        "ca_fingerprint",
+        "enrollment_secret",
+        "ip",
+        "port",
+    ] {
+        let mut invalid = claims.clone();
+        invalid.as_object_mut().unwrap().remove(field);
+        assert!(
+            crate::cert::parse_claims(&token(&invalid, false)).is_err(),
+            "missing {field}"
+        );
     }
-    let normalized = &doc["fingerprint_normalize"];
-    assert_eq!(crate::cert::normalize_fingerprint(" AB:CD ef 01 "), normalized[0]);
-    assert_eq!(crate::cert::normalize_fingerprint(""), normalized[1]);
+    for invalid in [json!([]), json!({}), json!({"certificate_id":5})] {
+        assert!(crate::cert::parse_claims(&token(&invalid, false)).is_err());
+    }
+    for invalid in ["a.b", "h.!!!.s"] {
+        assert!(crate::cert::parse_claims(invalid).is_err());
+    }
+    let mut invalid = claims.clone();
+    invalid["port"] = 0.into();
+    assert!(crate::cert::parse_claims(&token(&invalid, false)).is_err());
+    invalid = claims;
+    invalid["ca_fingerprint"] = " : ".into();
+    assert!(crate::cert::parse_claims(&token(&invalid, false)).is_err());
+    assert_eq!(crate::cert::normalize_fingerprint(" AB:CD ef 01 "), "abcdef01");
+    assert_eq!(crate::cert::normalize_fingerprint(""), "");
 }
-
 #[test]
-fn cluster_nodes_sort_like_go() {
-    let doc = golden();
-    let nodes = parse_cluster_nodes(
-        br#"{"ok":true,"nodes":[{"ip":"10.0.0.3","port":1,"client_count":5},{"ip":" ","port":2,"client_count":0},{"ip":"10.0.0.1","port":0},{"ip":" 10.0.0.2 ","port":3,"client_count":-4,"is_master":true},{"ip":"10.0.0.4","port":4,"client_count":5}]}"#,
-    )
-    .unwrap();
-    let want: Vec<(String, i64, i64, bool)> = doc["cluster_nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|n| {
-            (
-                n["ip"].as_str().unwrap().to_owned(),
-                n["port"].as_i64().unwrap(),
-                n["client_count"].as_i64().unwrap(),
-                n["is_master"].as_bool().unwrap(),
-            )
-        })
-        .collect();
-    let got: Vec<(String, i64, i64, bool)> = nodes
+fn cluster_nodes_ignore_unusable_addresses_and_sort_by_load_then_address() {
+    let nodes = parse_cluster_nodes(br#"{"ok":true,"nodes":[{"ip":"10.0.0.3","port":1,"client_count":5},{"ip":" ","port":2,"client_count":0},{"ip":"10.0.0.1","port":0},{"ip":" 10.0.0.2 ","port":3,"client_count":-4,"is_master":true},{"ip":"10.0.0.4","port":4,"client_count":5}]}"#).unwrap();
+    let actual: Vec<_> = nodes
         .into_iter()
         .map(|n| (n.ip, n.port, n.client_count, n.is_master))
         .collect();
-    assert_eq!(got, want);
+    assert_eq!(
+        actual,
+        vec![
+            ("10.0.0.2".to_owned(), 3, 0, true),
+            ("10.0.0.3".to_owned(), 1, 5, false),
+            ("10.0.0.4".to_owned(), 4, 5, false)
+        ]
+    );
+    assert!(parse_cluster_nodes(b"not json").is_err());
 }
-
-/// Go `TestRunConfigSubscriberLifetimeUsesLegacySubscribeWithoutLifecycleConfig` (the
-/// arguments per recovery state, as Go's exact values).
 #[test]
-fn subscription_parameters_match_go_per_recovery_state() {
-    let doc = golden();
-    for case in doc["subscription_parameters"].as_array().unwrap() {
-        let client = Client::with_options(
-            HomeConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            Duration::from_secs(3),
-            "11111111-2222-3333-4444-555555555555".into(),
-        );
-        if case["legacy"].as_bool().unwrap() {
-            client.enable_legacy_membership();
+fn subscription_arguments_follow_revision_membership_and_recovery_state() {
+    const INSTANCE: &str = "11111111-2222-3333-4444-555555555555";
+    for revision in [0, 7] {
+        for legacy in [false, true] {
+            for (state, takeover) in [
+                (Recovery::Stable, false),
+                (Recovery::TakeoverEligible, true),
+                (Recovery::Switching, false),
+                (Recovery::SwitchingTakeover, true),
+            ] {
+                let client = Client::with_options(
+                    HomeConfig {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    Duration::from_secs(3),
+                    INSTANCE.into(),
+                );
+                if legacy {
+                    client.enable_legacy_membership();
+                }
+                client.set_recovery(state);
+                if revision != 0 {
+                    client
+                        .set_lifecycle_config(CredentialConcurrency {
+                            lifecycle_config_revision: revision,
+                            cpa_heartbeat_timeout: 9_000_000_000,
+                            ..Default::default()
+                        })
+                        .unwrap();
+                }
+                let mut expected = vec!["config".to_owned()];
+                if revision != 0 {
+                    expected.push(revision.to_string());
+                    if !legacy {
+                        if takeover {
+                            expected.push("takeover".into());
+                        }
+                        expected.push(INSTANCE.into());
+                    }
+                }
+                let (actual, timeout) = client.subscription_parameters();
+                assert_eq!(
+                    actual, expected,
+                    "revision={revision}, legacy={legacy}, takeover={takeover}"
+                );
+                assert_eq!(timeout, Duration::from_secs(if revision == 0 { 3 } else { 9 }));
+            }
         }
-        client.set_recovery(match case["state"].as_u64().unwrap() {
-            0 => Recovery::Stable,
-            1 => Recovery::TakeoverEligible,
-            2 => Recovery::Switching,
-            _ => Recovery::SwitchingTakeover,
-        });
-        let revision = case["revision"].as_i64().unwrap();
-        if revision > 0 {
-            client
-                .set_lifecycle_config(CredentialConcurrency {
-                    lifecycle_config_revision: revision,
-                    cpa_heartbeat_timeout: 9_000_000_000,
-                    ..Default::default()
-                })
-                .unwrap();
-        }
-        let (args, timeout) = client.subscription_parameters();
-        let want: Vec<String> = serde_json::from_value(case["args"].clone()).unwrap();
-        assert_eq!(args, want, "{case}");
-        assert_eq!(
-            timeout.as_millis() as i64,
-            case["timeout_ms"].as_i64().unwrap(),
-            "{case}"
-        );
     }
 }
-
-/// Runs one operation against a fake answering like Go's golden harness.
+/// Runs a named operation against a local RESP peer with explicit reply variants.
 async fn run_op(name: &str) -> (Vec<Vec<String>>, Result<Json, String>) {
     let reply = |args: &[String]| -> Reply {
         let first = args[0].go_lower();
@@ -459,59 +488,154 @@ async fn run_op(name: &str) -> (Vec<Vec<String>>, Result<Json, String>) {
             })
             .await
             .map(|()| Json::Null),
-        other => panic!("unported golden op {other}"),
+        other => panic!("unknown protocol operation {other}"),
     };
     (home.commands(), result.map_err(|e| e.to_string()))
 }
 
-/// Go `TestKVGetConvertsRedisNilToMiss`, `TestKVMGetConvertsNilItemsToMiss`,
-/// `TestKVSetConditionUnmetReturnsFalse`, `TestKVCompareAndSwapSendsCASCommand`,
-/// `TestKVCompareAndSwapOmitsPXWithoutTTL`, `TestKVCompareAndSwapLatchesUnsupportedHome`,
-/// `TestKVMSetUsesStableKeyOrder`,
-/// `TestModelsRequestSerializationCarriesCredentials` and the in-flight snapshot's
-/// dedicated key (`TestClientLPushInFlightSnapshotUsesDedicatedKeyWithoutChangingHeartbeat`):
-/// every client operation sends Go's commands and decodes Go's replies.
 #[tokio::test]
-async fn every_command_matches_go_on_the_wire() {
-    let doc = golden();
-    // The golden keeps Go's Home plugin commands (`rpush_plugin_status`,
-    // `get_plugin_tasks`) as historical evidence; native plugins and their Home sync are
-    // removed (docs/DIFFERENCES-FROM-GO.md "Native plugins").
-    let skipped = [
-        "kv_ttl",
-        "kv_ttl_missing",
-        "kv_ttl_persistent",
-        "rpush_plugin_status",
-        "get_plugin_tasks",
+async fn home_commands_preserve_resp_arguments_and_decode_reply_variants() {
+    // These commands are Home's public Redis protocol. JSON is an argument value,
+    // while command names are case-insensitive and other argument order is significant.
+    let cases: Vec<(&str, Vec<&str>, Result<Json, &str>)> = vec![
+        ("get_config", vec!["get", "config"], Ok(json!("port: 1\n"))),
+        ("get_config_missing", vec!["get", "config"], Err("not found")),
+        ("get_config_empty", vec!["get", "config"], Err("empty")),
+        ("kv_get", vec!["get", "cpa:k"], Ok(json!(["v", true]))),
+        ("kv_get_miss", vec!["get", "cpa:k"], Ok(json!(["", false]))),
+        ("kv_set", vec!["set", "k", "v\0", "EX", "2", "NX"], Ok(json!(true))),
+        ("kv_set_unmet", vec!["set", "k", "v", "XX"], Ok(json!(false))),
+        ("kv_setnx", vec!["set", "k", "v", "EX", "2", "NX"], Ok(json!(true))),
+        ("kv_setnx_nottl", vec!["set", "k", "v", "NX"], Ok(json!(true))),
+        (
+            "kv_cas",
+            vec!["cas", "k", "1", "old", "new", "PX", "2"],
+            Ok(json!(true)),
+        ),
+        ("kv_cas_nottl", vec!["cas", "k", "0", "", "new"], Ok(json!(false))),
+        (
+            "kv_cas_unsupported",
+            vec!["cas", "k", "0", "", "new"],
+            Err("unsupported"),
+        ),
+        ("kv_del", vec!["del", "a", "b"], Ok(json!(2))),
+        ("kv_expire", vec!["expire", "k", "2"], Ok(json!(true))),
+        ("kv_expire_subsecond", vec!["expire", "k", "1"], Ok(json!(true))),
+        ("kv_incrby", vec!["incrby", "k", "-3"], Ok(json!(7))),
+        (
+            "kv_mget",
+            vec!["mget", "a", "b", "c"],
+            Ok(json!([["x", "", ""], [true, false, true]])),
+        ),
+        ("kv_mset", vec!["mset", "a", "1", "b", "2"], Ok(Json::Null)),
+        ("lpush_usage", vec!["lpush", "usage", r#"{"u":1}"#], Ok(Json::Null)),
+        ("lpush_usage_empty", vec![], Ok(Json::Null)),
+        (
+            "lpush_inflight",
+            vec!["lpush", "in-flight-snapshot", r#"{"kind":"part"}"#],
+            Ok(Json::Null),
+        ),
+        ("rpush_request_log", vec!["rpush", "request-log", "r"], Ok(Json::Null)),
+        ("rpush_app_log", vec!["rpush", "app-log", "a"], Ok(Json::Null)),
+        (
+            "get_refresh_auth",
+            vec![
+                "get",
+                r#"{"type":"refresh","auth_index":"idx","access_token_sha256":"sha"}"#,
+            ],
+            Ok(json!(r#"{"id":"a"}"#)),
+        ),
+        (
+            "get_refresh_auth_missing",
+            vec!["get", r#"{"type":"refresh","auth_index":"idx"}"#],
+            Err("not found"),
+        ),
+        (
+            "get_models",
+            vec![
+                "get",
+                r#"{"type":"models","headers":{"user-agent":"ua"},"query":{"key":"k"}}"#,
+            ],
+            Ok(json!(r#"{"data":[]}"#)),
+        ),
+        (
+            "rpop_auth",
+            vec![
+                "rpop",
+                r#"{"type":"auth","model":"gpt","count":1,"concurrency_protocol":1,"session_id":"s","parent_session_id":"p","node_kind":"k","headers":{"x-node-kind":"k"},"credential_policy":"pol","retry_round":2,"excluded_auth_ids":["x"]}"#,
+            ],
+            Ok(json!(r#"{"auth":{"id":"a"}}"#)),
+        ),
+        (
+            "rpop_auth_not_found",
+            vec![
+                "rpop",
+                r#"{"type":"auth","model":"gpt","count":1,"concurrency_protocol":1}"#,
+            ],
+            Err("not found"),
+        ),
+        (
+            "rpop_auth_server_error",
+            vec![
+                "rpop",
+                r#"{"type":"auth","model":"gpt","count":1,"concurrency_protocol":1}"#,
+            ],
+            Err("dispatch denied"),
+        ),
+        (
+            "concurrency_release",
+            vec![
+                "lpush",
+                "concurrency-release",
+                r#"{"credential_id":"cred-1","model":"gpt","release_seq":3}"#,
+            ],
+            Ok(Json::Null),
+        ),
     ];
-    for case in doc["commands"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        if skipped.contains(&name) {
-            continue;
-        }
-        let (commands, result) = run_op(name).await;
-        let want: Vec<Vec<String>> = match &case["commands"] {
-            Json::Null => Vec::new(),
-            v => serde_json::from_value(v.clone()).unwrap(),
-        };
-        assert_eq!(commands, want, "{name}");
-        match (&case["error"], result) {
-            (Json::Null, Ok(got)) => {
-                let want = &case["result"];
-                if !(want.is_null() && got.is_null()) {
-                    assert_eq!(&got, want, "{name}");
+    for (name, expected, result) in cases {
+        let (commands, actual_result) = run_op(name).await;
+        let commands: Vec<_> = commands
+            .iter()
+            .filter(|args| !args[0].eq_ignore_ascii_case("ping"))
+            .collect();
+        if expected.is_empty() {
+            assert!(commands.is_empty(), "{name}: {commands:?}");
+        } else {
+            assert_eq!(
+                commands.len(),
+                1,
+                "{name}: exactly one operation is issued, including unsupported CAS latching"
+            );
+            let actual = commands[0];
+            assert_eq!(actual.len(), expected.len(), "{name}");
+            assert!(actual[0].eq_ignore_ascii_case(expected[0]), "{name}: {actual:?}");
+            for (actual, expected) in actual[1..].iter().zip(&expected[1..]) {
+                if expected.starts_with('{') {
+                    assert_eq!(
+                        serde_json::from_str::<Json>(actual).unwrap(),
+                        serde_json::from_str::<Json>(expected).unwrap(),
+                        "{name}"
+                    );
+                } else {
+                    assert_eq!(actual, expected, "{name}");
                 }
             }
-            (Json::String(want), Err(got)) if name == "kv_cas_unsupported" => {
-                assert_eq!(got, format!("{want}|{want}"), "{name}");
+        }
+        if name.starts_with("rpop_auth") {
+            assert!(commands.iter().all(|args| args[0].eq_ignore_ascii_case("rpop")));
+        }
+        match (actual_result, result) {
+            (Ok(actual), Ok(expected)) => assert_eq!(actual, expected, "{name}"),
+            (Err(actual), Err(detail)) => {
+                assert!(actual.contains(detail), "{name}: {actual}");
+                if name == "kv_cas_unsupported" {
+                    assert_eq!(actual.matches("unsupported").count(), 2);
+                }
             }
-            (Json::String(want), Err(got)) => assert_eq!(&got, want, "{name}"),
-            (want, got) => panic!("{name}: want error {want:?}, got {got:?}"),
+            (actual, expected) => panic!("{name}: {actual:?}, expected {expected:?}"),
         }
     }
 }
-
-/// Go `TestRPopAuthLeavesCompleteServerErrorDeterministic`.
 #[tokio::test]
 async fn rpop_server_error_is_deterministic_and_keeps_the_lifetime() {
     let home = FakeHome::start(|args| match args[0].as_str() {
@@ -534,7 +658,6 @@ fn request() -> DispatchRequest {
     }
 }
 
-/// Go `TestRPopAuthMarksRequestReadThenCloseAmbiguous`.
 #[tokio::test]
 async fn rpop_read_then_close_is_ambiguous_and_fences() {
     let home = FakeHome::start(|args| match args[0].as_str() {
@@ -552,8 +675,6 @@ async fn rpop_read_then_close_is_ambiguous_and_fences() {
     assert_eq!(home.count("rpop"), 1);
 }
 
-/// Go `TestRPopAuthLeavesHELLOSetupInterruptionDeterministic` and
-/// `TestRPopAuthLeavesPreSendFailureDeterministic`.
 #[tokio::test]
 async fn failures_before_rpop_is_sent_are_deterministic() {
     // Setup interruption: the probe connection closes before RPOP.
@@ -587,7 +708,6 @@ async fn failures_before_rpop_is_sent_are_deterministic() {
     assert!(!error.is_ambiguous() && !unreachable.fenced(), "{error:?}");
 }
 
-/// Go `TestAbortAmbiguousDispatchClosesBlockedRPopWithoutWaitingForResponse`.
 #[tokio::test]
 async fn abort_releases_a_blocked_rpop_without_waiting_for_home() {
     let home = FakeHome::start(|args| match args[0].as_str() {
@@ -635,7 +755,6 @@ async fn dropping_an_issued_rpop_fences_the_lifetime() {
     assert!(client.fenced() && client.ambiguous_dispatch());
 }
 
-/// Go `TestAbortAmbiguousDispatchFencesConcurrentRPop`.
 #[tokio::test]
 async fn concurrent_rpops_after_abort_are_all_fenced_without_dialing() {
     let home = FakeHome::start(|_| fake::raw("+PONG\r\n")).await;
@@ -654,7 +773,6 @@ async fn concurrent_rpops_after_abort_are_all_fenced_without_dialing() {
 
 #[tokio::test]
 async fn release_waits_for_membership_to_be_stable() {
-    // Go TestConcurrencyReleaseDoesNotOpenBeforeMembershipReady.
     let home = FakeHome::start(|_| fake::raw(":1\r\n")).await;
     for state in [
         Recovery::TakeoverEligible,
@@ -714,8 +832,6 @@ async fn get_config_switches_to_the_least_loaded_cluster_node() {
     assert_eq!(client.cluster_nodes().len(), 2);
 }
 
-/// Go `TestGetConfigContinuesAfterClusterDiscoveryResponseError` and
-/// `TestGetConfigSkipsSecondDialAfterClusterTransportFailure`.
 #[tokio::test]
 async fn cluster_discovery_errors_split_by_transport() {
     // A Home error reply or an unusable payload still fetches the config.
@@ -772,7 +888,6 @@ fn failover_client(disabled: bool) -> Client {
 
 #[test]
 fn reconnect_failures_fail_over_after_three_and_survive_new_lifetimes() {
-    // Go TestNewLifetimePreservesClusterFailoverState.
     let client = failover_client(false);
     client.enable_legacy_membership();
     client.mark_reconnect_failure("connect");
@@ -795,7 +910,6 @@ fn reconnect_failures_fail_over_after_three_and_survive_new_lifetimes() {
 
 #[test]
 fn disabled_discovery_never_switches_targets() {
-    // Go TestFailoverAfterReconnectFailureDisabledDoesNotSwitchToClusterNode.
     let client = failover_client(true);
     for _ in 0..5 {
         client.mark_reconnect_failure("connect");
@@ -805,10 +919,6 @@ fn disabled_discovery_never_switches_targets() {
     assert!(client.cluster_nodes().is_empty());
 }
 
-/// Go `TestRedisOptionsHomeTLSDisabled`, `TestRedisOptionsHomeTLSEnabledUsesSeedHostAsServerName`
-/// and `TestRedisOptionsHomeTLSEnabledUsesExplicitServerName`: no TLS without `enable`;
-/// with it, the seed host is verified even after failing over to a cluster node's
-/// address, unless an explicit server name is set.
 #[test]
 fn tls_server_names_follow_the_seed_host_or_the_explicit_name() {
     let client = |host: &str, tls: crate::config::HomeTlsConfig| {
@@ -862,7 +972,6 @@ fn heartbeat_timeout_fails_over_at_once_and_skips_the_current_target() {
 
 #[test]
 fn ambiguous_dispatch_suppresses_takeover_for_the_next_lifetime() {
-    // Go TestAmbiguousDispatchSuppressesTakeoverForNextLifetime.
     let client = failover_client(false);
     client.set_recovery(Recovery::SwitchingTakeover);
     client.abort_ambiguous_dispatch();
@@ -884,7 +993,6 @@ fn lifecycle_config_is_validated_before_use() {
         error.to_string(),
         "validate credential concurrency lifecycle config: credential concurrency busy retry durations must be whole milliseconds"
     );
-    // Go TestClientSetLifecycleConfigAcceptsHomeAuthoritativeHeartbeat.
     client
         .set_lifecycle_config(CredentialConcurrency {
             cpa_heartbeat_timeout: 20_000_000_000,
@@ -923,8 +1031,6 @@ fn short_heartbeat(client: &Client, revision: i64) {
         .unwrap();
 }
 
-/// Go `TestRunConfigSubscriberLifetimeReturnsAfterHeartbeatLoss` and
-/// `TestRunConfigSubscriberLifetimeRebuildsFreshCommandPoolBeforeReady`.
 #[tokio::test]
 async fn subscriber_lifetime_applies_updates_until_the_heartbeat_is_lost() {
     let home = subscriber_home(ACK, Arc::new(AtomicUsize::new(1))).await;
@@ -975,10 +1081,6 @@ async fn subscriber_lifetime_applies_updates_until_the_heartbeat_is_lost() {
     assert!(home.count("ping") >= 1);
 }
 
-/// Go `TestManagedSubscriberOrdinaryTrafficDoesNotRenewHeartbeat` (v8.0.67 `c9dad847`):
-/// config and cluster messages arriving faster than the heartbeat timeout do not keep a
-/// lifetime alive without pongs. The 5s bound only turns a regression into a failure
-/// instead of a hang; a correct lifetime ends one 300ms heartbeat after it is ready.
 #[tokio::test]
 async fn non_pong_traffic_does_not_renew_the_heartbeat() {
     let home = subscriber_home(ACK, Arc::new(AtomicUsize::new(1))).await;
@@ -1031,10 +1133,8 @@ async fn non_pong_traffic_does_not_renew_the_heartbeat() {
     assert!(applied.load(Ordering::SeqCst) >= 2);
 }
 
-/// Go `TestConfigSubscriberUsesAppliedLifecycleRevisionAndRebuildsCommands` and
-/// `TestRunConfigSubscriberLifetimePreservesTakeoverWhenFreshCommandProbeFails`.
 #[tokio::test]
-async fn membership_args_and_takeover_eligibility_follow_go() {
+async fn membership_acknowledgements_preserve_takeover_across_probe_failure() {
     // Probe fails after a protocol-one ACK: takeover eligibility must survive.
     let ping_ok = Arc::new(AtomicUsize::new(0));
     let home = subscriber_home(ACK, ping_ok).await;
@@ -1062,7 +1162,6 @@ async fn membership_args_and_takeover_eligibility_follow_go() {
     );
 }
 
-/// Go `TestRunConfigSubscriberLifetimeRejectsInvalidSubscriptionACK`.
 #[tokio::test]
 async fn invalid_acks_and_legacy_rejections_end_the_lifetime() {
     let wrong = subscriber_home(
@@ -1154,7 +1253,6 @@ async fn cluster_channel_updates_replace_the_node_list() {
     let _ = run.await;
 }
 
-/// Go `TestIssuedRPopAuthErrorClassification` (protocol errors after the request).
 #[tokio::test]
 async fn corrupt_rpop_replies_are_ambiguous() {
     // go-redis rejects negative lengths other than -1 as protocol errors, not Nil.
@@ -1171,10 +1269,8 @@ async fn corrupt_rpop_replies_are_ambiguous() {
     }
 }
 
-/// Go `TestMembershipTakeoverUnavailableError`: Home's takeover refusal and an old
-/// Home's SUBSCRIBE arity error are told apart, and unrelated errors are neither.
 #[test]
-fn membership_errors_classify_like_go() {
+fn membership_errors_distinguish_takeover_refusal_from_legacy_arity() {
     let server = |message: &str| Error::Server(message.into());
     assert!(server("ERR membership_takeover_unavailable").is_membership_takeover_unavailable());
     let legacy = server("ERR wrong number of arguments for 'subscribe' command");
@@ -1188,7 +1284,6 @@ fn membership_errors_classify_like_go() {
     }
 }
 
-/// Go `TestClientLPushInFlightSnapshotErrorKeepsHeartbeat`.
 #[tokio::test]
 async fn a_failed_snapshot_push_keeps_the_heartbeat() {
     let home = FakeHome::start(|args| match args[0].go_lower().as_str() {
@@ -1202,8 +1297,6 @@ async fn a_failed_snapshot_push_keeps_the_heartbeat() {
     assert!(client.heartbeat_ok());
 }
 
-/// Go `TestClientClosePermanentlyFencesDispatch`: a closed client dispatches nothing and
-/// never opens a pool again.
 #[tokio::test]
 async fn a_closed_client_stays_fenced() {
     let home = FakeHome::start(|_| fake::raw("+PONG\r\n")).await;
@@ -1215,10 +1308,8 @@ async fn a_closed_client_stays_fenced() {
     assert!(home.commands().is_empty(), "nothing was dialed");
 }
 
-/// Go `TestDefaultProductionClientTimeouts`: operations and the subscription heartbeat
-/// both default to three seconds.
 #[test]
-fn production_timeouts_match_go() {
+fn production_operations_and_subscription_have_configured_deadlines() {
     let client = Client::new(HomeConfig {
         enabled: true,
         host: "127.0.0.1".into(),
@@ -1229,8 +1320,6 @@ fn production_timeouts_match_go() {
     assert_eq!(client.subscription_parameters().1, Duration::from_secs(3));
 }
 
-/// Go `TestQueryToLowerMap` and `TestModelsRequestOmitsEmptyCredentials`: names are
-/// lower-cased and repeated values joined; an empty map is omitted from the request.
 #[tokio::test]
 async fn models_requests_lower_case_and_omit_empty_maps() {
     let query = crate::client::lower_map([("Key", "v1"), ("Key", "v2"), ("Token", "abc")]);

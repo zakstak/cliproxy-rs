@@ -172,15 +172,19 @@ mod tests {
     }
 
     #[test]
-    fn go_duration_strings() {
-        for (d, want) in [
-            (Duration::ZERO, "0s"),
-            (Duration::from_millis(1500), "1.5s"),
-            (Duration::from_secs(90), "1m30s"),
-            (Duration::from_secs(3600), "1h0m0s"),
-            (Duration::from_millis(250), "250ms"),
+    fn displayed_keepalive_intervals_parse_to_the_configured_duration() {
+        for duration in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(250),
+            Duration::from_millis(1500),
+            Duration::from_secs(90),
+            Duration::from_secs(3600),
         ] {
-            assert_eq!(go_duration(d), want);
+            assert_eq!(
+                cpa_core::config::parse_duration(&go_duration(duration)),
+                Some(i64::try_from(duration.as_nanos()).unwrap())
+            );
         }
     }
 }

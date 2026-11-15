@@ -1,12 +1,12 @@
-//! Expected strings were printed by Go 1.26 running the v8.0.35 encoding steps
-//! (`url.Values.Encode` for `GenerateSIWCAuthURL`; `json.Unmarshal` into
-//! `map[string]json.RawMessage` and `json.Marshal` for `BindCodexSIWC`).
+//! SIWC query and token-file tests follow the OpenAI account/token contract in
+//! docs/codex/CONTRACT.md. Legacy stored expiry spellings are compatibility inputs,
+//! while refresh boundaries are specified with a fixed clock, not a Go recording.
 
 use super::*;
 use crate::codex_testkit::{Mock, json};
 
 #[test]
-fn authorize_url_matches_go() {
+fn authorization_binds_state_nonce_device_pkce_and_requested_resource() {
     let url = authorize_url(
         " st-1 ",
         "no-1",
@@ -16,10 +16,28 @@ fn authorize_url_matches_go() {
         "My Agent/1.0 (x)",
     )
     .unwrap();
-    assert_eq!(
-        url,
-        "https://auth.openai.com/api/accounts/authorize?agent_name_hint=My+Agent%2F1.0+%28x%29&client_id=dynamic_agent_client&code_challenge=ch_-1&code_challenge_method=S256&ext_agent_host_id=urn%3Auuid%3Ae61bbe28-07ef-466d-8e5d-a344f94ab305&nonce=no-1&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&resource=https%3A%2F%2Fapi.openai.com%2Fv1&response_type=code&scope=openid+profile+email+offline_access+resource.invoke+chatgpt.tokens.use.direct&state=st-1"
-    );
+    let url = url::Url::parse(&url).unwrap();
+    assert_eq!(url.origin().ascii_serialization(), "https://auth.openai.com");
+    assert_eq!(url.path(), "/api/accounts/authorize");
+    let query: std::collections::BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+    for (key, value) in [
+        ("agent_name_hint", "My Agent/1.0 (x)"),
+        ("client_id", "dynamic_agent_client"),
+        ("code_challenge", "ch_-1"),
+        ("code_challenge_method", "S256"),
+        ("ext_agent_host_id", "urn:uuid:e61bbe28-07ef-466d-8e5d-a344f94ab305"),
+        ("nonce", "no-1"),
+        ("redirect_uri", "http://127.0.0.1:1455/auth/callback"),
+        ("resource", "https://api.openai.com/v1"),
+        ("response_type", "code"),
+        (
+            "scope",
+            "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct",
+        ),
+        ("state", "st-1"),
+    ] {
+        assert_eq!(query.get(key).map(String::as_str), Some(value), "{key}");
+    }
     for (state, nonce, device) in [
         ("", "n", "e61bbe28-07ef-466d-8e5d-a344f94ab305"),
         ("s", " ", "e61bbe28-07ef-466d-8e5d-a344f94ab305"),
@@ -34,7 +52,7 @@ fn authorize_url_matches_go() {
 }
 
 #[test]
-fn identifier_reads_scalars_as_go_strings() {
+fn saved_identifier_accepts_existing_scalar_spellings_and_legacy_location() {
     let id = |yaml: &str| identifier(&Config::parse(yaml).unwrap());
     let v8 = |v: &str| format!("oauth:\n  providers:\n    codex:\n      signin-with-chatgpt-identifier: {v}\n");
     assert_eq!(id(&v8("'  Agent X  '")), "Agent X");
@@ -47,7 +65,7 @@ fn identifier_reads_scalars_as_go_strings() {
 }
 
 #[test]
-fn bind_file_keeps_disk_values_and_encodes_like_go() {
+fn binding_replaces_only_the_siwc_partition_and_enable_flag() {
     let disk = "{\n  \"type\": \"codex\",\n  \"access_token\": \"outer\", \"refresh_token\": \"r\",\n  \"big\": 123456789012345678901234567890,\n  \"html\": \"<a&b>\u{2028}\",\n  \"nested\": { \"k\" : [1, 2.50, \"x \\\" y\"] },\n  \"siwc\": {\"device_id\": \"old\"},\n  \"dup\": 1, \"dup\": 2,\n  \"use_siwc\": false\n}";
     let tokens = Tokens {
         access_token: "a<b".into(),
@@ -62,9 +80,25 @@ fn bind_file_keeps_disk_values_and_encodes_like_go() {
         device_id: "e61bbe28-07ef-466d-8e5d-a344f94ab305".into(),
     };
     let out = bind_file(disk.as_bytes(), &tokens).unwrap();
+    let saved: Value = serde_json::from_slice(&out).unwrap();
+    let original: Value = serde_json::from_str(disk).unwrap();
+    for key in ["type", "access_token", "refresh_token", "big", "html", "nested", "dup"] {
+        assert_eq!(saved[key], original[key], "outer field {key}");
+    }
+    // Semantic JSON equality alone can round a large integer through f64.
     assert_eq!(
-        String::from_utf8(out).unwrap(),
-        r#"{"access_token":"outer","big":123456789012345678901234567890,"dup":2,"html":"\u003ca\u0026b\u003e\u2028","nested":{"k":[1,2.50,"x \" y"]},"refresh_token":"r","siwc":{"access_token":"a\u003cb","client_id":"oaiapp_x","device_id":"e61bbe28-07ef-466d-8e5d-a344f94ab305","expired":"2035-01-01T00:00:00Z","id_token":"id","last_refresh":"2026-01-01T00:00:00Z","refresh_token":"r2","scope":"s chatgpt.tokens.use.direct","scopes":["s","chatgpt.tokens.use.direct"]},"type":"codex","use_siwc":true}"#
+        cpa_common::json::get(&out, "big").raw.as_ref(),
+        b"123456789012345678901234567890"
+    );
+    assert_eq!(saved["use_siwc"], true);
+    assert_eq!(
+        saved["siwc"],
+        serde_json::json!({
+            "access_token":"a<b","refresh_token":"r2","id_token":"id","client_id":"oaiapp_x",
+            "scope":"s chatgpt.tokens.use.direct","scopes":["s","chatgpt.tokens.use.direct"],
+            "expired":"2035-01-01T00:00:00Z","last_refresh":"2026-01-01T00:00:00Z",
+            "device_id":"e61bbe28-07ef-466d-8e5d-a344f94ab305"
+        })
     );
     assert!(bind_file(b"[1]", &tokens).is_none());
 }
@@ -168,52 +202,143 @@ async fn exchange_sends_the_issued_client_and_validates_the_grant() {
     assert!(mock.take().is_empty());
 }
 
-/// Go `CodexSIWCNeedsRefresh` at two fixed clocks for every expiry shape Go reads:
-/// `time.Parse`'s grammar, `normaliseUnix`, relative expiries with Go's wrapping
-/// `Duration` product, nested token maps, the JWT `exp` and Go's zero time; see
-/// tests/reference/codex_siwc_expiry.
+/// Existing credential files use several expiry keys and Unix or RFC 3339 values.
+/// All denote the same instant; refresh is due exactly five minutes before it.
 #[test]
-fn refresh_due_matches_go_expiry_parsing() {
-    let go: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_siwc_expiry_go.json")).unwrap();
-    let clocks: Vec<chrono::DateTime<chrono::Utc>> = go["clocks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|c| c.as_str().unwrap().parse().unwrap())
-        .collect();
-    let mut wrong = vec![];
-    for case in go["cases"].as_array().unwrap() {
-        let siwc: Value = serde_json::from_str(case["siwc"].as_str().unwrap()).unwrap();
-        let credential = cpa_core::credential::Credential::from_file(
+fn stored_expiry_aliases_and_units_share_the_same_refresh_boundary() {
+    // Align to a minute so legacy minute-precision timestamps denote this instant.
+    let now = at(-20);
+    let expiry = now + TimeDelta::seconds(3600);
+    let base = serde_json::json!({"access_token":"opaque","refresh_token":"refresh","client_id":"issued"});
+    let credential = |partition: Value| {
+        cpa_core::credential::Credential::from_file(
             std::path::Path::new("/fake"),
             std::path::Path::new("/fake/c.json"),
-            serde_json::json!({"type": "codex", "siwc": siwc})
+            serde_json::json!({"type":"codex","siwc":partition})
                 .as_object()
                 .unwrap()
                 .clone(),
         )
-        .unwrap();
-        let ours: Vec<Value> = clocks
-            .iter()
-            .map(|at| refresh_due(&credential, *at).unwrap().into())
-            .collect();
-        let mut want = case["due"].clone();
-        if case["name"] == "out-of-range float" && !cfg!(target_arch = "x86_64") {
-            // Recorded on amd64 (`math.MinInt64`, the zero time); Go on arm64 saturates to
-            // a far-future time.
-            want = serde_json::json!([false, false]);
-        }
-        if case["name"] == "float at the unit threshold" {
-            // DIFFERENCES-FROM-GO.md: serde_json rounds 1000000000000.9999 up to 1e12 + 1,
-            // read as milliseconds (2001); Go's correctly rounded float64 truncates to 1e12
-            // seconds.
-            want = serde_json::json!([true, true]);
-        }
-        if ours != want.as_array().unwrap()[..] {
-            wrong.push(format!("{}: {ours:?}, Go {want}", case["name"]));
+        .unwrap()
+    };
+    let check = |partition: Value| {
+        let c = credential(partition);
+        assert_eq!(refresh_due(&c, now), Some(false));
+        assert_eq!(refresh_due(&c, now + TimeDelta::seconds(3299)), Some(false));
+        assert_eq!(refresh_due(&c, now + TimeDelta::seconds(3300)), Some(true));
+        assert_eq!(refresh_due(&c, now + TimeDelta::seconds(3601)), Some(true));
+    };
+    for key in ["expired", "expire", "expires_at", "expiresAt", "expiry", "expires"] {
+        for value in [
+            serde_json::json!(expiry.to_rfc3339()),
+            serde_json::json!(expiry.timestamp()),
+            serde_json::json!(expiry.timestamp_millis()),
+            serde_json::json!(expiry.timestamp().to_string()),
+            serde_json::json!(format!("  {}  ", expiry.to_rfc3339())),
+        ] {
+            let mut partition = base.clone();
+            partition[key] = value;
+            check(partition);
         }
     }
-    assert!(wrong.is_empty(), "{wrong:#?}");
+    // Legacy files may store timezone-free UTC with or without seconds.
+    for value in [
+        expiry.format("%Y-%m-%d %H:%M:%S").to_string(),
+        expiry.format("%Y-%m-%d %H:%M").to_string(),
+    ] {
+        let mut partition = base.clone();
+        partition["expired"] = value.into();
+        check(partition);
+    }
+    for duration_key in ["expires_in", "expiresIn"] {
+        for issue_key in ["timestamp", "issued_at", "issuedAt"] {
+            for duration in [serde_json::json!(3600), serde_json::json!("3600")] {
+                let mut partition = base.clone();
+                partition[duration_key] = duration;
+                partition[issue_key] = now.timestamp().into();
+                check(partition);
+            }
+        }
+    }
+    for key in ["token", "Token"] {
+        let mut partition = base.clone();
+        partition[key] = serde_json::json!({"expired":expiry.to_rfc3339()});
+        check(partition);
+    }
+    // RFC 7519 NumericDate is seconds since the epoch; the unsigned token is a
+    // placeholder used only to test reading the locally stored access token.
+    use base64::Engine;
+    for engine in [
+        base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        base64::engine::general_purpose::URL_SAFE,
+    ] {
+        let payload = engine.encode(format!(r#"{{"exp":{}}}"#, expiry.timestamp()));
+        let mut partition = base.clone();
+        partition["access_token"] = format!("e30.{payload}.signature").into();
+        check(partition);
+    }
+}
+
+#[test]
+fn expiry_precedence_and_missing_data_have_explicit_local_refresh_policies() {
+    let base = serde_json::json!({"access_token":"opaque","refresh_token":"refresh","client_id":"issued"});
+    let credential = |partition: Value| {
+        cpa_core::credential::Credential::from_file(
+            std::path::Path::new("/fake"),
+            std::path::Path::new("/fake/c.json"),
+            serde_json::json!({"type":"codex","siwc":partition})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap()
+    };
+    let due = |partition: Value, seconds| refresh_due(&credential(partition), at(seconds));
+    let mut p = base.clone();
+    p["expired"] = at(600).to_rfc3339().into();
+    p["expires_at"] = at(3600).to_rfc3339().into();
+    assert_eq!(due(p.clone(), 299), Some(false));
+    assert_eq!(due(p, 300), Some(true), "first explicit expiry wins");
+    for key in ["last_refresh", "lastRefresh"] {
+        let mut p = base.clone();
+        p[key] = at(0).to_rfc3339().into();
+        assert_eq!(due(p.clone(), 299), Some(false));
+        assert_eq!(due(p, 300), Some(true));
+    }
+    for invalid in [
+        Value::Null,
+        serde_json::json!("not-a-time"),
+        serde_json::json!(true),
+        serde_json::json!({}),
+        serde_json::json!("2026-02-30T01:00:00Z"),
+    ] {
+        let mut p = base.clone();
+        p["expired"] = invalid;
+        p["last_refresh"] = at(0).to_rfc3339().into();
+        assert_eq!(due(p, 0), Some(false), "unreadable expiry falls back to last refresh");
+    }
+    for key in ["refresh_token", "client_id"] {
+        let mut p = base.clone();
+        p[key] = "".into();
+        assert_eq!(due(p, 0), None, "cannot refresh without {key}");
+    }
+    let mut missing_access = base.clone();
+    missing_access["access_token"] = "".into();
+    assert_eq!(due(missing_access, 0), Some(true));
+    assert_eq!(due(base.clone(), 0), Some(true), "no expiry and no refresh timestamp");
+    let mut relative = base.clone();
+    relative["expires_in"] = 3600.into();
+    assert_eq!(due(relative, 0), Some(true), "relative lifetime needs its issue time");
+    for zero in [serde_json::json!(0), serde_json::json!("0001-01-01T00:00:00Z")] {
+        let mut p = base.clone();
+        p["expired"] = zero;
+        p["expires_at"] = at(3600).to_rfc3339().into();
+        assert_eq!(
+            due(p, 0),
+            Some(true),
+            "legacy zero is unset and terminates the alias lookup"
+        );
+    }
 }
 
 // ---- #92: the SIWC token answer as OpenAI's token reference documents it (fields,

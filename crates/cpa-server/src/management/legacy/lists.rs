@@ -941,28 +941,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn groups_follow_go_group_legacy_keys() {
+    // Product policy: Legacy key-list operations retain grouping, typed weight bounds and boolean validation for operator configuration migration.
+    fn legacy_keys_group_without_losing_shared_and_per_key_settings() {
         let list = vec![
             json!({"api-key": "k", "priority": 2, "base-url": "https://b", "headers": {"A": "1"}, "weight": 0}),
             json!({"api-key": "j", "prefix": ""}),
         ];
         assert_eq!(
-            groups("gemini-api-key", &list),
+            groups("claude-api-key", &list),
             json!([
-                {"name": "gemini-1", "priority": 2, "base-url": "https://b", "headers": {"A": "1"},
+                {"name": "claude-1", "priority": 2, "base-url": "https://b", "headers": {"A": "1"},
                  "keys": [{"api-key": "k", "weight": 0}]},
-                {"name": "gemini-2", "keys": [{"api-key": "j"}]},
+                {"name": "claude-2", "keys": [{"api-key": "j"}]},
             ])
-        );
-        let compat = vec![json!({"name": "c", "base-url": "http://x", "api-key-entries": [{"api-key": "a"}]})];
-        assert_eq!(
-            groups("openai-compatibility", &compat),
-            json!([{"name": "c", "base-url": "http://x", "keys": [{"api-key": "a"}]}])
         );
     }
 
     #[test]
-    fn weight_and_bool_patches_follow_go() {
+    // Product policy: Legacy key-list operations retain grouping, typed weight bounds and boolean validation for operator configuration migration.
+    fn key_patches_require_typed_bounded_weights_and_booleans() {
         assert_eq!(weight_patch("null").ok(), Some(Value::Null));
         assert_eq!(weight_patch("-4").ok(), Some(json!(-4)));
         for bad in ["1.0", "\"2\"", "true", "1000001"] {

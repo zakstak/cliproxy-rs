@@ -1,11 +1,10 @@
-//! Executor parity: each case in `tests/fixtures/codex_go.json` ran through Go's
-//! `CodexExecutor` against a scripted loopback upstream. The Rust executor gets the same
-//! request and upstream reply; the upstream request and the client-visible output must match.
+//! Executor contract checks with local upstreams and synthetic credentials. Historical
+//! client requests and mock replies remain input-only regression stimuli; recorded Go
+//! output is not an expected value. Images and SIWC inputs are authored in Rust.
 
 use super::*;
-use crate::codex_testkit::{Captured, GO, Mock, Reply, Tap, Wiretap};
+use crate::codex_testkit::{Captured, INPUTS, Mock, Reply, Tap, Wiretap};
 use cpa_core::exec::Caller;
-use cpa_core::gostr::GoStr;
 use serde_json::Value;
 use std::path::Path;
 
@@ -99,121 +98,8 @@ fn reply(case: &Value) -> Reply {
     }
 }
 
-fn uuid_shaped(s: &str) -> bool {
-    uuid::Uuid::parse_str(s).is_ok()
-}
-
 /// The proxy's own identity, spelled out here rather than taken from the implementation.
 const PROXY_UA: &str = concat!("cliproxy-rs/", env!("CARGO_PKG_VERSION"));
-
-/// Go's recorded upstream request with the identity #26 sends instead of Go's fixed
-/// `codex-tui` one (docs/DIFFERENCES-FROM-GO.md): on a native Responses exchange the
-/// caller's own `User-Agent` and `originator`, otherwise cliproxy-rs's; an OAuth
-/// credential always carries an originator, an API key only the caller's. Every other
-/// header still has to match Go's recording.
-fn under_identity_policy(go: &Value, client: &HeaderMap, native: bool, oauth: bool) -> Value {
-    let mut go = go.clone();
-    let caller = |name: &str| {
-        client
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-            .filter(|v| native && !v.is_empty())
-            .map(str::to_owned)
-    };
-    let body = go["body"].as_str().unwrap_or_default().to_owned();
-    let headers = go["headers"].as_object_mut().unwrap();
-    let go_ua = headers["user-agent"][0].as_str().unwrap_or_default().to_owned();
-    let ua = caller("user-agent").unwrap_or_else(|| PROXY_UA.into());
-    // Go adds a random `session_id` when a model override leaves a "Mac OS" User-Agent
-    // (`applyModelHeaderOverrides`); the catalog's codex-tui override is gone, so a
-    // session that only that rule invented is gone too.
-    let random_session = headers
-        .get("session_id")
-        .and_then(|v| v[0].as_str())
-        .is_some_and(|id| !body.contains(id));
-    if go_ua.contains("Mac OS") && !ua.contains("Mac OS") && random_session {
-        headers.remove("session_id");
-    }
-    headers.insert("user-agent".into(), serde_json::json!([ua]));
-    match caller("originator").or_else(|| oauth.then(|| "cliproxy-rs".into())) {
-        Some(originator) => {
-            headers.insert("originator".into(), serde_json::json!([originator]));
-        }
-        None => {
-            headers.remove("originator");
-        }
-    }
-    go
-}
-
-/// Same path, body bytes and header set. Generated session UUIDs only need the same shape.
-fn assert_same_upstream(name: &str, rust: &Captured, go: &Value) {
-    assert_eq!(rust.path, go["path"].as_str().unwrap(), "{name}: path");
-    assert_eq!(
-        String::from_utf8_lossy(&rust.body),
-        go["body"].as_str().unwrap(),
-        "{name}: upstream body"
-    );
-    let skip = |n: &str| matches!(n, "host" | "content-length");
-    let go_headers = go["headers"].as_object().unwrap();
-    for (name_, values) in go_headers {
-        if skip(name_) {
-            continue;
-        }
-        let expected = values[0].as_str().unwrap();
-        let actual = rust.header(name_);
-        if name_ == "referer" {
-            // The previous hop's URL, on each run's own mock port.
-            let path = |u: &str| url::Url::parse(u).map(|u| u.path().to_owned()).unwrap_or_default();
-            assert_eq!(path(actual), path(expected), "{name}: header {name_}");
-            continue;
-        }
-        if name_ == "session_id"
-            && go_headers.contains_key("session_id")
-            && !go["body"].as_str().unwrap().contains(expected)
-        {
-            assert!(
-                uuid_shaped(actual),
-                "{name}: {name_} should be a fresh UUID, got {actual:?}"
-            );
-            continue;
-        }
-        assert_eq!(actual, expected, "{name}: header {name_}");
-    }
-    for name_ in rust.headers.keys() {
-        assert!(
-            skip(name_.as_str()) || go_headers.contains_key(name_.as_str()),
-            "{name}: extra header {name_}"
-        );
-    }
-}
-
-fn assert_same_error(name: &str, rust: &ExecError, go: &Value) {
-    assert_eq!(rust.status, go["status"].as_u64().unwrap() as u16, "{name}: status");
-    assert_eq!(
-        String::from_utf8_lossy(&rust.body),
-        go["message"].as_str().unwrap(),
-        "{name}: message"
-    );
-    assert_eq!(
-        rust.retry_after.map(|d| d.as_secs_f64()),
-        go["retry_after_s"].as_f64(),
-        "{name}: retry_after"
-    );
-    if go["credential_scoped"] == true {
-        assert_eq!(rust.scope, FailureScope::Credential, "{name}: credential scoped");
-    } else {
-        assert_ne!(
-            (rust.status, rust.scope),
-            (429, FailureScope::Credential),
-            "{name}: only usage limits cool the whole credential"
-        );
-    }
-    if go["request_scoped"] == true {
-        assert_eq!(rust.scope, FailureScope::Request, "{name}: request scoped");
-    }
-}
 
 async fn run(
     executor: &CodexExecutor,
@@ -298,17 +184,6 @@ fn result_refused(taps: &[Tap]) -> bool {
     !taps.iter().any(|t| matches!(t, Tap::Request { .. }))
 }
 
-/// Go's image-tool request without the defaults #27 removes (`instructions`,
-/// `reasoning`, `parallel_tool_calls`, `include`), and the Rust body, both as JSON
-/// (docs/DIFFERENCES-FROM-GO.md, "Codex translated route").
-fn image_tool_bodies(go: &str, rust: &[u8]) -> (Value, Value) {
-    let mut go: Value = serde_json::from_str(go).unwrap();
-    for key in ["instructions", "reasoning", "parallel_tool_calls", "include"] {
-        go.as_object_mut().unwrap().remove(key);
-    }
-    (go, serde_json::from_slice(rust).unwrap())
-}
-
 /// A recorded case the translated route serves (#27): a Claude or Chat Completions
 /// request on a native profile.
 fn translated_case(case: &Value, base_url: &str) -> bool {
@@ -317,53 +192,61 @@ fn translated_case(case: &Value, base_url: &str) -> bool {
         && super::translated::route(&View::new(&credential(case, base_url)), &request(case))
 }
 
-/// The translated contract for a recorded case (docs/DIFFERENCES-FROM-GO.md, "Codex
-/// translated route"): the upstream body is the built-in strict conversion with only the
-/// routed model and `stream`, so Go's injected `instructions`, reasoning default,
-/// prompt-cache key, replayed reasoning, tools and payload rules are absent; a refused
-/// conversion sends nothing.
+/// Translated route assertions inspect the provider request independently of the
+/// converter. Historical client inputs remain useful without their recorded outputs.
 fn assert_translated_contract(
     name: &str,
     case: &Value,
     result: &Result<ExecResponse, ExecError>,
     captured: &[Captured],
 ) {
-    let mut req = request(case);
-    if case["resolved_compat"] == true {
-        // As `run` binds it: the conversion reads the model's thinking capabilities.
-        let raw = serde_json::json!({"id": req.model, "is_compat": true});
-        req.resolved_model = Some(cpa_core::exec::ResolvedModel {
-            info: cpa_core::registry::ModelInfo::from_raw(raw.as_object().unwrap().clone()).unwrap(),
-            source: cpa_core::exec::ResolvedSource::ApiKey,
-        });
+    let req = request(case);
+    let source: Value = serde_json::from_slice(&req.body).unwrap();
+    let has_unrepresentable_thinking = source["messages"].as_array().into_iter().flatten().any(|message| {
+        message["content"].as_array().is_some_and(|blocks| {
+            blocks.iter().any(|block| {
+                block["type"] == "thinking" && block["thinking"].as_str().is_some_and(|text| !text.is_empty())
+            })
+        })
+    });
+    if has_unrepresentable_thinking {
+        let error = result
+            .as_ref()
+            .err()
+            .expect("reasoning text has no lossless Codex request representation");
+        assert_eq!((error.status, error.scope), (400, FailureScope::Request), "{name}");
+        assert!(captured.is_empty(), "{name}: refusal sends nothing");
+        return;
     }
-    let model = super::request::base_model(&req.model);
-    match super::translated::upstream_body(&req, &model) {
-        Err(expected) => {
-            let error = result
-                .as_ref()
-                .err()
-                .unwrap_or_else(|| panic!("{name}: the conversion is refused"));
-            assert_eq!(error.status, expected.status, "{name}");
-            assert!(captured.is_empty(), "{name}: nothing is sent");
-        }
-        Ok(expected) => {
-            let sent = captured
-                .first()
-                .unwrap_or_else(|| panic!("{name}: an upstream request"));
-            let body = String::from_utf8_lossy(&sent.body);
-            assert_eq!(body, expected, "{name}: translated upstream body");
-            let source = String::from_utf8_lossy(&req.body);
-            assert!(!body.contains("cpa_codex_replay_turn"), "{name}: no replay marker");
-            assert!(!body.contains(r#""instructions":"""#), "{name}: no empty instructions");
-            if !source.contains("prompt_cache_key") {
-                assert!(!body.contains("prompt_cache_key"), "{name}: no synthesized cache key");
-            }
-            if !source.contains("image_generation") {
-                assert!(!body.contains("image_generation"), "{name}: no injected image tool");
-            }
+    let sent = captured
+        .first()
+        .unwrap_or_else(|| panic!("{name}: valid translation must be sent"));
+    let body: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(sent.path, "/responses", "{name}");
+    assert_eq!(body["model"], req.model, "{name}: routed model");
+    assert_eq!(body["stream"], true, "{name}: provider SSE transport");
+    assert_eq!(body["store"], false, "{name}: translated requests disable persistence");
+    let input = body["input"].as_array().expect("translated message array");
+    assert!(!input.is_empty(), "{name}");
+    let source: Value = serde_json::from_slice(&req.body).unwrap();
+    for message in source["messages"].as_array().into_iter().flatten() {
+        if let Some(text) = message["content"].as_str() {
+            assert!(
+                input.iter().any(|item| item["content"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["text"].as_str() == Some(text)))),
+                "{name}: translated text {text:?} survives: {body}"
+            );
         }
     }
+    for key in ["prompt_cache_key", "instructions", "reasoning"] {
+        assert!(body.get(key).is_none(), "{name}: no synthesized {key}");
+    }
+    assert!(
+        body["tools"].as_array().is_none_or(Vec::is_empty),
+        "{name}: no injected tools"
+    );
+    assert!(!String::from_utf8_lossy(&sent.body).contains("cpa_codex_replay_turn"));
 }
 
 fn native_case(case: &Value, base_url: &str) -> bool {
@@ -464,9 +347,9 @@ fn assert_native_contract(
 }
 
 #[tokio::test]
-async fn executor_matches_go_on_every_fixture_case() {
+async fn historical_client_inputs_obey_native_translation_and_route_refusal_contracts() {
     let executor = executor();
-    for case in GO["executor"].as_array().unwrap() {
+    for case in INPUTS["executor"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let mock = Mock::start().await;
         let path = if case["alt"] == "responses/compact" {
@@ -627,45 +510,81 @@ async fn prepare_refreshes_when_due_and_keeps_a_valid_token_on_failure() {
 }
 
 #[test]
-fn alpha_search_body_rules_match_go_marshal() {
-    for case in GO["alpha_search"].as_array().unwrap() {
-        let input = case["input"].as_str().unwrap().as_bytes();
-        let sanitized = sanitize_alpha_search(input);
+fn alpha_search_edits_only_cache_controls_and_an_existing_model() {
+    let input=br#"{ "model":"client", "prompt_cache_key":"key", "prompt_cache_retention":"24h", "unknown":{"keep":true},"n":9007199254740993 }"#;
+    let sanitized = sanitize_alpha_search(input);
+    let parsed: Value = serde_json::from_slice(&sanitized).unwrap();
+    assert_eq!(
+        parsed,
+        serde_json::json!({"model":"client","unknown":{"keep":true},"n":9007199254740993_u64})
+    );
+    let rewritten = rewrite_alpha_search_model(sanitized, "routed");
+    let parsed: Value = serde_json::from_slice(&rewritten).unwrap();
+    assert_eq!(
+        parsed,
+        serde_json::json!({"model":"routed","unknown":{"keep":true},"n":9007199254740993_u64})
+    );
+    for raw in [b"not json".as_slice(), b"[]", b"null", b"{ \"unknown\": 42 }"] {
+        assert_eq!(sanitize_alpha_search(raw), raw);
         assert_eq!(
-            String::from_utf8_lossy(&sanitized),
-            case["sanitized"].as_str().unwrap(),
-            "{case}"
-        );
-        let rewritten = rewrite_alpha_search_model(sanitized, "real-model");
-        assert_eq!(
-            String::from_utf8_lossy(&rewritten),
-            case["rewritten"].as_str().unwrap(),
-            "{case}"
+            rewrite_alpha_search_model(raw.to_vec(), "routed"),
+            raw,
+            "missing model is not inserted"
         );
     }
 }
 
+/// Quota normalization is a local observation policy, not an undocumented claim
+/// about the provider. Inputs are hand-authored rate-limit and error envelopes.
 #[test]
-fn quota_events_and_signals_match_go() {
-    for case in GO["quota"]["events"].as_array().unwrap() {
-        let parsed = crate::codex_quota::event_headers(case["payload"].as_str().unwrap());
-        let expected: Vec<(String, String)> = case["headers"]
-            .as_object()
-            .map(|m| {
-                m.iter()
-                    .map(|(k, v)| (k.to_ascii_lowercase(), v[0].as_str().unwrap().to_owned()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut actual: Vec<(String, String)> = parsed
+fn quota_events_normalize_known_fields_and_signal_snapshots_are_bounded() {
+    let payload = serde_json::json!({"type":"codex.rate_limits",
+        "rate_limits":{"allowed":false,"limit_reached":true,"primary":{"used_percent":42,"window_minutes":300,"reset_after_seconds":30}},
+        "additional_rate_limits":[{"limit_name":"tool runs","rate_limit":{"allowed":true}}],
+        "code_review_rate_limits":{"allowed":true},
+        "credits":{"has_credits":true,"unlimited":false,"balance":"12.5"},
+        "plan_type":" pro ","metered_limit_name":"primary"});
+    let normalized = |payload: &str| -> std::collections::BTreeMap<String, String> {
+        crate::codex_quota::event_headers(payload)
             .unwrap_or_default()
             .into_iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v))
-            .collect();
-        actual.sort();
-        let mut expected = expected;
-        expected.sort();
-        assert_eq!(actual, expected, "{}", case["payload"]);
+            .collect()
+    };
+    let expected = std::collections::BTreeMap::from(
+        [
+            ("x-codex-allowed", "false"),
+            ("x-codex-limit-reached", "true"),
+            ("x-codex-primary-used-percent", "42"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-primary-reset-after-seconds", "30"),
+            ("x-codex-additional-tool-runs-allowed", "true"),
+            ("x-codex-additional-tool-runs-limit-name", "tool runs"),
+            ("x-codex-code-review-allowed", "true"),
+            ("x-codex-credits-has-credits", "true"),
+            ("x-codex-credits-unlimited", "false"),
+            ("x-codex-credits-balance", "12.5"),
+            ("x-codex-plan-type", "pro"),
+            ("x-codex-active-limit", "primary"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned())),
+    );
+    assert_eq!(normalized(&payload.to_string()), expected);
+    assert_eq!(
+        normalized(
+            r#"{"type":"error","headers":{"retry-after":30,"X-Codex-Primary-Used-Percent":42,"unrelated":"drop","x-codex-plan-type":[],"x-codex-unknown":"drop"}}"#
+        ),
+        std::collections::BTreeMap::from([
+            ("retry-after".into(), "30".into()),
+            ("x-codex-primary-used-percent".into(), "42".into())
+        ])
+    );
+    for payload in [
+        "invalid",
+        r#"{"type":"response.completed"}"#,
+        r#"{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":101,"window_minutes":300,"reset_after_seconds":30}}}"#,
+    ] {
+        assert!(normalized(payload).is_empty(), "{payload}");
     }
     let mut headers = HeaderMap::new();
     for (k, v) in [
@@ -682,11 +601,27 @@ fn quota_events_and_signals_match_go() {
     headers.insert("x-codex-credits-balance", "9".repeat(600).parse().unwrap());
     headers.append("x-codex-secondary-used-percent", "1".parse().unwrap());
     headers.append("x-codex-secondary-used-percent", "2".parse().unwrap());
-    let signals: serde_json::Map<String, Value> = crate::codex_quota::collect_signals(&headers)
-        .into_iter()
-        .map(|(k, v)| (k, Value::String(v)))
-        .collect();
-    assert_eq!(Value::Object(signals), GO["quota"]["signals"]);
+    let expected = std::collections::BTreeMap::from(
+        [
+            ("Retry-After", "30"),
+            ("X-Codex-Primary-Used-Percent", "42"),
+            ("X-Codex-Plan-Type", "pro"),
+            ("X-Ratelimit-Limit-Requests", "100"),
+            ("X-Codex-Additional-Foo-Allowed", "true"),
+            ("X-Codex-Secondary-Used-Percent", "2"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned())),
+    );
+    assert_eq!(crate::codex_quota::collect_signals(&headers), expected);
+    for n in 0..100 {
+        headers.insert(
+            http::HeaderName::from_bytes(format!("x-ratelimit-test-{n}").as_bytes()).unwrap(),
+            "1".parse().unwrap(),
+        );
+    }
+    let signals = crate::codex_quota::collect_signals(&headers);
+    assert_eq!(signals.len(), 64, "configured signal resource cap");
+    assert_eq!(signals["Retry-After"], "30", "priority signals survive the cap");
 }
 
 fn oauth_credential(base_url: &str) -> Credential {
@@ -731,7 +666,7 @@ fn plain_request(stream: bool, alt: Option<&str>) -> ExecRequest {
 }
 
 #[tokio::test]
-async fn compact_failures_follow_gos_availability_neutral_policy() {
+async fn compact_failures_preserve_availability_and_classify_request_auth_quota_and_transport() {
     // Go: compact 404/405/501 and request faults stop the request without cooling;
     // other failures fail over without cooling; auth and quota keep the normal policy.
     use crate::codex_testkit::json;
@@ -878,7 +813,8 @@ impl cpa_core::exec::UsageObserver for Recorded {
 /// Usage records see the upstream side, as Go's reporter does: the finalized request
 /// (`SetTranslatedReasoningEffort` on the upstream body, c7b4d573) and every
 /// upstream event in Codex format, or the compaction body in OpenAI Responses format,
-/// whatever the client speaks. Expected payloads come from the Go fixture.
+/// whatever the client speaks. Expected requests come from the mock wire capture;
+/// response bodies and lines come from the synthetic upstream stimulus.
 #[tokio::test]
 async fn usage_records_see_upstream_payloads() {
     let executor = executor();
@@ -887,7 +823,7 @@ async fn usage_records_see_upstream_payloads() {
         "oauth_nonstream_no_instructions_free_plan",
         "oauth_compact",
     ] {
-        let case = GO["executor"]
+        let case = INPUTS["executor"]
             .as_array()
             .unwrap()
             .iter()
@@ -924,12 +860,8 @@ async fn usage_records_see_upstream_payloads() {
         let reports = recorded.0.lock().unwrap().clone();
         let upstream_format = if compact { Format::OpenAIResponse } else { Format::Codex };
         // A native case records the body it sent: the client's, with only the permitted
-        // edits (`executor_matches_go_on_every_fixture_case` checks those bytes).
-        let sent = if native_case(case, &mock.url) || translated_case(case, &mock.url) {
-            String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap()
-        } else {
-            case["upstream"]["body"].as_str().unwrap().to_owned()
-        };
+        // edits (`historical_client_inputs_obey_native_translation_and_route_refusal_contracts` checks those bytes).
+        let sent = String::from_utf8(mock.take().pop().expect("an upstream request").body.to_vec()).unwrap();
         assert_eq!(
             reports[0],
             ("request", upstream_format, sent),
@@ -961,7 +893,7 @@ async fn usage_records_the_payload_override_reasoning_effort() {
         ("oauth_nonstream_no_instructions_free_plan", "codex"),
         ("oauth_compact", "openai-response"),
     ] {
-        let case = GO["executor"]
+        let case = INPUTS["executor"]
             .as_array()
             .unwrap()
             .iter()
@@ -1139,207 +1071,356 @@ async fn direct_images_send_the_configured_upstream_model() {
     }
 }
 
-/// The Images API cases (`GO["images"]`): Go's `CodexExecutor` ran each with source
-/// format `openai-image`, the route in `request_path` metadata and the client headers in
-/// the gin context, as the images handler calls it.
+/// Build an Images call with synthetic input and no client or saved credentials.
+fn image_request(body: Vec<u8>, model: &str, stream: bool, path: &str) -> ExecRequest {
+    let mut req = plain_request(stream, None);
+    req.source_format = Format::OpenAI;
+    req.response_format = Format::OpenAI;
+    req.model = model.into();
+    req.requested_model = model.into();
+    req.body = Bytes::from(body);
+    req.original_body = req.body.clone();
+    req.request_path = path.into();
+    req.headers.insert("user-agent", "caller-identity".parse().unwrap());
+    req
+}
+
+fn image_form(partial: &str) -> (Vec<u8>, String) {
+    let mut form = crate::multipart::Writer::with_boundary("image-contract".into());
+    for (key, value) in [
+        ("prompt", "paint a contract"),
+        ("partial_images", partial),
+        ("size", "1024x1024"),
+        ("quality", "high"),
+    ] {
+        form.field(key, value.as_bytes());
+    }
+    form.part(
+        &[
+            (
+                "Content-Disposition".into(),
+                b"form-data; name=\"image\"; filename=\"input.png\"".to_vec(),
+            ),
+            ("Content-Type".into(), b"image/png".to_vec()),
+        ],
+        b"IMG",
+    );
+    form.part(
+        &[
+            (
+                "Content-Disposition".into(),
+                b"form-data; name=\"mask\"; filename=\"mask.png\"".to_vec(),
+            ),
+            ("Content-Type".into(), b"image/png".to_vec()),
+        ],
+        b"MASK",
+    );
+    form.finish()
+}
+
+/// Direct image endpoints preserve JSON semantics (including unknown values),
+/// multipart file bytes, routed identity and upstream response bytes in both modes.
 #[tokio::test]
-async fn images_match_go_on_every_fixture_case() {
-    use base64::Engine;
-    let executor = executor();
-    let mut cases = GO["images"].as_array().unwrap().clone();
-    // `tool_edit_multipart_stream` sends `partial_images=nope`, which the tool path now
-    // refuses (#22; Go drops it), so the recorded case asserts that refusal below. Its
-    // copy with `partial_images=2` keeps the case's other assertions: the upstream request
-    // (Go's, with the tool's `"partial_images":2` that Go sends for that text) and the
-    // partial-image and completed frames of the same recorded reply. The fixture is
-    // unchanged; only this copy is edited.
-    let recorded = cases
-        .iter()
-        .find(|c| c["name"] == "tool_edit_multipart_stream")
-        .expect("the recorded multipart stream case");
-    let mut valid = recorded.clone();
-    valid["name"] = "tool_edit_multipart_stream_partial_images_2".into();
-    let payload = base64::engine::general_purpose::STANDARD
-        .decode(recorded["payload_b64"].as_str().unwrap())
+async fn direct_images_preserve_json_form_files_and_buffered_or_streamed_upstream_bytes() {
+    use crate::codex_testkit::json;
+    for edit in [false, true] {
+        for multipart in [false, true] {
+            if multipart && !edit {
+                continue;
+            }
+            for stream in [false, true] {
+                let mock = Mock::start().await;
+                let endpoint = if edit { "/images/edits" } else { "/images/generations" };
+                let path = if edit {
+                    "/v1/images/edits"
+                } else {
+                    "/v1/images/generations"
+                };
+                let upstream = if stream {
+                    "event: image_generation.completed\ndata: {\"type\":\"image_generation.completed\",\"b64_json\":\"SU1H\"}\n\n"
+                } else {
+                    r#"{ "created":17,"data":[{"b64_json":"SU1H"}],"unknown":9007199254740993 }"#
+                };
+                let mut reply = json(200, upstream);
+                if stream {
+                    reply.headers = vec![("content-type".into(), "text/event-stream".into())];
+                }
+                mock.script(endpoint, vec![reply]);
+                let (body, ct) = if multipart {
+                    image_form("2")
+                } else {
+                    (
+                        br#"{ "model":"client-image", "prompt":"paint a contract", "unknown":9007199254740993 }"#
+                            .to_vec(),
+                        "application/json".into(),
+                    )
+                };
+                let mut req = image_request(body, "gpt-image-2", stream, path);
+                req.headers.insert("content-type", ct.parse().unwrap());
+                let response = executor()
+                    .images(&oauth_credential(&mock.url), req, path, &Config::default())
+                    .await
+                    .unwrap();
+                let sent = mock.take();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].path, endpoint);
+                assert_eq!(sent[0].headers["user-agent"], PROXY_UA);
+                let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+                assert_eq!(body["model"], "gpt-image-2");
+                assert_eq!(body["stream"].as_bool().unwrap_or(false), stream);
+                assert_eq!(body["prompt"], "paint a contract");
+                if multipart {
+                    assert_eq!(body["images"][0]["image_url"], "data:image/png;base64,SU1H");
+                    assert_eq!(body["mask"]["image_url"], "data:image/png;base64,TUFTSw==");
+                    assert_eq!(body["partial_images"], 2);
+                    assert_eq!(body["size"], "1024x1024");
+                } else {
+                    assert_eq!(body["unknown"], 9007199254740993_u64);
+                }
+                let bytes = match response.body {
+                    ResponseBody::Buffered(body) => body.to_vec(),
+                    ResponseBody::Stream(mut events) => {
+                        let mut bytes = Vec::new();
+                        while let Some(event) = events.next().await {
+                            bytes.extend(event.unwrap());
+                        }
+                        bytes
+                    }
+                };
+                assert_eq!(bytes, upstream.as_bytes());
+            }
+        }
+    }
+    let mock = Mock::start().await;
+    let upstream = r#"{"error":{"message":"bad size","type":"invalid_request_error"}}"#;
+    mock.script("/images/generations", vec![json(400, upstream)]);
+    let error = executor()
+        .images(
+            &oauth_credential(&mock.url),
+            image_request(
+                br#"{"prompt":"paint"}"#.to_vec(),
+                "gpt-image-2",
+                false,
+                "/v1/images/generations",
+            ),
+            "/v1/images/generations",
+            &Config::default(),
+        )
+        .await
+        .err()
         .unwrap();
-    let nope: &[u8] = b"name=\"partial_images\"\r\n\r\nnope\r\n";
-    let at = payload
-        .windows(nope.len())
-        .position(|w| w == nope)
-        .expect("the recorded partial_images field");
-    let mut fixed = payload[..at].to_vec();
-    fixed.extend_from_slice(b"name=\"partial_images\"\r\n\r\n2\r\n");
-    fixed.extend_from_slice(&payload[at + nope.len()..]);
-    valid["payload_b64"] = base64::engine::general_purpose::STANDARD.encode(fixed).into();
-    let mut go_body: Value = serde_json::from_str(recorded["upstream"]["body"].as_str().unwrap()).unwrap();
-    go_body["tools"][0]["partial_images"] = 2.into();
-    valid["upstream"]["body"] = go_body.to_string().into();
-    cases.push(valid);
-    for case in &cases {
-        let name = case["name"].as_str().unwrap();
-        let mock = Mock::start().await;
-        let path = case["upstream"]["path"].as_str().unwrap_or("/responses");
-        mock.script(path, vec![reply(case)]);
-        let credential = credential(case, &mock.url);
-        let config_text = case["config"].as_str().filter(|s| !s.trim().is_empty()).unwrap_or("{}");
-        let cfg = Config::parse(config_text).unwrap();
-        let mut headers = HeaderMap::new();
-        for (k, v) in case["headers"].as_object().into_iter().flatten() {
-            headers.insert(
-                http::HeaderName::try_from(k.as_str()).unwrap(),
-                v.as_str().unwrap().parse().unwrap(),
-            );
-        }
-        let body = Bytes::from(
-            base64::engine::general_purpose::STANDARD
-                .decode(case["payload_b64"].as_str().unwrap())
-                .unwrap(),
-        );
-        let request_path = case["request_path"].as_str().unwrap();
-        let model = case["model"].as_str().unwrap();
-        let client = headers.clone();
-        let req = ExecRequest {
-            operation: Operation::Generate,
-            source_format: Format::OpenAI,
-            response_format: Format::OpenAI,
-            requested_model: model.into(),
-            model: model.into(),
-            original_body: body.clone(),
-            body,
-            stream: case["stream"].as_bool().unwrap_or(false),
-            alt: None,
-            session: None,
-            headers,
-            execution_session: None,
-            derived_session: None,
-            resolved_model: None,
-            usage: Default::default(),
-            request_path: request_path.into(),
-            caller: Caller {
-                principal: "client-key-FAKE".into(),
-                source: "authorization",
-                provider: String::new(),
-            },
-        };
-        let result = executor.images(&credential, req, request_path, &cfg).await;
-        let captured = mock.take();
-        if matches!(name, "tool_generation_nonstream_b64" | "tool_edit_json") {
-            // `n: 2` and `style`, or an image entry with a blank `image_url`, cannot be
-            // expressed by the image tool: refused before the send (#27). Go drops them
-            // (and the edit's file-ID image too).
-            let error = result.err().unwrap_or_else(|| panic!("{name}: refused"));
-            assert_eq!(error.status, 400, "{name}");
-            assert!(captured.is_empty(), "{name}: nothing is sent");
-            continue;
-        }
-        if name == "tool_edit_multipart_stream" {
-            // A present count that is not an integer is refused before the send (#22,
-            // docs/DIFFERENCES-FROM-GO.md); Go omits it, so the provider default applies.
-            // The `partial_images=2` copy above keeps this case's stream coverage.
-            let error = result.err().unwrap_or_else(|| panic!("{name}: refused"));
-            assert_eq!((error.status, error.scope), (400, FailureScope::Request), "{name}");
-            assert_eq!(
-                String::from_utf8_lossy(&error.body),
-                "request form field `partial_images` must be an integer"
-            );
-            assert!(captured.is_empty(), "{name}: nothing is sent");
-            continue;
-        }
-        if name == "tool_invalid_json" {
-            // The Codex request boundary (#22) refuses malformed client JSON with a
-            // request-scoped 400 that names the byte. Go answers its plain error,
-            // "invalid OpenAI image generation request JSON", as a 500
-            // (docs/DIFFERENCES-FROM-GO.md).
-            let error = result.err().unwrap_or_else(|| panic!("{name}: refused"));
-            assert_eq!((error.status, error.scope), (400, FailureScope::Request), "{name}");
-            assert_eq!(
-                String::from_utf8_lossy(&error.body),
-                "request body is not valid JSON at byte 10"
-            );
-            assert!(captured.is_empty(), "{name}: nothing is sent");
-            continue;
-        }
-        match case.get("upstream").filter(|u| !u.is_null()) {
-            None => assert!(captured.is_empty(), "{name}: no upstream request"),
-            Some(go) => {
-                assert_eq!(captured.len(), 1, "{name}: one upstream request");
-                let mut go = go.clone();
-                if name == "direct_edit_multipart" {
-                    // Go ranges over its form map: field order varies per run.
-                    let go_body: Value = serde_json::from_str(go["body"].as_str().unwrap()).unwrap();
-                    let rust_body: Value = serde_json::from_slice(&captured[0].body).unwrap();
-                    assert_eq!(rust_body, go_body, "{name}: upstream body fields");
-                    go["body"] = Value::String(String::from_utf8_lossy(&captured[0].body).into_owned());
-                }
-                // The proxy builds every Images request: never the caller's identity.
-                let oauth = !View::new(&credential).api_key;
-                let mut go = under_identity_policy(&go, &client, false, oauth);
-                if path == "/responses" {
-                    let (go_body, rust_body) = image_tool_bodies(go["body"].as_str().unwrap(), &captured[0].body);
-                    assert_eq!(rust_body, go_body, "{name}: the tool request without Go's defaults");
-                    go["body"] = Value::String(String::from_utf8_lossy(&captured[0].body).into_owned());
-                }
-                assert_same_upstream(name, &captured[0], &go);
+    assert_eq!((error.status, error.scope), (400, FailureScope::Request));
+    assert_eq!(error.body.as_ref(), upstream.as_bytes());
+}
+
+/// The image tool is an explicit conversion with a chosen upstream model and
+/// image-generation action. Results and partial frames read synthetic provider events.
+#[tokio::test]
+async fn image_tool_preserves_prompt_settings_files_and_image_results_in_both_response_formats() {
+    let item = serde_json::json!({"type":"image_generation_call","id":"image-contract","status":"completed","result":"SU1H","revised_prompt":"revised contract","output_format":"webp","size":"1024x1024","quality":"high","background":"transparent"});
+    let usage = serde_json::json!({"input_tokens":3,"output_tokens":5,"total_tokens":8});
+    let completed = serde_json::json!({"type":"response.completed","response":{"id":"response-contract","created_at":17,"status":"completed","output":[item],"tool_usage":{"image_gen":usage}}});
+    let partial = serde_json::json!({"type":"response.image_generation_call.partial_image","partial_image_index":2,"partial_image_b64":"UEFSVA==","output_format":"webp"});
+    let upstream = format!("data: {partial}\n\ndata: {completed}\n\n");
+    for edit in [false, true] {
+        for multipart in [false, true] {
+            if multipart && !edit {
+                continue;
             }
-        }
-        let output = &case["output"];
-        if let Some(go_error) = output.get("error") {
-            let error = result.err().unwrap_or_else(|| panic!("{name}: expected error"));
-            match go_error.get("status") {
-                Some(_) => assert_same_error(name, &error, go_error),
-                // A plain Go error: the handler answers 500.
-                None => {
-                    assert_eq!(error.status, 500, "{name}: status");
-                    assert_eq!(
-                        String::from_utf8_lossy(&error.body),
-                        go_error["message"].as_str().unwrap(),
-                        "{name}: message"
+            for stream in [false, true] {
+                for url in [false, true] {
+                    let mock = Mock::start().await;
+                    mock.script(
+                        "/responses",
+                        vec![Reply {
+                            status: 200,
+                            headers: vec![("content-type".into(), "text/event-stream".into())],
+                            body: upstream.clone(),
+                        }],
                     );
-                }
-            }
-            continue;
-        }
-        let response = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-        match response.body {
-            ResponseBody::Buffered(body) => {
-                assert_eq!(
-                    String::from_utf8_lossy(&body),
-                    output["payload"]
-                        .as_str()
-                        .unwrap_or_else(|| panic!("{name}: Go streamed")),
-                    "{name}: payload"
-                );
-            }
-            ResponseBody::Stream(mut stream) => {
-                let mut items = Vec::new();
-                while let Some(item) = stream.next().await {
-                    items.push(item);
-                }
-                let joined: String = items
-                    .iter()
-                    .filter_map(|i| i.as_ref().ok())
-                    .map(|b| String::from_utf8_lossy(b).into_owned())
-                    .collect();
-                let go_joined: String = output["chunks"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("{name}: Go answered without a stream"))
-                    .iter()
-                    .map(|c| c.as_str().unwrap())
-                    .collect();
-                assert_eq!(joined, go_joined, "{name}: stream bytes");
-                match (items.last(), output.get("stream_error")) {
-                    (Some(Err(error)), Some(go)) => assert_same_error(name, error, go),
-                    (_, Some(_)) => panic!("{name}: expected a terminal stream error"),
-                    (Some(Err(error)), None) => panic!("{name}: unexpected stream error {error}"),
-                    _ => {}
+                    let path = if edit {
+                        "/v1/images/edits"
+                    } else {
+                        "/v1/images/generations"
+                    };
+                    let (body, ct) = if multipart {
+                        let (body, ct) = image_form("2");
+                        // Add response_format before the closing multipart delimiter.
+                        let tail = b"--image-contract--\r\n";
+                        let mut raw = body[..body.len() - tail.len()].to_vec();
+                        raw.extend(format!("--image-contract\r\nContent-Disposition: form-data; name=\"response_format\"\r\n\r\n{}\r\n",if url {"url"} else {"b64_json"}).as_bytes());
+                        raw.extend(tail);
+                        (raw, ct)
+                    } else {
+                        let mut value = serde_json::json!({"prompt":"paint a contract","size":"1024x1024","quality":"high","partial_images":2,"response_format":if url {"url"} else {"b64_json"}});
+                        if edit {
+                            value["images"] = serde_json::json!([{"image_url":"data:image/png;base64,SU1H"}]);
+                            value["mask"] = serde_json::json!({"image_url":"data:image/png;base64,TUFTSw=="});
+                        }
+                        (value.to_string().into_bytes(), "application/json".into())
+                    };
+                    let mut req = image_request(body, "gpt-5.4", stream, path);
+                    req.headers.insert("content-type", ct.parse().unwrap());
+                    let response = executor()
+                        .images(&oauth_credential(&mock.url), req, path, &Config::default())
+                        .await
+                        .unwrap();
+                    let sent = mock.take();
+                    assert_eq!(sent.len(), 1);
+                    assert_eq!(sent[0].path, "/responses");
+                    assert_eq!(sent[0].headers["user-agent"], PROXY_UA);
+                    let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+                    assert_eq!(body["model"], "gpt-5.4-mini");
+                    assert_eq!(body["stream"], true);
+                    assert_eq!(body["store"], false);
+                    assert_eq!(body["tool_choice"], serde_json::json!({"type":"image_generation"}));
+                    let tool = &body["tools"][0];
+                    assert_eq!(tool["action"], if edit { "edit" } else { "generate" });
+                    assert_eq!(tool["partial_images"], 2);
+                    assert_eq!(tool["size"], "1024x1024");
+                    assert_eq!(tool["quality"], "high");
+                    assert_eq!(body["input"][0]["content"][0]["text"], "paint a contract");
+                    if edit {
+                        assert_eq!(
+                            body["input"][0]["content"][1]["image_url"],
+                            "data:image/png;base64,SU1H"
+                        );
+                        assert_eq!(tool["input_image_mask"]["image_url"], "data:image/png;base64,TUFTSw==");
+                    }
+                    for key in [
+                        "instructions",
+                        "reasoning",
+                        "parallel_tool_calls",
+                        "include",
+                        "prompt_cache_key",
+                    ] {
+                        assert!(body.get(key).is_none(), "no invented {key}");
+                    }
+                    let (field, result, partial_result) = if url {
+                        ("url", "data:image/webp;base64,SU1H", "data:image/webp;base64,UEFSVA==")
+                    } else {
+                        ("b64_json", "SU1H", "UEFSVA==")
+                    };
+                    match response.body {
+                        ResponseBody::Buffered(body) => {
+                            assert!(!stream);
+                            let body: Value = serde_json::from_slice(&body).unwrap();
+                            assert_eq!(body["created"], 17);
+                            assert_eq!(body["data"][0][field], result);
+                            assert_eq!(body["data"][0]["revised_prompt"], "revised contract");
+                            assert_eq!(body["output_format"], "webp");
+                            assert_eq!(body["usage"], usage);
+                        }
+                        ResponseBody::Stream(mut frames) => {
+                            assert!(stream);
+                            let mut events = String::new();
+                            while let Some(frame) = frames.next().await {
+                                events.push_str(std::str::from_utf8(&frame.unwrap()).unwrap());
+                            }
+                            let data: Vec<Value> = events
+                                .lines()
+                                .filter_map(|line| line.strip_prefix("data: "))
+                                .map(|line| serde_json::from_str(line).unwrap())
+                                .collect();
+                            assert_eq!(data.len(), 2, "{events}");
+                            let prefix = if edit { "image_edit" } else { "image_generation" };
+                            assert_eq!(data[0]["type"], format!("{prefix}.partial_image"));
+                            assert_eq!(data[0]["partial_image_index"], 2);
+                            assert_eq!(data[0][field], partial_result);
+                            assert_eq!(data[1]["type"], format!("{prefix}.completed"));
+                            assert_eq!(data[1][field], result);
+                            assert_eq!(data[1]["usage"], usage);
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+#[tokio::test]
+async fn image_tool_refuses_unrepresentable_inputs_and_reports_upstream_or_incomplete_output() {
+    use crate::codex_testkit::json;
+    let path = "/v1/images/generations";
+    for input in [
+        r#"{"prompt":"paint","n":2}"#,
+        r#"{"prompt":"paint","style":"vivid"}"#,
+        r#"{"prompt":"paint","images":[{"image_url":" "}]}"#,
+        r#"{"prompt":"paint","partial_images":"nope"}"#,
+        "{bad",
+    ] {
+        let mock = Mock::start().await;
+        let error = executor()
+            .images(
+                &oauth_credential(&mock.url),
+                image_request(input.as_bytes().to_vec(), "gpt-5.4", false, path),
+                path,
+                &Config::default(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!((error.status, error.scope), (400, FailureScope::Request), "{input}");
+        assert!(mock.take().is_empty());
+    }
+    let mock = Mock::start().await;
+    let (body, ct) = image_form("nope");
+    let mut req = image_request(body, "gpt-5.4", true, "/v1/images/edits");
+    req.headers.insert("content-type", ct.parse().unwrap());
+    let error = executor()
+        .images(
+            &oauth_credential(&mock.url),
+            req,
+            "/v1/images/edits",
+            &Config::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!((error.status, error.scope), (400, FailureScope::Request));
+    assert!(mock.take().is_empty());
+    for (status, upstream, expected) in [
+        (
+            429,
+            r#"{"error":{"type":"usage_limit_reached","message":"limit","resets_in_seconds":60}}"#,
+            429,
+        ),
+        (
+            200,
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n",
+            502,
+        ),
+        (
+            200,
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"image_generation_call\",\"result\":\"SU1H\"}}\n\n",
+            504,
+        ),
+    ] {
+        let mock = Mock::start().await;
+        let mut reply = json(status, upstream);
+        reply.headers = vec![("content-type".into(), "text/event-stream".into())];
+        mock.script("/responses", vec![reply]);
+        let error = executor()
+            .images(
+                &oauth_credential(&mock.url),
+                image_request(br#"{"prompt":"paint"}"#.to_vec(), "gpt-5.4", false, path),
+                path,
+                &Config::default(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.status, expected, "{upstream}");
+        if status == 429 {
+            assert_eq!(error.scope, FailureScope::Credential);
+            assert_eq!(error.retry_after, Some(std::time::Duration::from_secs(60)));
+        }
+        assert_eq!(mock.take().len(), 1);
+    }
+}
+
 /// Go `Auth.AccountInfo` for the fixture credentials.
-fn go_account(credential: &Credential) -> [String; 5] {
+fn capture_account(credential: &Credential) -> [String; 5] {
     let (kind, value) = match credential.attributes.get("api_key") {
         Some(key) => ("api_key", key.clone()),
         None => ("oauth", credential.str("email").unwrap_or_default().to_owned()),
@@ -1361,9 +1442,9 @@ fn go_account(credential: &Credential) -> [String; 5] {
 /// the transport's own headers), the chunks are the upstream body, and the recorded
 /// stream error is Go's.
 #[tokio::test]
-async fn capture_records_each_attempt_as_go_does() {
+async fn capture_matches_mock_wire_bytes_metadata_and_delivered_failures() {
     let executor = executor();
-    for case in GO["executor"].as_array().unwrap() {
+    for case in INPUTS["executor"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let mock = Mock::start().await;
         let path = if case["alt"] == "responses/compact" {
@@ -1398,12 +1479,20 @@ async fn capture_records_each_attempt_as_go_does() {
             Some(session) => ws_http(&executor, &credential, &cfg, req, session).await,
             None => executor.execute(&credential, req, &cfg).await,
         };
-        if let Ok(ExecResponse {
-            body: ResponseBody::Stream(mut stream),
-            ..
-        }) = result
-        {
-            while stream.next().await.is_some() {}
+        let mut delivered_errors = Vec::new();
+        match result {
+            Ok(ExecResponse {
+                body: ResponseBody::Stream(mut stream),
+                ..
+            }) => {
+                while let Some(item) = stream.next().await {
+                    if let Err(error) = item {
+                        delivered_errors.push(error);
+                    }
+                }
+            }
+            Err(error) => delivered_errors.push(error),
+            _ => {}
         }
         let taps = tap.taps();
         let all = mock.take();
@@ -1431,8 +1520,11 @@ async fn capture_records_each_attempt_as_go_does() {
             "{name}"
         );
         assert_eq!(body.as_bytes(), sent.body.as_ref(), "{name}: request body");
-        assert_eq!(*account, go_account(&credential), "{name}: account");
-        let mut recorded: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.go_lower(), v.clone())).collect();
+        assert_eq!(*account, capture_account(&credential), "{name}: account");
+        let mut recorded: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect();
         recorded.sort();
         let mut wire: Vec<(String, String)> = sent
             .headers
@@ -1442,10 +1534,6 @@ async fn capture_records_each_attempt_as_go_does() {
             .collect();
         wire.sort();
         assert_eq!(recorded, wire, "{name}: request headers");
-        assert!(
-            headers.iter().all(|(k, _)| *k == crate::proxy::canonical_header(k)),
-            "{name}: Go header spelling {headers:?}"
-        );
         let status = case["upstream_status"].as_u64().unwrap() as u16;
         assert!(
             matches!(&taps[1], Tap::Metadata(s, _) if *s == status),
@@ -1481,15 +1569,19 @@ async fn capture_records_each_attempt_as_go_does() {
         let lines: Vec<&str> = upstream.split('\n').filter(|l| !l.trim().is_empty()).collect();
         assert!(!chunks.is_empty(), "{name}: stream lines");
         assert_eq!(chunks, lines[..chunks.len()], "{name}: stream lines");
-        match case["output"].get("stream_error") {
-            Some(go) => assert_eq!(errors, [go["message"].as_str().unwrap()], "{name}: stream error"),
-            None if case["output"].get("error").is_some() => {
-                assert_eq!(errors.len(), 1, "{name}: the bootstrap failure: {errors:?}")
-            }
-            None => {
-                assert_eq!(chunks.len(), lines.len(), "{name}: every line");
-                assert!(errors.is_empty(), "{name}: {errors:?}");
-            }
+        assert_eq!(
+            errors.len(),
+            delivered_errors.len(),
+            "{name}: every delivered failure is captured"
+        );
+        for (captured, error) in errors.iter().zip(&delivered_errors) {
+            assert!(
+                captured.contains(String::from_utf8_lossy(&error.body).as_ref()),
+                "{name}: capture {captured:?}, delivered {error:?}"
+            );
+        }
+        if errors.is_empty() {
+            assert_eq!(chunks.len(), lines.len(), "{name}: every successful line");
         }
     }
 }
@@ -1901,274 +1993,278 @@ async fn split_sse_events_spend_the_bootstrap_budget() {
     }
 }
 
-/// Go `TestCodexExecutorReplayedWebSearchCallHistoryEnsuresWebSearchTool_Issue6770`
-/// (e7d4c731) through the executor. Go added a web search tool (and the image tool and
-/// an `instructions` default) to the body; every call now takes the native route, so the
-/// client's body goes upstream unchanged on HTTP and WebSocket alike (#23, #24, #28).
+/// A Responses history may contain completed built-in tool calls without requesting
+/// those tools again. Native HTTP and compaction forward that distinction unchanged.
 #[tokio::test]
-async fn replayed_web_search_history_matches_go() {
-    let go: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_web_search_history_go.json")).unwrap();
-    let executor = executor();
-    for case in go["executor"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        let call = case["call"].as_str().unwrap();
-        let mut attributes = serde_json::json!({"api_key": "test"});
-        if let Some(plan) = case["plan"].as_str() {
-            attributes["plan_type"] = plan.into();
-        }
-        let mut headers = serde_json::json!({});
-        if case["lite_header"] == true {
-            headers["x-openai-internal-codex-responses-lite"] = "true".into();
-        }
-        let synthetic = serde_json::json!({
-            "source": "openai-response",
-            "model": "gpt-6.1-sol",
-            "payload": case["payload"],
-            "stream": call != "non_stream" && call != "compact",
-            "alt": if call == "compact" { Value::from("responses/compact") } else { Value::Null },
-            "headers": headers,
-            "attributes": attributes,
-        });
-        let cfg = Config::parse(if case["no_image"] == true {
-            "disable-image-generation: true\n"
-        } else {
-            "{}"
-        })
-        .unwrap();
-        let sent = if call == "websocket" {
-            let req = request(&synthetic);
-            let model = super::native::upstream_model(&req).unwrap();
-            String::from_utf8(super::native::routed(&req.body, &model).unwrap().to_vec()).unwrap()
-        } else {
-            let mock = Mock::start().await;
-            let (path, content_type, body) = if call == "compact" {
-                (
-                    "/responses/compact",
-                    "application/json",
-                    r#"{"id":"resp_compact_1","object":"response.compaction","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}"#,
-                )
-            } else {
-                (
-                    "/responses",
-                    "text/event-stream",
-                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n",
-                )
-            };
-            mock.script(
-                path,
-                vec![Reply {
-                    status: 200,
-                    headers: vec![("content-type".into(), content_type.into())],
-                    body: body.into(),
-                }],
-            );
-            let credential = credential(&synthetic, &mock.url);
-            if let ResponseBody::Stream(mut stream) = executor
-                .execute(&credential, request(&synthetic), &cfg)
-                .await
-                .unwrap()
-                .body
-            {
-                while stream.next().await.is_some() {}
+async fn native_web_search_history_does_not_synthesize_tools_or_instructions() {
+    for stream in [false, true] {
+        for compact in [false, true] {
+            if compact && stream {
+                continue;
             }
-            String::from_utf8(mock.take().pop().unwrap().body.to_vec()).unwrap()
-        };
-        // Without the web search or image tool Go added.
-        assert_eq!(sent, case["payload"].as_str().unwrap(), "{name}");
+            for tools in ["", ",\"tools\":[]", ",\"tools\":[{\"type\":\"web_search\"}]"] {
+                for lite in [false, true] {
+                    let mock = Mock::start().await;
+                    let path = if compact { "/responses/compact" } else { "/responses" };
+                    let response = if stream {
+                        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"search-contract\",\"status\":\"completed\",\"output\":[]}}\n\n"
+                    } else {
+                        r#"{"id":"search-contract","object":"response","status":"completed","output":[]}"#
+                    };
+                    mock.script(
+                        path,
+                        vec![Reply {
+                            status: 200,
+                            headers: vec![(
+                                "content-type".into(),
+                                if stream {
+                                    "text/event-stream"
+                                } else {
+                                    "application/json"
+                                }
+                                .into(),
+                            )],
+                            body: response.into(),
+                        }],
+                    );
+                    let raw = format!(
+                        r#"{{ "model":"gpt-5.4", "input":[{{"type":"message","role":"user","content":"search contract"}},{{"id":"search-1","type":"web_search_call","status":"completed","action":{{"type":"search","query":"Rust contract"}}}}],"unknown":9007199254740993{tools} }}"#
+                    );
+                    let mut req = plain_request(stream, compact.then_some("responses/compact"));
+                    req.source_format = Format::OpenAIResponse;
+                    req.response_format = Format::OpenAIResponse;
+                    req.body = Bytes::from(raw.clone());
+                    req.original_body = req.body.clone();
+                    if lite {
+                        req.headers
+                            .insert("x-openai-internal-codex-responses-lite", "true".parse().unwrap());
+                    }
+                    let mut credential = oauth_credential(&mock.url);
+                    credential
+                        .attributes
+                        .insert("api_key".into(), "private-contract".into());
+                    let config = Config::parse("disable-image-generation: true\n").unwrap();
+                    let response = executor().execute(&credential, req, &config).await.unwrap();
+                    if let ResponseBody::Stream(mut events) = response.body {
+                        while let Some(event) = events.next().await {
+                            event.unwrap();
+                        }
+                    }
+                    let sent = mock.take();
+                    assert_eq!(sent.len(), 1);
+                    assert_eq!(sent[0].path, path);
+                    assert_eq!(sent[0].body.as_ref(), raw.as_bytes());
+                }
+            }
+        }
     }
 }
 
-/// Sign in with ChatGPT (7b0319fb): Go v8.0.35's upstream headers for a `use_siwc`
-/// credential on every call, and its missing-token error; see tests/reference/codex_siwc.
-/// The bodies follow the native contract instead (#28, docs/DIFFERENCES-FROM-GO.md): the
-/// `siwc` profile takes the native route, so the client's body goes upstream with only
-/// its `model` routed, and Go's Sign in with ChatGPT body rules no longer run.
+fn siwc_credential(base_url: &str) -> Credential {
+    let mut credential=Credential::from_file(Path::new("/fake"),Path::new("/fake/siwc.json"),
+        serde_json::json!({"type":"codex","access_token":"outer-contract","account_id":"outer-account","use_siwc":true,"siwc":{"access_token":"  siwc-contract  ","client_id":"issued-contract","refresh_token":"private-refresh"}}).as_object().unwrap().clone()).unwrap();
+    credential.attributes.insert("base_url".into(), base_url.into());
+    credential.attributes.insert("use_siwc".into(), "false".into());
+    credential
+        .attributes
+        .insert("header:X-Operator".into(), "operator-contract".into());
+    credential
+}
+
+/// The SIWC partition selects authentication without rewriting native Responses
+/// semantics. Exact input bytes include fields a recorder used to discard.
 #[tokio::test]
-async fn siwc_requests_match_go() {
-    let go: Value = serde_json::from_str(include_str!("../tests/fixtures/codex_siwc_go.json")).unwrap();
-    let executor = executor();
-    for case in go["cases"].as_array().unwrap() {
-        let name = case["name"].as_str().unwrap();
-        let call = case["call"].as_str().unwrap();
-        let mut metadata = case["metadata"].clone();
-        metadata["type"] = "codex".into();
-        let synthetic = serde_json::json!({
-            "source": "openai-response",
-            "model": case["model"],
-            "payload": case["payload"],
-            "stream": call == "stream" || call == "websocket",
-            "alt": if call == "compact" { Value::from("responses/compact") } else { Value::Null },
-            "headers": case["headers"],
-            "attributes": case["attributes"],
-            "metadata": metadata,
-        });
-        let cfg = Config::parse(case["config"].as_str().unwrap_or("{}")).unwrap();
-        let mock = Mock::start().await;
-        let credential = credential(&synthetic, &mock.url);
-        // Go sends `<signin-with-chatgpt-identifier> (<GOOS>; <GOARCH>)`, an
-        // operator-chosen identity. #26 (docs/DIFFERENCES-FROM-GO.md): a native caller's
-        // own User-Agent, else cliproxy-rs's. The image call is translated, so the
-        // proxy's. Every other recorded header still has to match.
-        let mut sent_headers = case["sent_headers"].clone();
-        if let Some(ua) = sent_headers.get_mut("user-agent") {
-            assert!(
-                ua[0].as_str().unwrap().contains(" (linux; amd64)"),
-                "{name}: Go's SIWC identity"
-            );
-            let caller = case["headers"]
-                .as_object()
-                .and_then(|h| h.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")))
-                .and_then(|(_, v)| v.as_str())
-                .map(str::trim)
-                .filter(|v| call != "image" && !v.is_empty());
-            ua[0] = caller.unwrap_or(PROXY_UA).into();
-        }
-        // A buffered request keeps the client's `stream: false` on this profile (#28), so
-        // it asks for JSON, where Go forced a stream.
-        if call == "non_stream"
-            && let Some(accept) = sent_headers.get_mut("accept")
-        {
-            accept[0] = "application/json".into();
-        }
-        // The native body: the client's, with only the routed model.
-        let native_body = {
-            let req = request(&synthetic);
-            let model = super::native::upstream_model(&req).ok();
-            model
-                .and_then(|m| super::native::routed(&req.body, &m).ok())
-                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                .unwrap_or_default()
-        };
-        let go_upstream = serde_json::json!({
-            "path": case["path"],
-            "body": if call == "image" { case["body"].clone() } else { Value::String(native_body.clone()) },
-            "headers": sent_headers,
-        });
-        if call == "websocket" {
-            let req = request(&synthetic);
-            let view = View::new(&credential);
-            let settings = Settings::scoped(&cfg, &view);
-            let body = native_body.clone();
-            let cache = request::prompt_cache_id(&req, &body, Some("exec-session"), true);
-            let headers = request::ws_headers(
-                &view,
-                &settings,
-                &req.headers,
-                &body,
-                &request::base_model(&req.model),
-                cache.as_deref(),
-                request::is_native(&req),
-                crate::codex_identity::Origin::Caller,
-            );
-            let mut actual: Vec<(String, String)> = headers
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
-                .collect();
-            actual.sort();
-            let mut expected: Vec<(String, String)> = go_upstream["headers"]
-                .as_object()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| (k.clone(), v[0].as_str().unwrap().to_owned()))
-                .collect();
-            expected.sort();
-            assert_eq!(actual, expected, "{name}: headers");
-            continue;
-        }
-        if call == "image" {
-            let sse = concat!(
-                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"id\":\"ig_0\",\"status\":\"completed\",\"result\":\"SU1HMQ==\",\"output_format\":\"png\"}}\n\n",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_img\",\"created_at\":1700000000,\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
-            );
-            mock.script(
-                "/responses",
-                vec![Reply {
-                    status: 200,
-                    headers: vec![("content-type".into(), "text/event-stream".into())],
-                    body: sse.into(),
-                }],
-            );
-            let path = "/v1/images/generations";
-            let mut req = request(&synthetic);
-            (req.source_format, req.response_format, req.request_path) = (Format::OpenAI, Format::OpenAI, path.into());
-            executor.images(&credential, req, path, &cfg).await.unwrap();
-            let sent = mock.take().pop().unwrap();
-            let (go_body, rust_body) = image_tool_bodies(go_upstream["body"].as_str().unwrap(), &sent.body);
-            assert_eq!(rust_body, go_body, "{name}: the tool request without Go's defaults");
-            let mut go_upstream = go_upstream;
-            go_upstream["body"] = Value::String(String::from_utf8_lossy(&sent.body).into_owned());
-            assert_same_upstream(name, &sent, &go_upstream);
-            continue;
-        }
-        let (path, content_type, reply) = if call == "compact" {
-            (
-                "/responses/compact",
-                "application/json",
-                r#"{"id":"resp_compact_1","object":"response.compaction","usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}"#,
-            )
-        } else {
-            (
-                "/responses",
-                "text/event-stream",
-                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"total_tokens\":15}}}\n\n",
-            )
-        };
-        mock.script(
-            path,
-            vec![Reply {
-                status: 200,
-                headers: vec![("content-type".into(), content_type.into())],
-                body: reply.into(),
-            }],
-        );
-        match executor.execute(&credential, request(&synthetic), &cfg).await {
-            Ok(res) => {
-                if let ResponseBody::Stream(mut stream) = res.body {
-                    while stream.next().await.is_some() {}
+async fn siwc_http_profiles_keep_native_bytes_and_use_only_the_selected_partition() {
+    for stream in [false, true] {
+        for compact in [false, true] {
+            if compact && stream {
+                continue;
+            }
+            for instructions in ["", "be brief"] {
+                let mock = Mock::start().await;
+                let path = if compact { "/responses/compact" } else { "/responses" };
+                let reply = if stream {
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"output\":[]}}\n\n"
+                } else {
+                    r#"{"id":"r","object":"response","output":[],"status":"completed"}"#
+                };
+                mock.script(
+                    path,
+                    vec![Reply {
+                        status: 200,
+                        headers: vec![(
+                            "content-type".into(),
+                            if stream {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            }
+                            .into(),
+                        )],
+                        body: reply.into(),
+                    }],
+                );
+                let raw = format!(
+                    r#"{{ "model":"gpt-5.4", "input":[{{"type":"configuration_update","reasoning":{{"effort":"low"}}}},{{"type":"message","role":"user","content":[{{"type":"input_text","text":"contract"}}]}}],"instructions":{instructions:?},"stream":{stream},"store":true,"temperature":0.5,"max_output_tokens":100,"prompt_cache_retention":"24h","prompt_cache_options":{{"mode":"keep"}},"prompt_cache_key":"native-cache","unknown":9007199254740993 }}"#
+                );
+                let mut req = plain_request(stream, compact.then_some("responses/compact"));
+                req.body = Bytes::from(raw.clone());
+                req.original_body = req.body.clone();
+                req.headers
+                    .insert("user-agent", "siwc-client-contract".parse().unwrap());
+                req.headers
+                    .insert("authorization", "Bearer caller-key-never-upstream".parse().unwrap());
+                let response = executor()
+                    .execute(&siwc_credential(&mock.url), req, &Config::default())
+                    .await
+                    .unwrap();
+                if let ResponseBody::Stream(mut events) = response.body {
+                    while let Some(event) = events.next().await {
+                        event.unwrap();
+                    }
                 }
-                assert_same_upstream(name, &mock.take().pop().unwrap(), &go_upstream);
-            }
-            // A thinking suffix has no native meaning, so the native route refuses it
-            // before any upstream request, where Go turned it into body fields.
-            Err(error) if case["status"].is_null() => {
-                assert!(
-                    cpa_common::thinking::parse_suffix(case["model"].as_str().unwrap()).has_suffix,
-                    "{name}: {error:?}"
-                );
-                assert_eq!(error.status, 400, "{name}");
-                assert!(mock.take().is_empty(), "{name}: nothing may reach upstream");
-            }
-            Err(error) => {
-                assert_eq!(error.status as i64, case["status"].as_i64().unwrap(), "{name}: status");
+                let sent = mock.take();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].path, path);
+                assert_eq!(sent[0].body.as_ref(), raw.as_bytes());
+                let headers = &sent[0].headers;
+                assert_eq!(headers["authorization"], "Bearer siwc-contract");
+                assert_eq!(headers["user-agent"], "siwc-client-contract");
                 assert_eq!(
-                    String::from_utf8_lossy(&error.body),
-                    case["error"].as_str().unwrap(),
-                    "{name}: error"
+                    headers["accept"],
+                    if stream {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    }
                 );
-                assert!(mock.take().is_empty(), "{name}: nothing may reach upstream");
+                assert_eq!(headers["x-operator"], "operator-contract");
+                assert!(
+                    !headers.contains_key("chatgpt-account-id"),
+                    "outer account is not the SIWC partition"
+                );
             }
         }
     }
-    // Without a `base_url` (the cases above dial a mock): Go's `defaultOpenAISIWCBaseURL`.
-    let production = Credential::from_file(
-        Path::new("/fake"),
-        Path::new("/fake/c.json"),
-        serde_json::json!({"type": "codex", "use_siwc": true, "access_token": "outer-at",
-                           "siwc": {"access_token": "siwc-at"}})
-        .as_object()
-        .unwrap()
-        .clone(),
-    )
-    .unwrap();
+    let mock = Mock::start().await;
+    let mut credential = siwc_credential(&mock.url);
+    credential.metadata["siwc"] = serde_json::json!({"client_id":"issued-contract"});
+    let error = executor()
+        .execute(&credential, plain_request(true, None), &Config::default())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!((error.status, error.scope), (401, FailureScope::Credential));
+    assert!(String::from_utf8_lossy(&error.body).contains("siwc access_token is missing"));
+    assert!(mock.take().is_empty());
+    let error = executor()
+        .execute(
+            &siwc_credential(&mock.url),
+            {
+                let mut req = plain_request(true, None);
+                req.model = "gpt-5.4(low)".into();
+                req
+            },
+            &Config::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!((error.status, error.scope), (400, FailureScope::Request));
+    assert!(mock.take().is_empty());
+    let production = siwc_credential("");
+    let mut production = production;
+    production.attributes.remove("base_url");
     let view = View::new(&production);
-    assert_eq!((view.base_url, view.token), ("https://api.openai.com/v1", "siwc-at"));
+    assert_eq!(
+        (view.base_url, view.token),
+        ("https://api.openai.com/v1", "siwc-contract")
+    );
+}
+
+#[test]
+fn siwc_websocket_headers_keep_protocol_metadata_and_do_not_use_the_outer_account() {
+    let credential = siwc_credential("http://local.invalid");
+    let view = View::new(&credential);
+    let cfg = Config::default();
+    let settings = Settings::scoped(&cfg, &view);
+    for beta in ["responses_websockets=2026-09-01", "assistants=v2"] {
+        let mut headers = HeaderMap::new();
+        for (key, value) in [
+            ("user-agent", "siwc-client-contract"),
+            ("openai-beta", beta),
+            ("x-client-request-id", "client-request"),
+            ("conversation_id", "outer-conversation"),
+        ] {
+            headers.insert(key, value.parse().unwrap());
+        }
+        let headers = request::ws_headers(
+            &view,
+            &settings,
+            &headers,
+            "{}",
+            "gpt-5.4",
+            Some("session-contract"),
+            true,
+            crate::codex_identity::Origin::Caller,
+        );
+        assert_eq!(headers["authorization"], "Bearer siwc-contract");
+        assert_eq!(headers["user-agent"], "siwc-client-contract");
+        assert_eq!(headers["session_id"], "session-contract");
+        assert_eq!(headers["x-client-request-id"], "session-contract");
+        assert_eq!(
+            headers["openai-beta"],
+            if beta.starts_with("responses_websockets=") {
+                beta
+            } else {
+                request::WS_BETA
+            }
+        );
+        assert_eq!(headers["x-operator"], "operator-contract");
+        assert!(!headers.contains_key("conversation_id"));
+        assert!(!headers.contains_key("chatgpt-account-id"));
+    }
+}
+
+#[tokio::test]
+async fn siwc_image_models_use_the_responses_image_tool_and_proxy_identity() {
+    let mock = Mock::start().await;
+    mock.script("/responses",vec![Reply{status:200,headers:vec![("content-type".into(),"text/event-stream".into())],body:"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\",\"created_at\":17,\"output\":[{\"type\":\"image_generation_call\",\"result\":\"SU1H\"}]}}\n\n".into()}]);
+    let path = "/v1/images/generations";
+    let response = executor()
+        .images(
+            &siwc_credential(&mock.url),
+            image_request(
+                br#"{"model":"gpt-image-2","prompt":"paint a contract"}"#.to_vec(),
+                "gpt-image-2",
+                false,
+                path,
+            ),
+            path,
+            &Config::default(),
+        )
+        .await
+        .unwrap();
+    let sent = mock.take();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].path, "/responses");
+    assert_eq!(sent[0].headers["authorization"], "Bearer siwc-contract");
+    assert_eq!(sent[0].headers["user-agent"], PROXY_UA);
+    let body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+    assert_eq!(body["tools"][0]["model"], "gpt-image-2");
+    assert_eq!(body["input"][0]["content"][0]["text"], "paint a contract");
+    let ResponseBody::Buffered(result) = response.body else {
+        panic!("buffered image result")
+    };
+    let result: Value = serde_json::from_slice(&result).unwrap();
+    assert_eq!(result["data"][0]["b64_json"], "SU1H");
 }
 
 /// Sign in with ChatGPT refresh (Go `refreshLocked`): the `siwc` partition refreshes on
 /// its own 5-minute lead, a rejected token refreshes the partition requests use, a
 /// management refresh both, and one partition failing keeps the other's result.
 #[tokio::test]
-async fn siwc_partition_refreshes_like_go() {
+async fn refresh_partitions_schedule_independently_retain_success_and_retry_only_failures() {
     use crate::codex_testkit::json;
     const OUTER: &str = "/oauth/token";
     const SIWC: &str = "/api/accounts/oauth/token";
@@ -2219,8 +2315,15 @@ async fn siwc_partition_refreshes_like_go() {
     let sent = mock.take();
     assert_eq!(paths(sent.clone()), [SIWC], "only the due partition refreshes");
     assert_eq!(
-        String::from_utf8_lossy(&sent[0].body),
-        "client_id=client-1&grant_type=refresh_token&refresh_token=siwc-b&resource=https%3A%2F%2Fapi.openai.com%2Fv1"
+        url::form_urlencoded::parse(&sent[0].body)
+            .into_owned()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        std::collections::BTreeMap::from([
+            ("client_id".into(), "client-1".into()),
+            ("grant_type".into(), "refresh_token".into()),
+            ("refresh_token".into(), "siwc-b".into()),
+            ("resource".into(), "https://api.openai.com/v1".into())
+        ])
     );
     assert_eq!(patch.set.keys().collect::<Vec<_>>(), ["siwc"]);
     let siwc = &patch.set["siwc"];

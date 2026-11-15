@@ -732,47 +732,87 @@ pub fn non_stream(ctx: &ResponseCtx<'_>, raw: &[u8]) -> Result<Vec<u8>, Error> {
 mod tests {
     use super::*;
 
-    /// Go v8.0.35 `ConvertCodexResponseToOpenAI` and its non-stream form on URL citations
-    /// (16d98881): see tests/reference/codex_chat.
     #[test]
-    fn url_citations_match_go() {
-        let go: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/codex_chat_go.json")).unwrap();
+    fn citations_keep_urls_titles_and_character_offsets_in_buffered_responses() {
         let ctx = ResponseCtx {
-            model: "gpt-5.5",
+            model: "gpt-test",
             original_request: b"",
             translated_request: b"",
             tool_search: false,
         };
-        for case in go["streams"].as_array().unwrap() {
-            let mut stream = go_stream(&ctx);
-            for (line, want) in case["lines"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .zip(case["out"].as_array().unwrap())
-            {
-                let got: Vec<String> = stream
-                    .line(line.as_str().unwrap().as_bytes())
-                    .unwrap()
-                    .iter()
-                    .map(|c| String::from_utf8_lossy(c).into_owned())
-                    .collect();
-                let want: Vec<&str> = want.as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
-                assert_eq!(got, want, "{}: {}", case["name"], line);
-            }
-        }
-        for case in go["non_stream"].as_array().unwrap() {
-            let ctx = ResponseCtx {
-                original_request: case["original"].as_str().unwrap_or_default().as_bytes(),
-                ..ctx
-            };
-            let out = non_stream(&ctx, case["in"].as_str().unwrap().as_bytes()).unwrap();
-            assert_eq!(
-                String::from_utf8_lossy(&out),
-                case["out"].as_str().unwrap(),
-                "{}",
-                case["name"]
-            );
-        }
+        let input = serde_json::json!({"type":"response.completed","response":{
+            "id":"response-1","model":"gpt-test","created_at":1700000000,"status":"completed",
+            "output":[{"type":"message","content":[
+                {"type":"output_text","text":"前🙂"},
+                {"type":"output_text","text":"引用","annotations":[
+                    {"type":"url_citation","url":"https://example.com","title":"Source","start_index":0,"end_index":2},
+                    {"type":"url_citation","url":"https://example.com","title":"Duplicate","start_index":0,"end_index":2},
+                    {"type":"file_citation","file_id":"not-a-url"}
+                ]}
+            ]}],"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}
+        }});
+        let output = non_stream(&ctx, &serde_json::to_vec(&input).unwrap()).unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(output["choices"][0]["message"]["content"], "前🙂引用");
+        assert_eq!(
+            output["choices"][0]["message"]["annotations"],
+            serde_json::json!([
+                {"type":"url_citation","url":"https://example.com","title":"Source","start_index":2,"end_index":4}
+            ])
+        );
+        assert_eq!(
+            output["usage"],
+            serde_json::json!({"prompt_tokens":3,"completion_tokens":4,"total_tokens":7})
+        );
+    }
+
+    #[test]
+    fn streamed_citations_are_deduplicated_and_use_character_offsets() {
+        let ctx = ResponseCtx {
+            model: "gpt-test",
+            original_request: b"",
+            translated_request: b"",
+            tool_search: false,
+        };
+        let mut stream = go_stream(&ctx);
+        let delta = stream
+            .line("data: {\"type\":\"response.output_text.delta\",\"delta\":\"前🙂\"}".as_bytes())
+            .unwrap();
+        assert_eq!(delta.len(), 1);
+        let annotation = br#"data: {"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","id":"cite-1","url":"https://example.com","title":"Source","start_index":0,"end_index":2}}"#;
+        let frames = stream.line(annotation).unwrap();
+        assert_eq!(frames.len(), 1);
+        let output: serde_json::Value = serde_json::from_slice(&frames[0]).unwrap();
+        assert_eq!(
+            output["choices"][0]["delta"]["annotations"],
+            serde_json::json!([
+                {"type":"url_citation","url":"https://example.com","title":"Source","start_index":2,"end_index":4}
+            ])
+        );
+        assert!(stream.line(annotation).unwrap().is_empty());
+    }
+    #[test]
+    fn citation_ranges_reject_negative_or_reversed_offsets_and_deduplicate_ids() {
+        let annotations = serde_json::json!([
+            {"type":"url_citation","id":"a","url":"https://a.test","title":"first","start_index":0,"end_index":1},
+            {"type":"url_citation","id":"a","url":"https://different.test","start_index":2,"end_index":3},
+            {"type":"url_citation","url":"https://negative.test","start_index":-3,"end_index":1},
+            {"type":"url_citation","url":"https://reverse.test","start_index":4,"end_index":3},
+            {"type":"url_citation","url":"https://a.test","title":"later","start_index":3,"end_index":4},
+            {"type":"file_citation","file_id":"f","start_index":0,"end_index":1}
+        ]);
+        let encoded = serde_json::to_vec(&annotations).unwrap();
+        let parsed = gj::parse(&encoded);
+        let mut seen = HashSet::new();
+        let citations = url_citations(&parsed.array(), 0, &mut seen);
+        let actual: Vec<serde_json::Value> = citations.iter().map(|v| serde_json::from_slice(v).unwrap()).collect();
+        assert_eq!(
+            actual,
+            vec![
+                serde_json::json!({"type":"url_citation","url":"https://a.test","title":"first","start_index":0,"end_index":1}),
+                serde_json::json!({"type":"url_citation","url":"https://a.test","title":"later","start_index":3,"end_index":4})
+            ]
+        );
+        assert!(url_citations(&parsed.array(), 0, &mut seen).is_empty());
     }
 }

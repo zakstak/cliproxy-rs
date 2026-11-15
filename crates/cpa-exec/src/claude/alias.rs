@@ -654,36 +654,146 @@ mod tests {
     use super::*;
 
     #[test]
-    fn harness_alias_matches_clean_go_capture() {
-        let body = r#"{"tools":[{"name":"fixture_lookup","input_schema":{"type":"object"}},{"name":"mcp__fixture__native","input_schema":{}}],"tool_choice":{"type":"tool","name":"fixture_lookup"},"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"fixture_lookup","input":{}}]}]}"#;
-        let (out, reverse) = remap(body, "fixture-client-key");
-        let alias = "mcp__poem_real__leisure_fixture_lookup";
-        assert_eq!(out, body.replace("\"fixture_lookup\"", &format!("\"{alias}\"")));
-        assert_eq!(reverse.get(alias).map(String::as_str), Some("fixture_lookup"));
-        assert_eq!(
-            reverse.get("mcp__fixture__native").map(String::as_str),
-            Some("mcp__fixture__native")
+    fn aliases_are_stable_isolated_and_restore_without_touching_tool_data() {
+        let body = r#"{"tools":[{"name":"fixture_lookup","input_schema":{"type":"object"}},{"name":"mcp__fixture__native","input_schema":{}}],"tool_choice":{"type":"tool","name":"fixture_lookup"},"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"fixture_lookup","input":{"name":"fixture_lookup"}}]}]}"#;
+        let (out, reverse) = remap(body, "caller-one");
+        let alias = reverse
+            .iter()
+            .find(|(_, original)| *original == "fixture_lookup")
+            .unwrap()
+            .0;
+        assert!(is_mcp_name(alias));
+        assert_ne!(alias, "fixture_lookup");
+        assert_eq!(remap(body, "caller-one"), (out.clone(), reverse.clone()));
+        let (_, other) = remap(body, "caller-two");
+        assert!(
+            !other.contains_key(alias),
+            "callers must not share their alias namespace"
         );
-        let resolver = Resolver::new(&reverse);
-        assert_eq!(resolver.resolve(alias).unwrap().as_deref(), Some("fixture_lookup"));
-        assert_eq!(resolver.resolve("mcp__fixture__native").unwrap(), None);
-        // Drifted tool word with the same server and semantic suffix still restores.
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["tools"][0]["name"], alias.as_str());
+        assert_eq!(parsed["tool_choice"]["name"], alias.as_str());
+        assert_eq!(parsed["messages"][0]["content"][0]["name"], alias.as_str());
+        assert_eq!(parsed["messages"][0]["content"][0]["input"]["name"], "fixture_lookup");
+        assert_eq!(parsed["tools"][1]["name"], "mcp__fixture__native");
+        let response =
+            format!(r#"{{"content":[{{"type":"tool_use","name":"{alias}","input":{{"name":"literal"}}}}]}}"#);
+        let restored: serde_json::Value =
+            serde_json::from_str(&restore_response(&response, &reverse).unwrap()).unwrap();
+        assert_eq!(restored["content"][0]["name"], "fixture_lookup");
+        assert_eq!(restored["content"][0]["input"]["name"], "literal");
+        let (server, _, semantic) = alias_parts(alias).unwrap();
+        let drifted = format!("mcp__{server}__abandon_{semantic}");
         assert_eq!(
-            resolver
-                .resolve("mcp__poem_real__abandon_fixture_lookup")
-                .unwrap()
-                .as_deref(),
+            Resolver::new(&reverse).resolve(&drifted).unwrap().as_deref(),
             Some("fixture_lookup")
         );
-        assert_eq!(resolver.resolve("mcp__other__x_fixture_lookup").unwrap(), None);
+        assert_eq!(
+            Resolver::new(&reverse).resolve("mcp__other__x_fixture_lookup").unwrap(),
+            None
+        );
     }
 
-    /// v8.0.35 claude_executor_request_remap_test.go (02fc76b1): a caller-owned MCP tool
+    #[test]
+    fn alias_allocation_keeps_case_long_names_and_caller_collisions_distinct() {
+        let names = [
+            "Read".to_owned(),
+            "read".to_owned(),
+            "a".repeat(200),
+            "custom tool with spaces".to_owned(),
+        ];
+        let tools: Vec<_> = names
+            .iter()
+            .map(|name| serde_json::json!({"type":"custom","name":name,"input_schema":{"type":"object"}}))
+            .collect();
+        let body = serde_json::json!({"opaque":9007199254740993u64,"tools":tools}).to_string();
+        let (out, reverse) = remap(&body, "local-alias-collision");
+        assert_eq!(reverse.len(), names.len());
+        assert_eq!(reverse.values().collect::<HashSet<_>>().len(), names.len());
+        assert!(reverse.keys().all(|name| is_mcp_name(name) && name.len() <= 64));
+        let first: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let reserved = first["tools"][0]["name"].as_str().unwrap();
+        let mut collision: serde_json::Value = serde_json::from_str(&body).unwrap();
+        collision["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name":reserved}));
+        let (changed, map) = remap(&collision.to_string(), "local-alias-collision");
+        let changed: serde_json::Value = serde_json::from_str(&changed).unwrap();
+        assert_ne!(changed["tools"][0]["name"], reserved);
+        assert_eq!(changed["tools"][names.len()]["name"], reserved);
+        assert_eq!(map.get(reserved).map(String::as_str), Some(reserved));
+        assert_eq!(changed["opaque"], 9007199254740993u64);
+        let no_custom = r#"{ "tools":[{"name":"mcp__caller__lookup"}], "opaque": 1.00 }"#;
+        let (unchanged, map) = remap(no_custom, "local-alias-collision");
+        assert_eq!(unchanged, no_custom);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn semantic_recovery_is_server_bound_and_restores_search_references() {
+        let reverse: Reverse = [
+            ("mcp__local_server__word_query", "query"),
+            ("mcp__local_server__other_search_query", "search_query"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_owned(), b.to_owned()))
+        .collect();
+        let resolver = Resolver::new(&reverse);
+        for (input, expected) in [
+            ("mcp__local_server__word_query", Some("query")),
+            ("mcp__local_server__local_server__word_query", Some("query")),
+            (
+                "mcp__local_server__local_server__local_server__word_query",
+                Some("query"),
+            ),
+            ("mcp__local_server__changed_search_query", Some("search_query")),
+            ("mcp__local_server___search_query", Some("search_query")),
+            ("mcp__different__word_query", None),
+            ("mcp__local_server__undeclared", None),
+            ("mcp__local_server__word_query_extra", None),
+        ] {
+            assert_eq!(resolver.resolve(input).unwrap().as_deref(), expected, "{input}");
+        }
+        let duplicate: Reverse = [
+            ("mcp__local_server__word_query", "one"),
+            ("mcp__local_server__other_query", "two"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_owned(), b.to_owned()))
+        .collect();
+        assert!(
+            Resolver::new(&duplicate)
+                .resolve("mcp__local_server__changed_query")
+                .is_err()
+        );
+        let body = serde_json::json!({"content":[{"type":"tool_reference","tool_name":"mcp__local_server__word_query"}, {"type":"tool_result","content":[{"type":"tool_reference","tool_name":"mcp__local_server__other_search_query"}]}, {"type":"tool_search_tool_result","content":{"tool_references":[{"type":"tool_reference","tool_name":"mcp__local_server__word_query"}]}}, {"type":"text","text":"mcp__local_server__word_query"}]}).to_string();
+        let restored: serde_json::Value = serde_json::from_str(&restore_response(&body, &reverse).unwrap()).unwrap();
+        assert_eq!(restored["content"][0]["tool_name"], "query");
+        assert_eq!(restored["content"][1]["content"][0]["tool_name"], "search_query");
+        assert_eq!(
+            restored["content"][2]["content"]["tool_references"][0]["tool_name"],
+            "query"
+        );
+        assert_eq!(restored["content"][3]["text"], "mcp__local_server__word_query");
+        let line = format!(
+            "data: {}",
+            serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_search_tool_result","content":{"tool_references":[{"type":"tool_reference","tool_name":"mcp__local_server__word_query"}]}}})
+        );
+        let restored = super::super::stream::restore_line(line.as_bytes(), &reverse).unwrap();
+        let restored: serde_json::Value = serde_json::from_slice(restored.strip_prefix(b"data: ").unwrap()).unwrap();
+        assert_eq!(
+            restored["content_block"]["content"]["tool_references"][0]["tool_name"],
+            "query"
+        );
+    }
+
+    /// A caller-owned MCP tool
     /// wrapped in the virtual server, by tool name or by its full name, restores in
     /// buffered and streamed responses; a tool name two declared tools share stays an
     /// error.
     #[test]
-    fn caller_mcp_tool_wrapped_in_the_virtual_server_restores_like_go() {
+    fn wrapped_mcp_tools_restore_and_ambiguous_names_are_refused() {
         let server_of = |reverse: &Reverse| {
             let alias = reverse
                 .iter()

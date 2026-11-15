@@ -903,7 +903,8 @@ mod tests {
 
     /// Go TestEffectiveCatalogSources.
     #[test]
-    fn effective_sources_match_go() {
+    // Product policy: Catalog updates honor operator source selection, credential-free HTTP requests and structured status reporting; generation fencing prevents stale publication.
+    fn catalog_sources_respect_local_and_home_modes() {
         let url = "https://example.com/catalog.json";
         for local in [false, true] {
             for home in [false, true] {
@@ -1153,7 +1154,8 @@ mod tests {
     /// Go-recorded redirect replay). A source that would not go out so is refused
     /// without a request.
     #[tokio::test]
-    async fn sources_are_requested_as_go_requests_them() {
+    // Product policy: Catalog updates honor operator source selection, credential-free HTTP requests and structured status reporting; generation fencing prevents stale publication.
+    async fn catalog_http_requests_are_credential_free_and_preserve_source_paths() {
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let record = seen.clone();
         let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
@@ -1622,29 +1624,32 @@ mod tests {
 
     /// Go `CatalogSourceStatus` and `CatalogRefreshResult`, without the Devin catalog.
     #[test]
-    fn reports_render_go_catalog_source_statuses() {
-        let render = |s: &Status| serde_json::to_string(&s.to_json()).unwrap();
+    // Product policy: Catalog updates honor operator source selection, credential-free HTTP requests and structured status reporting; generation fencing prevents stale publication.
+    fn catalog_refresh_reports_expose_structured_outcomes() {
+        let render = |s: &Status| s.to_json();
+        let assert_json =
+            |actual: Value, expected: &str| assert_eq!(actual, serde_json::from_str::<Value>(expected).unwrap());
         let ok = refreshed("https://example.com/models.json", &["claude", "xai"]);
-        assert_eq!(
+        assert_json(
             render(&ok),
-            r#"{"source":"https://example.com/models.json","refreshed":true,"changed_providers":["claude","xai"]}"#
+            r#"{"source":"https://example.com/models.json","refreshed":true,"changed_providers":["claude","xai"]}"#,
         );
         let skipped = Status {
             source: DISABLED.into(),
             outcome: Outcome::Skipped,
         };
-        assert_eq!(
+        assert_json(
             render(&skipped),
-            r#"{"source":"disabled","refreshed":false,"skipped":true}"#
+            r#"{"source":"disabled","refreshed":false,"skipped":true}"#,
         );
-        assert_eq!(
+        assert_json(
             render(&refreshed("embed", &[])),
-            r#"{"source":"embed","refreshed":true}"#
+            r#"{"source":"embed","refreshed":true}"#,
         );
         let failed = Status::failed("/catalog.json".into(), UNAVAILABLE);
-        assert_eq!(
+        assert_json(
             render(&failed),
-            r#"{"source":"/catalog.json","refreshed":false,"error":"no valid model catalog source"}"#
+            r#"{"source":"/catalog.json","refreshed":false,"error":"no valid model catalog source"}"#,
         );
         let report = Report {
             catalog: ok.clone(),

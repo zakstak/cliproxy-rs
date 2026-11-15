@@ -1,0 +1,269 @@
+{
+  "provenance": "CLIProxyAPI 6fecc6e (v8.0.10) historical client stimuli only. Mock reply and relay expectations independently specified in realtime.rs; recorded response/status/upstream captures removed.",
+  "cases": [
+    {
+      "name": "live_sideband_relays",
+      "path": "/v1/live/call-live",
+      "principal": "owner",
+      "headers": {
+        "Openai-Alpha": [
+          "quicksilver=v2"
+        ],
+        "Sec-Websocket-Protocol": [
+          "realtime, openai-beta.realtime-v1"
+        ],
+        "Session-Id": [
+          "session-1"
+        ],
+        "X-Not-Forwarded": [
+          "x"
+        ],
+        "X-Oai-Attestation": [
+          "attest"
+        ]
+      },
+      "send": [
+        {
+          "kind": "text",
+          "data": "hello"
+        },
+        {
+          "kind": "ping",
+          "data": "p"
+        },
+        {
+          "kind": "binary",
+          "data": "\u0001\u0002"
+        },
+        {
+          "kind": "text",
+          "data": "upstream-close"
+        }
+      ]
+    },
+    {
+      "name": "live_sideband_consumed",
+      "path": "/v1/live/call-live",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "calls_sideband_client_close",
+      "path": "/v1/realtime/calls/call-calls",
+      "principal": "owner",
+      "headers": null,
+      "send": [
+        {
+          "kind": "text",
+          "data": "a"
+        },
+        {
+          "kind": "close",
+          "data": "client-bye",
+          "code": 4002
+        }
+      ]
+    },
+    {
+      "name": "query_sideband",
+      "path": "/v1/realtime?call_id=call-query",
+      "principal": "owner",
+      "headers": null,
+      "send": [
+        {
+          "kind": "text",
+          "data": "q"
+        },
+        {
+          "kind": "close",
+          "code": 1000
+        }
+      ]
+    },
+    {
+      "name": "sideband_other_principal",
+      "path": "/v1/live/call-scope",
+      "principal": "other",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "sideband_after_scope_reject",
+      "path": "/v1/live/call-scope",
+      "principal": "owner",
+      "headers": null,
+      "send": [
+        {
+          "kind": "close",
+          "data": "away",
+          "code": 1001
+        }
+      ]
+    },
+    {
+      "name": "sideband_secret_owner",
+      "path": "/v1/realtime/calls/call-secret",
+      "principal": "secret",
+      "headers": null,
+      "send": [
+        {
+          "kind": "text",
+          "data": "s"
+        },
+        {
+          "kind": "close",
+          "code": 1000
+        }
+      ]
+    },
+    {
+      "name": "sideband_secret_wrong_call",
+      "path": "/v1/realtime/calls/call-secret2",
+      "principal": "secret",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "sideband_upstream_401",
+      "path": "/v1/realtime/calls/call-401",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "live_sideband_upstream_401",
+      "path": "/v1/live/live-401",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "sideband_upstream_404",
+      "path": "/v1/realtime/calls/call-404",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "live_sideband_upstream_404",
+      "path": "/v1/live/live-404",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "sideband_upstream_429",
+      "path": "/v1/realtime/calls/call-429",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "live_sideband_upstream_429",
+      "path": "/v1/live/live-429",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "direct_relays",
+      "path": "/v1/realtime?model=gpt-realtime",
+      "principal": "owner",
+      "headers": {
+        "Openai-Alpha": [
+          "dropped"
+        ],
+        "Sec-Websocket-Protocol": [
+          "realtime"
+        ]
+      },
+      "send": [
+        {
+          "kind": "text",
+          "data": "d"
+        },
+        {
+          "kind": "close",
+          "code": 1000
+        }
+      ]
+    },
+    {
+      "name": "direct_default_model_originator",
+      "path": "/v1/realtime",
+      "principal": "owner",
+      "headers": {
+        "Originator": [
+          "my-app"
+        ]
+      },
+      "send": [
+        {
+          "kind": "close",
+          "code": 1000
+        }
+      ]
+    },
+    {
+      "name": "direct_secret_session_update",
+      "path": "/v1/realtime?model=gpt-realtime-mini",
+      "principal": "secret",
+      "headers": null,
+      "send": [
+        {
+          "kind": "read"
+        },
+        {
+          "kind": "text",
+          "data": "after-update"
+        },
+        {
+          "kind": "close",
+          "code": 1000
+        }
+      ]
+    },
+    {
+      "name": "direct_upstream_401",
+      "path": "/v1/realtime?model=m-401",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "direct_upstream_404",
+      "path": "/v1/realtime?model=m-404",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "direct_upstream_429",
+      "path": "/v1/realtime?model=m-429",
+      "principal": "owner",
+      "headers": null,
+      "send": null
+    },
+    {
+      "name": "sideband_upstream_selects_no_protocol",
+      "path": "/v1/live/call-noselect",
+      "principal": "owner",
+      "headers": {
+        "Sec-Websocket-Protocol": [
+          "realtime, no-select"
+        ]
+      },
+      "send": [
+        {
+          "kind": "text",
+          "data": "n"
+        },
+        {
+          "kind": "close",
+          "code": 1000
+        }
+      ]
+    }
+  ]
+}

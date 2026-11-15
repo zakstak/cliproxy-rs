@@ -427,66 +427,6 @@ pub(crate) fn with_advisor(betas: &str) -> String {
     parts.join(",")
 }
 
-/// A list Go assembled for the Claude Code 2.1.280 profile, rewritten into the 2.1.325
-/// order `cli` follows: Go goldens keep their recording, and replays accept either
-/// form. Not a capture: the 2.1.325 order itself is pinned by the capture test below.
-#[cfg(test)]
-pub(crate) fn from_2_1_280(go: &str, body: &str) -> String {
-    let had_token_count = go.split(',').any(|b| b == THINKING_TOKEN_COUNT);
-    let mut b: Vec<&str> = go
-        .split(',')
-        .filter(|b| *b != MID_CONV_SYSTEM && *b != THINKING_TOKEN_COUNT)
-        .collect();
-    if signals::probe(body) {
-        b.retain(|x| [CLAUDE_CODE, OAUTH, CONTEXT_1M].contains(x) || CONSTANT.contains(x));
-        return b.join(",");
-    }
-    if !signals::probe_or_helper(body)
-        && model(body).go_lower().contains("haiku")
-        && let Some(i) = b.iter().position(|x| *x == CLAUDE_CODE)
-    {
-        b.remove(i);
-        let at = b.iter().rposition(|x| CONSTANT.contains(x)).map_or(0, |i| i + 1);
-        b.insert(at, CLAUDE_CODE);
-    }
-    if had_token_count {
-        let follows = [
-            ADVANCED_TOOL_USE,
-            MID_CONV_CLEAR_AT,
-            EFFORT,
-            DANGEROUS_TOOL_USE,
-            SERVER_SIDE_FALLBACK,
-            FALLBACK_CREDIT,
-            STRUCTURED_OUTPUTS,
-            THINKING_BINDING,
-            THINKING_DISPLAY_UPDATES,
-            THINKING_RESUMPTION,
-            FAST_MODE,
-            AFK_MODE,
-            EXTENDED_CACHE_TTL,
-            PROMPT_CACHING_EVICT,
-            CACHE_DIAGNOSIS,
-        ];
-        let at = b.iter().position(|x| follows.contains(x)).unwrap_or(b.len());
-        b.insert(at, THINKING_TOKEN_COUNT);
-    }
-    if let (Some(e), Some(d)) = (
-        b.iter().position(|x| *x == EFFORT),
-        b.iter().position(|x| *x == DANGEROUS_TOOL_USE),
-    ) && d < e
-    {
-        b.swap(d, e);
-    }
-    b.join(",")
-}
-
-/// Whether `ours` is Go's recorded `Anthropic-Beta` value, as recorded or in the 2.1.325
-/// order ([`from_2_1_280`]).
-#[cfg(test)]
-pub(crate) fn matches_go(ours: &str, go: &str, body: &str) -> bool {
-    ours == go || ours == from_2_1_280(go, body)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,27 +504,32 @@ mod tests {
     }
 
     #[test]
-    fn harness_profiles_match_go_captures() {
+    fn beta_assembly_keeps_auth_requirements_and_deduplicates_extensions() {
+        use std::collections::HashSet;
         let body = r#"{"model":"claude-sonnet-4-6","diagnostics":{"previous_message_id":null}}"#;
-        // Recorded from Go's 2.1.280 profile; thinking-token-count now follows the tool
-        // betas (2.1.325).
-        let go = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07";
-        assert_eq!(cli(body, &Requested::new(), true), from_2_1_280(go, body));
+        let oauth = cli(body, &Requested::new(), true);
+        let key = cli(body, &Requested::new(), false);
+        let flags = |value: &str| value.split(',').map(str::to_owned).collect::<HashSet<_>>();
+        assert!(flags(&oauth).contains(OAUTH));
+        assert!(!flags(&key).contains(OAUTH));
+        let counting = count_tokens(true);
+        assert!(flags(&counting).contains(OAUTH));
+        assert!(flags(&counting).contains(TOKEN_COUNTING));
+        assert!(!flags(&counting).contains(CACHE_DIAGNOSIS));
+        for supplied in ["extension-a,extension-a,extension-b", "extension-b,extension-a"] {
+            let with_auth = with_oauth_credential(supplied, true);
+            let actual = flags(&with_auth);
+            assert!(actual.contains("extension-a"));
+            assert!(actual.contains("extension-b"));
+            assert!(actual.contains(OAUTH));
+            assert!(actual.contains(EXTENDED_CACHE_TTL));
+            assert_eq!(with_auth.split(',').count(), actual.len());
+            assert_eq!(flags(&with_oauth_credential(&with_auth, true)), actual);
+        }
+        let advisor = with_advisor("extension-a,effort-2025-11-24,extension-b");
         assert_eq!(
-            from_2_1_280(go, body),
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,thinking-token-count-2026-05-13,effort-2025-11-24,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07"
-        );
-        assert_eq!(
-            count_tokens(true),
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,token-counting-2024-11-01"
-        );
-        assert_eq!(
-            with_oauth_credential("claude-code-20250219,interleaved-thinking-2025-05-14", true),
-            "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,extended-cache-ttl-2025-04-11"
-        );
-        assert_eq!(
-            with_advisor("a,effort-2025-11-24,b"),
-            "a,advisor-tool-2026-03-01,effort-2025-11-24,b"
+            flags(&advisor),
+            flags("extension-a,advisor-tool-2026-03-01,effort-2025-11-24,extension-b")
         );
     }
 }

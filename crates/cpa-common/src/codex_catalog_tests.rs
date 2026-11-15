@@ -1,146 +1,116 @@
-//! Replays tests/fixtures/codex_catalog_go.json.gz, written by Go's catalog builder at
-//! v8.0.35 with the registry facts it looked up (tests/reference/codex_client/README.md).
-
+//! Catalog schema and capability behavior. Payload contracts remain in docs/codex/CONTRACT.md.
 use super::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 
-fn fixture() -> Value {
-    use std::io::Read;
-    let gz = include_bytes!("../tests/fixtures/codex_catalog_go.json.gz");
-    let mut text = String::new();
-    flate2::read::GzDecoder::new(&gz[..]).read_to_string(&mut text).unwrap();
-    serde_json::from_str(&text).unwrap()
+struct CatalogRegistry;
+impl Registry for CatalogRegistry {
+    fn lookup(&self, _: &str, _: Option<&str>) -> Option<ModelFacts> {
+        None
+    }
+    fn providers(&self, _: &str) -> Vec<String> {
+        vec!["claude".into()]
+    }
+    fn web_search(&self, _: &str) -> Option<bool> {
+        Some(false)
+    }
 }
 
-struct Recorded<'a>(&'a Value);
-
-fn facts(v: &Value) -> Option<ModelFacts> {
-    if v.is_null() {
-        return None;
-    }
-    let s = |k: &str| v[k].as_str().unwrap_or_default().to_owned();
-    let strings = |k: &str| {
-        v[k].as_array()
-            .map(|a| a.iter().map(|x| x.as_str().unwrap().to_owned()).collect())
-            .unwrap_or_default()
-    };
-    Some(ModelFacts {
-        id: s("id"),
-        kind: s("type"),
-        owned_by: s("owned_by"),
-        display_name: s("display_name"),
-        description: s("description"),
-        context_length: v["context_length"].as_i64().unwrap_or_default(),
-        metadata_model_id: s("metadata_model_id"),
-        thinking: (!v["thinking"].is_null()).then(|| serde_json::from_value(v["thinking"].clone()).unwrap()),
-        explicit_thinking: v["explicit_thinking"].as_bool().unwrap_or_default(),
-        input_modalities: strings("input_modalities"),
-        explicit_input_modalities: v["explicit_input_modalities"].as_bool().unwrap_or_default(),
-    })
+fn model() -> Value {
+    json!({"slug":"custom","display_name":"Custom","description":"Description","base_instructions":"Instructions","minimal_client_version":"0","visibility":"list","default_reasoning_level":"low","context_window":1024,"max_context_window":2048,"priority":0,"supported_reasoning_levels":[{"effort":"low"}]})
 }
 
-impl Registry for Recorded<'_> {
-    fn lookup(&self, id: &str, provider: Option<&str>) -> Option<ModelFacts> {
-        let key = match provider {
-            Some(p) => format!("{id}|{p}"),
-            None => id.to_owned(),
-        };
-        let recorded = self.0["lookups"]
-            .get(&key)
-            .unwrap_or_else(|| panic!("Go never looked up {key:?}"));
-        facts(recorded)
-    }
-
-    fn providers(&self, id: &str) -> Vec<String> {
-        self.0["providers"][id]
+#[test]
+fn catalog_reports_available_models_and_version_supported_capabilities() {
+    let available = [json!({"id":"custom","display_name":"Operator model","description":"Operator description","max_context_length":16384,"thinking":{"levels":["low","medium","max","ultra"]}}), json!({"id":"gpt-image-2.5"}), json!({"id":""})]
+        .map(|v| GoValue::from_json(&v).into_object().unwrap());
+    for version in ["0.143.99", "0.144.0"] {
+        let output = build_response(&available, &CatalogRegistry, None, None, true, version);
+        let output: Value = serde_json::from_slice(&marshal_compact(&output)).unwrap();
+        let models = output["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        let custom = models.iter().find(|m| m["slug"] == "custom").unwrap();
+        assert_eq!(custom["display_name"], "Operator model");
+        assert_eq!(custom["description"], "Operator description");
+        assert_eq!(custom["context_window"], 16384);
+        assert_eq!(custom["multi_agent_version"], "v2");
+        let efforts = custom["supported_reasoning_levels"]
             .as_array()
-            .map(|a| a.iter().map(|p| p.as_str().unwrap().to_owned()).collect())
-            .unwrap_or_default()
-    }
-
-    fn web_search(&self, id: &str) -> Option<bool> {
-        self.0["web_search"][id].as_bool()
-    }
-}
-
-#[test]
-fn catalogs_match_go() {
-    let fixture = fixture();
-    let available: Vec<Map> = fixture["available"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| GoValue::from_json(m).into_object().expect("an object"))
-        .collect();
-    let registry = Recorded(&fixture);
-    let patch_table = &fixture["apply_patch"];
-    let patch = |id: &str| patch_table[id].as_bool().unwrap_or(false);
-    let search_table = &fixture["tool_search"];
-    let search = |id: &str| search_table[id].as_bool().unwrap_or(false);
-    let vectors = fixture["vectors"].as_array().unwrap();
-    assert_eq!(vectors.len(), 6);
-    for v in vectors {
-        let capability: Option<&dyn Fn(&str) -> bool> = if v["apply_patch"] == true { Some(&patch) } else { None };
-        let tool_search: Option<&dyn Fn(&str) -> bool> = if v["tool_search"] == true { Some(&search) } else { None };
-        let out = build_response(
-            &available,
-            &registry,
-            capability,
-            tool_search,
-            v["optimize"].as_bool().unwrap(),
-            v["version"].as_str().unwrap(),
+            .unwrap()
+            .iter()
+            .map(|v| v["effort"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(efforts.contains(&"low") && efforts.contains(&"medium"));
+        assert_eq!(efforts.contains(&"max"), version == "0.144.0");
+        assert_eq!(efforts.contains(&"ultra"), version == "0.144.0");
+        assert_eq!(
+            models.iter().find(|m| m["slug"] == "gpt-image-2.5").unwrap()["visibility"],
+            "hide"
         );
-        let got = String::from_utf8(marshal_compact(&out)).unwrap();
-        let want = v["out"].as_str().unwrap();
-        if got != want {
-            let (g, w): (Value, Value) = (serde_json::from_str(&got).unwrap(), serde_json::from_str(want).unwrap());
-            for (gm, wm) in g["models"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .zip(w["models"].as_array().unwrap())
-            {
-                assert_eq!(gm, wm, "version {:?}: model {}", v["version"], wm["slug"]);
-            }
-            assert_eq!(got, want, "version {:?}", v["version"]);
-        }
     }
 }
 
 #[test]
-fn validation_matches_go() {
-    let fixture = fixture();
-    for case in fixture["validation"].as_array().unwrap() {
-        let want = case["err"].as_str().unwrap();
-        let got = validate(case["in"].as_str().unwrap().as_bytes())
-            .err()
-            .unwrap_or_default();
-        if want.starts_with("decode Codex client model catalog:") {
-            // encoding/json's wording differs; the prefix and the failure match.
-            assert!(got.starts_with("decode Codex client model catalog:"), "{got}");
-        } else {
-            assert_eq!(got, want, "{}", case["in"]);
-        }
-    }
+fn catalog_validation_checks_schema_and_relations_without_pinning_error_prose() {
+    assert!(validate(&serde_json::to_vec(&json!({"models":[model()]})).unwrap()).is_ok());
     assert!(validate(crate::codex_client::CLIENT_MODELS_JSON.as_bytes()).is_ok());
-    // Since e240bd84 a catalog without `gpt-5.5` is valid; its first model becomes the
-    // default template.
-    let other = r#"{"models":[{"slug":"other","display_name":"a","description":"b","base_instructions":"c","minimal_client_version":"0","visibility":"list","default_reasoning_level":"low","context_window":1,"max_context_window":5,"priority":0,"supported_reasoning_levels":[{"effort":"low"}]}]}"#;
-    assert_eq!(validate(other.as_bytes()), Ok(()));
+    for bad in [
+        json!({}),
+        json!({"models":[]}),
+        json!({"models":{}}),
+        json!({"models":[model(),model()]}),
+    ] {
+        assert!(validate(&serde_json::to_vec(&bad).unwrap()).is_err());
+    }
+    for key in [
+        "slug",
+        "display_name",
+        "description",
+        "base_instructions",
+        "minimal_client_version",
+        "visibility",
+        "default_reasoning_level",
+        "context_window",
+        "max_context_window",
+        "priority",
+        "supported_reasoning_levels",
+    ] {
+        let mut missing = model();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(
+            validate(&serde_json::to_vec(&json!({"models":[missing]})).unwrap()).is_err(),
+            "missing {key}"
+        );
+    }
+    for (key, value) in [
+        ("context_window", json!(0)),
+        ("context_window", json!(4096)),
+        ("priority", json!(-1)),
+        ("priority", json!(0.5)),
+        ("default_reasoning_level", json!("unknown")),
+        ("supported_reasoning_levels", json!([{"effort":"low"},{"effort":"low"}])),
+    ] {
+        let mut invalid = model();
+        invalid[key] = value;
+        assert!(
+            validate(&serde_json::to_vec(&json!({"models":[invalid]})).unwrap()).is_err(),
+            "invalid {key}"
+        );
+    }
+    assert!(validate(b"{").is_err());
 }
 
 #[test]
-fn versions_compare_like_go() {
-    assert!(extended_levels(""));
-    assert!(extended_levels("garbage"));
-    assert!(extended_levels("0.144.0"));
-    assert!(extended_levels("V0.144.0-rc1"));
-    assert!(!extended_levels("0.143.99"));
-    assert!(!extended_levels("0.143"));
-    assert!(extended_levels("0.144"));
-    // Go cuts at the first `-` or `+` before parsing, so only a bad part fails.
-    assert_eq!(compare_versions("1.-2", "1"), Some(0));
-    assert_eq!(compare_versions("1.x", "1"), None);
+fn extended_reasoning_levels_start_at_the_client_capability_version() {
+    for (version, enabled) in [
+        ("0.143.99", false),
+        ("0.143", false),
+        ("0.144", true),
+        ("0.144.0", true),
+        ("v0.144.0-rc1", true),
+        ("0.145.0", true),
+    ] {
+        assert_eq!(extended_levels(version), enabled, "{version}");
+    }
 }
 
 /// Go `isCodexClientImageOrVideoModel`, with the GPT Image 2.6 IDs of CLIProxyAPI

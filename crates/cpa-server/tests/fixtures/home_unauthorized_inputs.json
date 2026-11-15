@@ -1,0 +1,229 @@
+[
+  {
+    "name": "count_tokens_oauth_runtime",
+    "id": "claude-a.json",
+    "auth_provider": "claude",
+    "index": "home-idx-7",
+    "attributes": {
+      "runtime_only": "true",
+      "source_backend": "postgres"
+    },
+    "metadata": {
+      "access_token": " tok-claude-a ",
+      "email": "a@example.test",
+      "type": "claude"
+    },
+    "provider": "claude",
+    "model": "claude-sonnet-4-5",
+    "body": "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}",
+    "client": {
+      "client_ip": "10.0.0.9",
+      "resolved_client_ip": "198.51.100.4",
+      "x_forwarded_for": "198.51.100.4",
+      "user_agent": "claude-cli/2.1 (external, cli)",
+      "session_id": "sess-home-canonical",
+      "parent_session_id": "sess-parent",
+      "is_fork": false,
+      "request_id": "req-unauth-1",
+      "endpoint": "POST /v1/messages/count_tokens"
+    },
+    "request": {
+      "alias": "sonnet-alias",
+      "reasoning_effort": "high",
+      "service_tier": "auto",
+      "with_options": true
+    }
+  },
+  {
+    "name": "alpha_search_no_body",
+    "id": "codex-b.json",
+    "auth_provider": "codex",
+    "index": "home-idx-8",
+    "attributes": {
+      "source": "config:codex[0]"
+    },
+    "metadata": {
+      "token": {
+        "access_token": "tok-codex-b"
+      }
+    },
+    "provider": "codex",
+    "model": "gpt-5.4",
+    "body": null,
+    "client": {
+      "client_ip": "127.0.0.1",
+      "resolved_client_ip": "127.0.0.1",
+      "x_forwarded_for": "",
+      "user_agent": "codex_cli_rs/0.50",
+      "session_id": "srch-1",
+      "parent_session_id": "",
+      "is_fork": false,
+      "request_id": "req-alpha",
+      "endpoint": "POST /v1/alpha/search"
+    },
+    "request": {
+      "alias": "",
+      "reasoning_effort": "",
+      "service_tier": "",
+      "with_options": false
+    }
+  },
+  {
+    "name": "blank_provider_falls_back_and_source_kinds",
+    "id": "kimi-c.json",
+    "auth_provider": "xai",
+    "index": "home-idx-9",
+    "attributes": {
+      "auth_kind": "oauth",
+      "source_backend": "object-store"
+    },
+    "metadata": {
+      "accessToken": "tok-kimi"
+    },
+    "provider": "  ",
+    "model": " grok-test ",
+    "body": "",
+    "client": {
+      "client_ip": "",
+      "resolved_client_ip": "",
+      "x_forwarded_for": "",
+      "user_agent": "",
+      "session_id": "same",
+      "parent_session_id": "same",
+      "is_fork": false,
+      "request_id": "",
+      "endpoint": "POST /v1/messages/count_tokens"
+    },
+    "request": {
+      "alias": "",
+      "reasoning_effort": "",
+      "service_tier": "priority",
+      "with_options": true
+    }
+  },
+  {
+    "name": "path_source",
+    "id": "gem-d.json",
+    "auth_provider": "xai",
+    "index": "home-idx-10",
+    "attributes": {
+      "path": "/auth/gem-d.json"
+    },
+    "metadata": {
+      "access_token": "tok-gem"
+    },
+    "provider": "xai",
+    "model": " grok-test ",
+    "body": "status 401",
+    "client": {
+      "client_ip": "",
+      "resolved_client_ip": "",
+      "x_forwarded_for": "",
+      "user_agent": "",
+      "session_id": "",
+      "parent_session_id": "",
+      "is_fork": false,
+      "request_id": "",
+      "endpoint": ""
+    },
+    "request": {
+      "alias": "",
+      "reasoning_effort": "",
+      "service_tier": "",
+      "with_options": false
+    }
+  },
+  {
+    "name": "unknown_source_is_file",
+    "id": "x-e.json",
+    "auth_provider": "xai",
+    "index": "home-idx-11",
+    "attributes": {
+      "source": "somewhere-else"
+    },
+    "metadata": {
+      "access_token": "tok-x"
+    },
+    "provider": "xai",
+    "model": "grok-4",
+    "body": null,
+    "client": {
+      "client_ip": "",
+      "resolved_client_ip": "",
+      "x_forwarded_for": "",
+      "user_agent": "",
+      "session_id": "",
+      "parent_session_id": "",
+      "is_fork": false,
+      "request_id": "",
+      "endpoint": ""
+    },
+    "request": {
+      "alias": "",
+      "reasoning_effort": "",
+      "service_tier": "",
+      "with_options": false
+    }
+  },
+  {
+    "name": "no_source_attributes",
+    "id": "c-f.json",
+    "auth_provider": "claude",
+    "index": "home-idx-12",
+    "attributes": null,
+    "metadata": {
+      "access_token": "tok-f"
+    },
+    "provider": "claude",
+    "model": "claude-opus-4-1",
+    "body": null,
+    "client": {
+      "client_ip": "",
+      "resolved_client_ip": "",
+      "x_forwarded_for": "",
+      "user_agent": "",
+      "session_id": "",
+      "parent_session_id": "",
+      "is_fork": false,
+      "request_id": "",
+      "endpoint": ""
+    },
+    "request": {
+      "alias": "",
+      "reasoning_effort": "",
+      "service_tier": "",
+      "with_options": false
+    }
+  },
+  {
+    "name": "api_key_has_no_fingerprint",
+    "id": "k-g",
+    "auth_provider": "claude",
+    "index": "home-idx-13",
+    "attributes": {
+      "api_key": "sk-fake",
+      "source": "config:claude[0]"
+    },
+    "metadata": null,
+    "provider": "claude",
+    "model": "claude-sonnet-4-5",
+    "body": "nope",
+    "client": {
+      "client_ip": "",
+      "resolved_client_ip": "",
+      "x_forwarded_for": "",
+      "user_agent": "",
+      "session_id": "",
+      "parent_session_id": "",
+      "is_fork": false,
+      "request_id": "",
+      "endpoint": ""
+    },
+    "request": {
+      "alias": "",
+      "reasoning_effort": "",
+      "service_tier": "",
+      "with_options": false
+    }
+  }
+]

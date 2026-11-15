@@ -541,7 +541,8 @@ async fn redispatch_waits_for_the_release_acknowledgement() {
 }
 
 #[tokio::test]
-async fn an_unacknowledged_release_fails_like_go() {
+// Product policy: Home dispatch requires release acknowledgement and bounds repeated ineligible selection, independent of provider accounts.
+async fn home_release_requires_acknowledgement() {
     let ack = Arc::new(Notify::new());
     ack.notify_one();
     let home = Arc::new(FakeHome {
@@ -562,7 +563,8 @@ async fn an_unacknowledged_release_fails_like_go() {
 }
 
 #[tokio::test]
-async fn a_repeated_ineligible_pick_fails_like_go() {
+// Product policy: Home dispatch requires release acknowledgement and bounds repeated ineligible selection, independent of provider accounts.
+async fn home_selection_bounds_repeated_ineligible_credentials() {
     let home = FakeHome::with(vec![credential("home-codex-key", "codex", "apikey")]);
     let (proxy, _, seen) = start(home.clone(), Some("/v1/live/call-123"), HOUR, None).await;
     let response = post_live(&proxy, "gpt-live-1-codex").await;

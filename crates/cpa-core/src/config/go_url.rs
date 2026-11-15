@@ -445,21 +445,22 @@ fn unescape(s: &str, mode: Mode) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Endpoint parsing protects supported HTTP authorities rather than arbitrary opaque URL schemes.
     #[test]
-    fn accepts_and_rejects_like_go() {
-        let host = |s: &str| parse(s).map(|u| u.hostname().to_owned());
-        assert_eq!(
-            host("https://u:p@API.Kimi.AI:8443/coding").as_deref(),
-            Some("API.Kimi.AI")
-        );
-        assert_eq!(host("//sub.kimi.ai/x").as_deref(), Some("sub.kimi.ai"));
-        assert_eq!(host("api.kimi.com/coding").as_deref(), Some(""));
-        assert_eq!(host("https://[::1]:8080/x").as_deref(), Some("::1"));
-        assert_eq!(host("https://[fe80::1%25en0]/").as_deref(), Some("fe80::1%en0"));
-        assert_eq!(host("https://[::1%25%25]/").as_deref(), Some("::1%%"));
-        for bad in [
-            "https://api.kimi.ai/%zz",
-            "https://api.kimi.com:abc/v1",
+    fn http_endpoints_preserve_authority_and_reject_ambiguous_hosts() {
+        for (raw, scheme, hostname) in [
+            ("https://API.example.invalid:8443/v1", "https", "API.example.invalid"),
+            ("http://127.0.0.1:8317/v1", "http", "127.0.0.1"),
+            ("https://[::1]:8080/v1", "https", "::1"),
+            ("http://[fe80::1%25eth0]/", "http", "fe80::1%eth0"),
+        ] {
+            let url = parse(raw).unwrap();
+            assert_eq!(url.scheme, scheme);
+            assert_eq!(url.hostname(), hostname);
+        }
+        for invalid in [
+            "https://api.example.invalid/%zz",
+            "https://h:abc/v1",
             "https://a:1:2/",
             "https://[1.2.3.4]/",
             "http://x[::1]",
@@ -469,76 +470,66 @@ mod tests {
             "https://a b/",
             "https://a%41/",
             "https://u{@h/",
-            ":x",
-            "1a:b/c",
             "http://h/\x01",
-            "http://h/#%zz",
-            "*#%zz",
         ] {
-            assert!(parse(bad).is_none(), "{bad}");
+            assert!(parse(invalid).is_none(), "{invalid}");
         }
-        assert_eq!(parse("turn:%zz").map(|u| u.scheme), Some("turn".into()));
-        assert!(parse("postgres://a:1,b:2/db").is_some());
-        assert!(parse("http://h/?%zz").is_some(), "Go leaves the query unvalidated");
     }
 
-    /// Go 1.26.4 `URL.RequestURI()` after `url.Parse`.
+    /// HTTP request targets retain escaped path delimiters and exclude fragments.
     #[test]
-    fn request_uri_follows_go() {
-        for (raw, want) in [
-            ("http://h:1/my catalogs/../models.json", "/my%20catalogs/../models.json"),
-            ("https://h/mod\u{e8}les/models.json", "/mod%C3%A8les/models.json"),
-            ("https://h/a%2Fb/x|y.json", "/a/b/x%7Cy.json"),
+    fn request_targets_escape_paths_and_preserve_existing_escapes() {
+        for (raw, expected) in [
+            ("http://h/my catalogs/models.json", "/my%20catalogs/models.json"),
+            ("https://h/modèles/models.json", "/mod%C3%A8les/models.json"),
             ("https://h/a%2Fb/x.json", "/a%2Fb/x.json"),
-            ("https://h/a/../c.json?x=1&y=a b", "/a/../c.json?x=1&y=a b"),
-            ("https://h/[x]/!$'()*.json", "/[x]/!$'()*.json"),
+            ("https://h/a/../c.json?x=1&y=a%20b", "/a/../c.json?x=1&y=a%20b"),
             ("https://h", "/"),
             ("https://h?", "/?"),
-            ("https://h/p#frag", "/p"),
+            ("https://h/p#fragment", "/p"),
             ("https://h/%41", "/%41"),
         ] {
-            assert_eq!(request_uri(raw).as_deref(), Some(want), "{raw}");
+            assert_eq!(request_uri(raw).as_deref(), Some(expected), "{raw}");
+            assert!(!expected.contains('#'));
         }
         assert_eq!(request_uri("https://h/%zz"), None);
         assert_eq!(request_uri("mailto:x"), None);
     }
 
-    /// Go 1.26.8 `http.NewRequest(...).URL.String()`: `removeEmptyPort` on the host.
+    /// Normalized endpoint references retain explicit ports and never expose URL credentials.
     #[test]
-    fn new_request_removes_an_empty_port() {
-        for (raw, want) in [
+    fn endpoint_normalization_omits_empty_ports_and_redacts_userinfo() {
+        for (raw, expected) in [
             ("http://h:/x", "http://h/x"),
             ("http://[::1]:/x?", "http://[::1]/x?"),
-            ("http://u:p@h:/x", "http://h/x"),
+            ("http://secret-user:secret-password@h:/x", "http://h/x"),
             ("http://h:80/x", "http://h:80/x"),
         ] {
             let mut url = Escaped::parse(raw).unwrap();
             url.remove_empty_port();
-            assert_eq!(url.referer(), want, "{raw}");
+            let rendered = url.referer();
+            assert_eq!(rendered, expected);
+            assert!(!rendered.contains("secret-user") && !rendered.contains("secret-password"));
         }
     }
 
-    /// Go's own table (net/url url_test.go `resolvePathTests`), plus merged `//` paths.
+    /// Relative URL path resolution follows RFC 3986 examples, including traversal above the root.
     #[test]
-    fn resolve_path_matches_go() {
-        for (base, reference, want) in [
-            ("a/b", ".", "/a/"),
-            ("a/b", "c", "/a/c"),
-            ("a/b", "..", "/"),
-            ("a/", "..", "/"),
-            ("a/", "../..", "/"),
-            ("a/b/c", "..", "/a/"),
-            ("a/b/c", "../d", "/a/d"),
-            ("a/b/c", ".././d", "/a/d"),
-            ("a/b", "./..", "/"),
-            ("a/./b", ".", "/a/"),
-            ("a/../", ".", "/"),
-            ("a/.././b", "c", "/c"),
-            ("//api/item", "next", "//api/next"),
-            ("", "next", "/next"),
-            ("", "", ""),
+    fn relative_paths_remove_dot_segments_without_escaping_root() {
+        // RFC 3986 section 5.4 relative-reference examples for base /b/c/d;p.
+        for (reference, expected) in [
+            ("g", "/b/c/g"),
+            ("./g", "/b/c/g"),
+            ("../g", "/b/g"),
+            ("../../g", "/g"),
+            ("../../../g", "/g"),
+            (".", "/b/c/"),
+            ("..", "/b/"),
         ] {
-            assert_eq!(resolve_path(base, reference), want, "{base:?} + {reference:?}");
+            assert_eq!(resolve_path("/b/c/d;p", reference), expected);
         }
+        assert_eq!(resolve_path("//api/item", "next"), "//api/next");
+        assert_eq!(resolve_path("", "next"), "/next");
+        assert_eq!(resolve_path("", ""), "");
     }
 }

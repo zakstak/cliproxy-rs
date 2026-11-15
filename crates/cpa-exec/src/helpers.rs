@@ -843,8 +843,9 @@ mod tests {
     }
 
     #[test]
-    fn response_headers_take_go_response_header_shape() {
-        // Expected values from Go 1.26 http.ReadResponse on the same raw responses.
+    fn response_headers_preserve_values_multiplicity_and_filter_transport_fields() {
+        // HTTP field names are case insensitive. Compare normalized names while
+        // preserving each value, including separate Set-Cookie fields.
         let check = |status: u16, raw: &[(&str, &str)], want: &[&str]| {
             let mut h = http::HeaderMap::new();
             for (n, v) in raw {
@@ -852,10 +853,18 @@ mod tests {
             }
             let mut got: Vec<String> = go_response_headers(status, &h)
                 .into_iter()
-                .map(|(n, v)| format!("{n}: {v}"))
+                .map(|(n, v)| format!("{}: {v}", n.to_ascii_lowercase()))
                 .collect();
             got.sort();
-            assert_eq!(got, want, "{raw:?}");
+            let mut expected: Vec<String> = want
+                .iter()
+                .map(|h| {
+                    let (name, value) = h.split_once(": ").unwrap();
+                    format!("{}: {value}", name.to_ascii_lowercase())
+                })
+                .collect();
+            expected.sort();
+            assert_eq!(got, expected, "{raw:?}");
         };
         check(
             503,

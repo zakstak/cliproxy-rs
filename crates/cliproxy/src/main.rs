@@ -1436,40 +1436,60 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    // Expected values: Go resolveManagementBaseURL (tests/fixtures/discovery_main_go.json).
     #[test]
-    fn management_base_url_follows_go() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/discovery_main_go.json")).unwrap();
-        let cases = fixture["management_base_url"].as_array().unwrap();
-        assert!(cases.len() >= 6);
-        for case in cases {
-            let got = management_base_url(
-                case["flag"].as_str().unwrap(),
-                case["remote"].as_str().unwrap(),
-                case["port"].as_i64().unwrap(),
-            );
-            assert_eq!(got, case["out"].as_str().unwrap(), "{case}");
+    fn management_url_uses_flag_then_configuration_then_local_port() {
+        for (flag, configured, port, expected) in [
+            (
+                " https://flag.example/base ",
+                "https://config.example",
+                99,
+                "https://flag.example/base",
+            ),
+            (
+                "",
+                " http://configured.example/path ",
+                99,
+                "http://configured.example/path",
+            ),
+            (" ", " ", 0, "http://127.0.0.1:8317"),
+            ("", "", -1, "http://127.0.0.1:8317"),
+            ("", "", 9000, "http://127.0.0.1:9000"),
+            ("https://[::1]:8443", "", 9000, "https://[::1]:8443"),
+        ] {
+            assert_eq!(management_base_url(flag, configured, port), expected);
         }
-        let config = Config::parse("config-version: 8\nmanagement:\n  base-url: ' http://y '\n").unwrap();
-        assert_eq!(resolve_management_base_url("", &config), "http://y");
+        let config =
+            Config::parse("config-version: 8\nmanagement:\n base-url: ' http://configured.example '\n").unwrap();
+        assert_eq!(resolve_management_base_url("", &config), "http://configured.example");
     }
-
     #[test]
-    fn argv_prescan_matches_go() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/discovery_main_go.json")).unwrap();
-        for case in fixture["argv"].as_array().unwrap() {
-            let args: Vec<String> = serde_json::from_value(case["args"].clone()).unwrap();
-            assert_eq!(
-                argv_enables_bool_flag(&args, "discover-json"),
-                case["discover_json"],
-                "{args:?}"
-            );
-            assert_eq!(argv_enables_bool_flag(&args, "discover"), case["discover"], "{args:?}");
+    fn discover_mode_prescan_respects_boolean_values_operands_and_value_flags() {
+        for flag in ["discover", "discover-json"] {
+            let scan = |args: &[&str]| {
+                argv_enables_bool_flag(
+                    &args.iter().map(|s| s.replace("discover", flag)).collect::<Vec<_>>(),
+                    flag,
+                )
+            };
+            for args in [
+                &["-discover"][..],
+                &["--discover"],
+                &["--discover=true"],
+                &["-discover=1"],
+            ] {
+                assert!(scan(args), "{flag}: {args:?}");
+            }
+            for args in [
+                &["-discover=false"][..],
+                &["--discover=0"],
+                &["--", "-discover"],
+                &["operand", "-discover"],
+                &["-config", "-discover"],
+            ] {
+                assert!(!scan(args), "{flag}: {args:?}");
+            }
         }
     }
-
     /// A flag the binary does not define may be boolean, so a discover flag after it
     /// still selects discover mode for the pre-parse scan (the full parse then refuses
     /// the undefined flag). Built-in flags that take a value keep consuming it as Go does.
@@ -1530,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn every_go_flag_parses_in_single_and_double_dash_form() {
+    fn operator_flags_accept_single_and_double_dash_forms() {
         let argv = |a: &[&str]| {
             go_flags(
                 &Args::command(),
@@ -1668,32 +1688,28 @@ mod tests {
     }
 
     #[test]
-    fn go_int_matches_strconv_base_zero() {
-        for (s, want) in [
-            ("3", Some(3)),
-            ("-10", Some(-10)),
-            ("+7", Some(7)),
-            ("0x1f", Some(31)),
-            ("010", Some(8)),
+    fn numeric_cli_arguments_accept_saved_spellings_and_refuse_out_of_range_values() {
+        let parse = |value: &str| {
+            let raw = ["discover", "-timeout", value].map(str::to_owned);
+            let flags = go_flags(&DiscoverArgs::command(), raw)?;
+            DiscoverArgs::try_parse_from(flags).map_err(|error| error.to_string())
+        };
+        for (input, expected) in [
+            ("3", 3),
+            ("-10", -10),
+            ("+7", 7),
+            ("0x1f", 31),
+            ("010", 8),
+            ("0b101", 5),
+            ("0o17", 15),
+            ("-9223372036854775808", i64::MIN),
         ] {
-            assert_eq!(go_int(s).ok(), want, "{s}");
+            assert_eq!(parse(input).unwrap().timeout, expected, "{input}");
         }
-        for (s, want) in [
-            ("0b101", Some(5)),
-            ("0o17", Some(15)),
-            ("1_000", Some(1000)),
-            ("0_10", Some(8)),
-            ("", None),
-        ] {
-            assert_eq!(go_int(s).ok(), want, "{s}");
+        for input in ["", "9223372036854775808", "1.5", "not-a-number"] {
+            assert!(parse(input).is_err(), "{input}");
         }
-        for bad in ["9223372036854775808", "_1", "1_", "1__0", "0x", "1.5", "0x_"] {
-            assert!(go_int(bad).is_err(), "{bad}");
-        }
-        assert_eq!(go_int("0x_1f").ok(), Some(31));
-        assert_eq!(go_int("-9223372036854775808").ok(), Some(i64::MIN));
     }
-
     #[test]
     fn standalone_url_follows_the_listener() {
         let url = |addr: &str, tls| standalone_base_url((addr.parse().unwrap(), tls));

@@ -403,7 +403,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn atoi_follows_go() {
+    fn integer_input_accepts_decimal_signs_and_refuses_overflow() {
         assert_eq!(atoi("12"), Some(12));
         assert_eq!(atoi("-3"), Some(-3));
         assert_eq!(atoi("+4"), Some(4));

@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn providers_fold_like_go() {
+    fn removed_provider_names_accept_operator_aliases() {
         for name in [
             "kimi",
             " KIMI.com ",

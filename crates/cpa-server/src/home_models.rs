@@ -281,8 +281,16 @@ pub(crate) fn grok(entries: &[Entry]) -> String {
 mod tests {
     use super::*;
 
+    // Generated client JSON is a schema contract; member order and escape spelling are not.
+    fn assert_json(actual: impl AsRef<str>, expected: impl AsRef<str>) {
+        let actual: serde_json::Value = serde_json::from_str(actual.as_ref()).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(expected.as_ref()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
-    fn decode_merges_sections_and_sorts_like_go() {
+    // Product policy: Home catalog sections merge by model identity, retain capability values and reject unusable envelopes; rendering is asserted separately as JSON meaning.
+    fn home_catalog_sections_merge_by_identity_and_retain_capabilities() {
         let raw = br#"{"Codex":[{"id":"gpt-5","owned_by":"openai","created":5,"context_length":"400000"}],"claude":[{"id":"gpt-5"},{"name":"models/claude-x","displayName":"Claude X","max_tokens":9}],"x":[{"id":""}]}"#;
         let entries = decode(raw).unwrap();
         assert_eq!(
@@ -361,15 +369,15 @@ mod tests {
     }
 
     #[test]
-    fn renderers_follow_go_shapes() {
+    fn home_models_render_client_json_schemas() {
         let entries = decode(br#"{"xai":[{"id":"grok-4","display_name":"Grok 4","context_length":256000,"owned_by":"xai"},{"id":"g2"}]}"#).unwrap();
-        assert_eq!(
+        assert_json(
             openai(&entries),
-            r#"{"data":[{"id":"g2","object":"model"},{"id":"grok-4","object":"model","owned_by":"xai"}],"object":"list"}"#
+            r#"{"data":[{"id":"g2","object":"model"},{"id":"grok-4","object":"model","owned_by":"xai"}],"object":"list"}"#,
         );
-        assert_eq!(
+        assert_json(
             grok(&entries),
-            r#"{"object":"list","data":[{"id":"g2","model":"g2","name":"g2","api_backend":"responses","supported_in_api":true},{"id":"grok-4","model":"grok-4","name":"Grok 4","context_window":256000,"api_backend":"responses","supported_in_api":true}]}"#
+            r#"{"object":"list","data":[{"id":"g2","model":"g2","name":"g2","api_backend":"responses","supported_in_api":true},{"id":"grok-4","model":"grok-4","name":"Grok 4","context_window":256000,"api_backend":"responses","supported_in_api":true}]}"#,
         );
         assert_eq!(
             error_envelope(br#"{"error":{"type":"no_credentials"}}"#),

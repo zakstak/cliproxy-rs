@@ -1,0 +1,2044 @@
+{
+  "provenance": {
+    "kind": "historical-inputs-only",
+    "source": "ws_e2e.json at f6bff59c4c1646747caced0fbb08388fd66626e0",
+    "recorded_from": "CLIProxyAPI 6fecc6e with ae3ee3be additions; see README.md",
+    "scope": "Client messages and scripted local peer replies only. No recorded proxy output or captured requests."
+  },
+  "scenarios": [
+    {
+      "name": "ws_two_turns",
+      "config": "host: \"\"\n",
+      "client_headers": {
+        "session_id": "sess-ws",
+        "x-codex-turn-state": "ts-1"
+      },
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hel\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_hello\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"previous_response_id\":\"{{last_response_id}}\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"more\"}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_more\",\"content\":[{\"type\":\"output_text\",\"text\":\"more\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "http_incremental",
+      "config": "host: \"\"\n",
+      "client_headers": {
+        "session_id": "sess-http"
+      },
+      "credentials": [
+        {
+          "id": "codex-http.json",
+          "attributes": {
+            "api_key": "sk-fake-http"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_hello\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"call a tool\"}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":1}\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.append\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"42\"}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r3\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_done\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r3\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "previous_not_found_then_create",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-http.json",
+          "attributes": {
+            "api_key": "sk-fake-http"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"previous_response_id\":\"r0\",\"input\":[]}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.bogus\"}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":\"text\"}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"ok\"}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_ok\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "prewarm_then_followup",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-http.json",
+          "attributes": {
+            "api_key": "sk-fake-http"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"generate\":false,\"instructions\":\"warm\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"setup\"}]}]}",
+          "read": "completed"
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"previous_response_id\":\"{{last_response_id}}\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"go\"}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_went\",\"content\":[{\"type\":\"output_text\",\"text\":\"went\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ws_request_fault_exposed",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"huge\"}]}]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ws_request_fault_headers",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"huge\"}]}]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\",\"message\":\"too long\"},\"headers\":{\"x-request-id\":\"req-1\"}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ws_quota_silent_close",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"error\",\"status\":429,\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"limit\",\"resets_in_seconds\":60}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ws_continuation_needs_replay",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        },
+        {
+          "id": "codex-http.json",
+          "attributes": {
+            "api_key": "sk-fake-http"
+          },
+          "models": [
+            "gpt-other"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_hello\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-other\",\"previous_response_id\":\"{{last_response_id}}\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"switch\"}]}]}",
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "ws_upstream_closes_between_turns",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_hello\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ],
+              "then": "close"
+            }
+          ]
+        },
+        {
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "ws_upstream_message_too_big",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ],
+              "then": "close1009"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ws_upstream_message_too_big_spaced_reason",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ],
+              "then": "close1009_spaced"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "http_stream_ends_early",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-http.json",
+          "attributes": {
+            "api_key": "sk-fake-http"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_partial\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ws_multi_agent_v2",
+      "config": "host: \"\"\nclient:\n  codex:\n    optimize-multi-agent-v2: true\ncodex:\n  orphan-delegation-compatibility: true\n",
+      "client_headers": {
+        "User-Agent": "codex_cli_rs/0.150.0 (Linux; x86_64)",
+        "X-Openai-Subagent": "collab_spawn",
+        "session_id": "sess-ma"
+      },
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"orphan\",\"name\":\"create_thread\",\"namespace\":\"codex_app\",\"output\":\"thread ok\"},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"delegate\"}]}],\"tools\":[{\"type\":\"namespace\",\"name\":\"collaboration\",\"tools\":[{\"type\":\"function\",\"name\":\"spawn_agent\",\"description\":\"Spawns an agent.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\",\"encrypted\":true}}}}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_s\",\"call_id\":\"call_s\",\"namespace\":\"collaboration-optimize\",\"name\":\"spawn_agent\",\"arguments\":\"{\\\"message\\\":\\\"go\\\"}\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "http_multi_agent_v2",
+      "config": "host: \"\"\nclient:\n  codex:\n    optimize-multi-agent-v2: true\ncodex:\n  orphan-delegation-compatibility: true\n",
+      "client_headers": {
+        "User-Agent": "codex_cli_rs/0.150.0 (Linux; x86_64)",
+        "X-Openai-Subagent": "collab_spawn",
+        "session_id": "sess-ma"
+      },
+      "credentials": [
+        {
+          "id": "codex-http.json",
+          "attributes": {
+            "api_key": "sk-fake-http"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"orphan\",\"name\":\"create_thread\",\"namespace\":\"codex_app\",\"output\":\"thread ok\"},{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"delegate\"}]}],\"tools\":[{\"type\":\"namespace\",\"name\":\"collaboration\",\"tools\":[{\"type\":\"function\",\"name\":\"spawn_agent\",\"description\":\"Spawns an agent.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\",\"encrypted\":true}}}}]}]}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_s\",\"call_id\":\"call_s\",\"namespace\":\"collaboration-optimize\",\"name\":\"spawn_agent\",\"arguments\":\"{\\\"message\\\":\\\"go\\\"}\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_successor",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"one\"}",
+          "read": "none",
+          "upstream": [
+            {}
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"two\"}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s2\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.incomplete\",\"response\":{\"id\":\"r1\",\"incomplete_details\":{\"reason\":\"steered\"},\"output\":[]}}",
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_STEER_OK\",\"content\":[{\"type\":\"output_text\",\"text\":\"STEER_OK\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_tool_pending",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"one\"}",
+          "read": "none",
+          "upstream": [
+            {}
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"two\"}",
+          "read": "until:response.steer.pending",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s2\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call1\",\"name\":\"lookup\",\"arguments\":\"{}\"}]}}",
+                "{\"type\":\"response.steer.pending\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"},\"reason\":\"waiting_for_required_input\",\"required_input\":[{\"type\":\"function_call_output\",\"call_id\":\"call1\",\"name\":\"lookup\"}]}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"previous_response_id\":\"r1\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"call1\",\"output\":\"found\"}]}",
+          "read": "until:response.completed@r2",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_STEER_OK\",\"content\":[{\"type\":\"output_text\",\"text\":\"STEER_OK\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_disconnect_accepted",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"one\"}",
+          "read": "none",
+          "upstream": [
+            {}
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"two\"}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s2\",\"previous_response_id\":\"r1\"}}"
+              ],
+              "then": "close"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_local_validation",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "none",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{",
+          "read": "until:error"
+        },
+        {
+          "send": "{\"type\":\"unsupported.request\"}",
+          "read": "until:error"
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"steering_id\":\"corrected\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"continue\"}]}]}",
+          "read": "until:response.completed@first",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"corrected\",\"previous_response_id\":\"first\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}",
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"steered\",\"previous_response_id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"steered\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed@second",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"second\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"second\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_later_error_recovers",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"INITIAL\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"REJECTED\",\"input\":[]}",
+          "read": "until:error",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"error\",\"status\":400,\"event_id\":\"rejected-create\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Correct the request\"}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"CORRECTED\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"corrected\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_RECOVERED\",\"content\":[{\"type\":\"output_text\",\"text\":\"RECOVERED\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"corrected\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_initial_error_terminal",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"INITIAL\",\"input\":[]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"error\",\"status\":400,\"event_id\":\"rejected-create\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Correct the request\"}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_later_error_then_upstream_close",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"INITIAL\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"REJECTED\",\"input\":[]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"error\",\"status\":400,\"event_id\":\"rejected-create\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Correct the request\"}}"
+              ],
+              "then": "close"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_historical_oauth_path_steers_api_key",
+      "config": "host: \"\"\noauth:\n  providers:\n    codex:\n      response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"INITIAL\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"REJECTED\",\"input\":[]}",
+          "read": "until:error",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"error\",\"status\":400,\"event_id\":\"rejected-create\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Correct the request\"}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"CORRECTED\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"corrected\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_RECOVERED\",\"content\":[{\"type\":\"output_text\",\"text\":\"RECOVERED\"}]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"corrected\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_idle_upstream_close",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ],
+              "then": "close"
+            }
+          ]
+        },
+        {
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "steer_idle_upstream_close_legacy_disabled",
+      "config": "host: \"\"\ncodex:\n  response-steering: false\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ],
+              "then": "close"
+            }
+          ]
+        },
+        {
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "steer_idle_upstream_close_v8_api_key",
+      "config": "host: \"\"\noauth:\n  providers:\n    codex:\n      response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ],
+              "then": "close"
+            }
+          ]
+        },
+        {
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "steer_idle_upstream_close_v8_oauth",
+      "config": "host: \"\"\noauth:\n  providers:\n    codex:\n      response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-oauth.json",
+          "attributes": {
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-6-astra"
+          ],
+          "metadata": {
+            "access_token": "fake-oauth-token"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-6-astra\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ],
+              "then": "close"
+            }
+          ]
+        },
+        {
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "steer_idle_upstream_close_upstream_api_key",
+      "config": "host: \"\"\nupstream:\n  codex:\n    response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ],
+              "then": "close"
+            }
+          ]
+        },
+        {
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "steer_idle_upstream_close_upstream_oauth",
+      "config": "host: \"\"\nupstream:\n  codex:\n    response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-oauth.json",
+          "attributes": {
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-6-astra"
+          ],
+          "metadata": {
+            "access_token": "fake-oauth-token"
+          }
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-6-astra\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ],
+              "then": "close"
+            }
+          ]
+        },
+        {
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "steer_disabled_error_terminal",
+      "config": "host: \"\"\ncodex:\n  response-steering: false\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"INITIAL\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"REJECTED\",\"input\":[]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"error\",\"status\":400,\"event_id\":\"rejected-create\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Correct the request\"}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_in_flight",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"Focus on networking\"}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_disconnect_pending",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"one\"}",
+          "read": "none",
+          "upstream": [
+            {}
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"two\"}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s2\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call1\",\"name\":\"lookup\",\"arguments\":\"{}\"}]}}",
+                "{\"type\":\"response.steer.pending\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"},\"reason\":\"waiting_for_required_input\",\"required_input\":[{\"type\":\"function_call_output\",\"call_id\":\"call1\",\"name\":\"lookup\"}]}"
+              ],
+              "then": "drop"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_append_inherits",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"instructions\":\"Initial system instructions\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.append\",\"input\":[{\"role\":\"user\",\"content\":\"turn 2\"}]}",
+          "read": "until:response.completed@r2",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_queued_create_then_steer",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"steer 1\"}",
+          "read": "until:response.created@auto-1",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.incomplete\",\"response\":{\"id\":\"r1\",\"output\":[],\"incomplete_details\":{\"reason\":\"steered\"}}}",
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"auto-1\",\"previous_response_id\":\"r1\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"previous_response_id\":\"auto-1\",\"input\":[{\"role\":\"user\",\"content\":\"queued next\"}]}",
+          "read": "none"
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"auto-1\",\"input\":\"steer 2 in flight\"}",
+          "read": "until:response.completed@r2",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s2\",\"previous_response_id\":\"auto-1\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"auto-1\",\"output\":[]}}",
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"auto-2\",\"previous_response_id\":\"auto-1\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"auto-2\",\"output\":[]}}"
+              ]
+            },
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_active_failure_keeps_queued_create",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed@good",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.failed\",\"response\":{\"id\":\"first\",\"output\":[],\"error\":{\"type\":\"invalid_request_error\",\"message\":\"rejected\"}}}",
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"good\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"good\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_ambiguous_failure_ends_the_socket",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.failed\",\"response\":{\"id\":\"\",\"output\":[],\"error\":{\"type\":\"invalid_request_error\",\"message\":\"rejected\"}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_later_credential_failure",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"first\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"first\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"error\",\"status\":401,\"headers\":{\"X-Request-Id\":\"later-rejection\"},\"error\":{\"type\":\"authentication_error\",\"status\":401,\"message\":\"credential rejected\",\"resets_in_seconds\":3600}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_later_quota_failure",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"started\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "close",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.failed\",\"response\":{\"id\":\"started\",\"error\":{\"type\":\"usage_limit_reached\",\"status\":429,\"message\":\"credential rejected\",\"resets_in_seconds\":3600}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_wrong_parent_rejected",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"one\"}",
+          "read": "until:response.steer.pending",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.steer.accepted\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call1\",\"name\":\"lookup\",\"arguments\":\"{}\"}]}}",
+                "{\"type\":\"response.steer.pending\",\"steer\":{\"id\":\"s1\",\"previous_response_id\":\"r1\"},\"reason\":\"waiting_for_required_input\",\"required_input\":[{\"type\":\"function_call_output\",\"call_id\":\"call1\",\"name\":\"lookup\"}]}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"previous_response_id\":\"other\",\"input\":[]}",
+          "read": "until:error"
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"previous_response_id\":\"r1\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"call1\",\"output\":\"found\"}]}",
+          "read": "until:response.completed@r2",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "steer_model_switch_needs_replay",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-other\",\"input\":[]}",
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "steer_credential_disabled",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "disable": true,
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"must not be sent\"}",
+          "read": "close"
+        }
+      ]
+    },
+    {
+      "name": "steer_rejected_when_disabled",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"previous_response_id\":\"r1\",\"input\":\"one\"}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.steer\",\"input\":\"one\"}",
+          "read": "one"
+        }
+      ]
+    },
+    {
+      "name": "http_upstream_400_exposed",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-http.json",
+          "attributes": {
+            "api_key": "sk-fake-http"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "close",
+          "upstream": [
+            {
+              "status": 400,
+              "body": "{\"error\":{\"message\":\"bad input\",\"type\":\"invalid_request_error\",\"code\":\"invalid_value\"}}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "interrupt_in_flight",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.interrupt\"}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r1\",\"mode\":\"discard_partial_items\",\"extension\":\"keep\"}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":42}",
+          "read": "one"
+        },
+        {
+          "disable": true,
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r1\",\"mode\":\"discard_partial_items\",\"extension\":\"keep\"}",
+          "read": "one"
+        },
+        {
+          "enable": true,
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r1\",\"mode\":\"discard_partial_items\",\"extension\":\"keep\"}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.incomplete\",\"response\":{\"id\":\"r1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"interrupted\"},\"usage\":{\"output_tokens\":7},\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"previous_response_id\":\"r1\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "interrupt_in_flight_steering",
+      "config": "host: \"\"\ncodex:\n  response-steering: true\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.interrupt\"}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r1\",\"mode\":\"discard_partial_items\",\"extension\":\"keep\"}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":42}",
+          "read": "one"
+        },
+        {
+          "disable": true,
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r1\",\"mode\":\"discard_partial_items\",\"extension\":\"keep\"}",
+          "read": "one"
+        },
+        {
+          "enable": true,
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r1\",\"mode\":\"discard_partial_items\",\"extension\":\"keep\"}",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.incomplete\",\"response\":{\"id\":\"r1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"interrupted\"},\"usage\":{\"output_tokens\":7},\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"previous_response_id\":\"r1\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "interrupt_http_local",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-http.json",
+          "attributes": {
+            "api_key": "sk-fake-http"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}]}",
+          "read": "until:response.output_item.done",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r-http\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"msg_partial\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}}"
+              ],
+              "then": "hold"
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r-http\",\"mode\":\"discard_partial_items\"}",
+          "read": "completed"
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r-http\"}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"previous_response_id\":\"r-http\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"next\"}]}]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "interrupt_binary_frame",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.created",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send_hex": "7b2274797065223a22726573706f6e73652e696e74657272757074222c22726573706f6e73655f6964223a227231222c22657874656e73696f6e223a22ff227d",
+          "read": "completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.incomplete\",\"response\":{\"id\":\"r1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"interrupted\"},\"output\":[]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "interrupt_late_ws",
+      "config": "host: \"\"\n",
+      "credentials": [
+        {
+          "id": "codex-ws.json",
+          "attributes": {
+            "api_key": "sk-fake-ws",
+            "websockets": "true"
+          },
+          "models": [
+            "gpt-fixture"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"input\":[]}",
+          "read": "until:response.completed",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"unknown\"}",
+          "read": "one"
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r1\",\"mode\":\"discard_partial_items\"}",
+          "read": "none"
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"previous_response_id\":\"r1\",\"input\":[]}",
+          "read": "until:response.created@r2",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r2\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r1\",\"mode\":\"discard_partial_items\"}",
+          "read": "none"
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r1\",\"mode\":\"discard_partial_items\"}",
+          "read": "none"
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r2\",\"mode\":\"discard_partial_items\"}",
+          "read": "until:response.completed@r2",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "send": "{\"type\":\"response.interrupt\",\"response_id\":\"r2\"}",
+          "read": "none"
+        },
+        {
+          "send": "{\"type\":\"response.create\",\"model\":\"gpt-fixture\",\"previous_response_id\":\"r2\",\"input\":[]}",
+          "read": "until:response.completed@r3",
+          "upstream": [
+            {
+              "events": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"r3\",\"status\":\"in_progress\",\"output\":[]}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r3\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

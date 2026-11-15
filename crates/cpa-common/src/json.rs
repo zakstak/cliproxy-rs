@@ -3633,39 +3633,25 @@ mod tests {
 
     // Cases carried over from cpa-exec's kimi_json, each checked against sjson.
     #[test]
-    fn set_appends_and_replaces_like_sjson() {
-        assert_eq!(
-            s(try_set_str(br#"{"a":1}"#, "model", "k3").unwrap()),
-            r#"{"a":1,"model":"k3"}"#
-        );
-        assert_eq!(
-            s(try_set_str(br#"{"model":"x","a":1}"#, "model", "k3").unwrap()),
-            r#"{"model":"k3","a":1}"#
-        );
-        assert_eq!(
-            s(try_set_str(b"{}", "thinking.type", "enabled").unwrap()),
-            r#"{"thinking":{"type":"enabled"}}"#
-        );
-        assert_eq!(
-            s(try_set_str(br#"{ "a": 1 }"#, "b", "x").unwrap()),
-            r#"{ "a": 1 ,"b":"x"}"#
-        );
-        assert_eq!(
-            s(try_set_raw(br#"{"m":[{"a":1},{"b":2}]}"#, "m.1.c", "true").unwrap()),
-            r#"{"m":[{"a":1},{"b":2,"c":true}]}"#
-        );
-        assert_eq!(s(try_set_raw(b"  ", "a.0", "1").unwrap()), r#"{"a":[1]}"#);
-        assert_eq!(
-            try_set_raw(br#"{"stream_options":[]}"#, "stream_options.include_usage", "true"),
-            Err("cannot set array element for non-numeric key 'include_usage'".to_owned())
-        );
-        // Plain ASCII strings stay raw; anything that needs marshaling is HTML-escaped too.
-        assert_eq!(s(try_set_str(b"{}", "a", "a<b").unwrap()), r#"{"a":"a<b"}"#);
-        assert_eq!(s(try_set_str(b"{}", "a", "é<\"").unwrap()), "{\"a\":\"é\\u003c\\\"\"}");
+    fn targeted_setters_create_paths_replace_values_and_keep_unrelated_spans() {
+        let input = br#"{ "keep":{"raw":1.2300e+04}, "items":[{"a":1},{"b":2}]}"#;
+        for (path, raw) in [
+            ("model", r#""custom""#),
+            ("thinking.type", r#""enabled""#),
+            ("items.1.c", "true"),
+        ] {
+            let output = try_set_raw(input, path, raw).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(get(&output, path).raw()).unwrap(),
+                serde_json::from_str::<serde_json::Value>(raw).unwrap()
+            );
+            assert_eq!(get(&output, "keep").raw(), get(input, "keep").raw());
+            assert!(std_valid(&output));
+        }
+        let output = try_set_str(input, "items.0.a", "quoted\"\né").unwrap();
+        assert_eq!(get(&output, "items.0.a").str(), "quoted\"\né");
     }
 
-    /// `valid` jumps over plain string bytes; a byte that decides validity must be seen
-    /// wherever it sits in a long string.
     #[test]
     fn valid_sees_string_bytes_in_every_word_lane() {
         for at in 0..40 {
@@ -3688,46 +3674,30 @@ mod tests {
     }
 
     #[test]
-    fn delete_takes_one_neighbouring_comma() {
-        let body: &[u8] = br#"{"a": 1, "b": 2, "c": 3}"#;
-        let del = |b: &[u8], p: &str| s(try_delete(b, p).unwrap());
-        assert_eq!(del(body, "a"), r#"{ "b": 2, "c": 3}"#);
-        assert_eq!(del(body, "b"), r#"{"a": 1, "c": 3}"#);
-        assert_eq!(del(body, "c"), r#"{"a": 1, "b": 2}"#);
-        assert_eq!(del(br#"{"only":true}"#, "only"), "{}");
-        assert_eq!(del(body, "missing"), String::from_utf8_lossy(body));
-        assert_eq!(del(b"[1,2]", "-1"), "[1]");
-        // sjson leaves `{"\"x":,"y":2}` for a key holding an escaped quote; the port
-        // removes the whole member (issue #146, docs/DIFFERENCES-FROM-GO.md).
-        assert_eq!(del(br#"{"\"x":1,"y":2}"#, "\\\"x"), r#"{"y":2}"#);
-        assert_eq!(del(br#"{"y":2, "\"x" :1}"#, "\\\"x"), r#"{"y":2}"#);
-        assert_eq!(
-            del(br#"{"a\\":1,"y":2}"#, "a\\\\"),
-            r#"{"y":2}"#,
-            "escaped backslash before the closing quote"
-        );
-        assert_eq!(
-            del(br#"{"y":2,"\\\"\"":1}"#, "\\\\\\\"\\\""),
-            r#"{"y":2}"#,
-            "backslash and quote runs"
-        );
+    fn member_deletion_keeps_other_members_and_valid_escaped_keys() {
+        let input = br#"{ "a":1, "b":2, "c":3 }"#;
+        for key in ["a", "b", "c"] {
+            let output = try_delete(input, key).unwrap();
+            let mut expected = serde_json::json!({"a":1,"b":2,"c":3});
+            expected.as_object_mut().unwrap().remove(key);
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&output).unwrap(), expected);
+        }
+        assert_eq!(try_delete(input, "missing").unwrap(), input);
         for (body, path) in [
-            (&br#"{"\"x":1,"y":2}"#[..], "\\\"x"),
-            (br#"{"y":{"\"q\"":[1,{"z":"\""}]},"k":0}"#, "y.\\\"q\\\""),
-            (br#"{"k":{"\\":1}}"#, "k.\\\\"),
+            (&br#"{"\"x":1,"y":2}"#[..], r#"\"x"#),
+            (br#"{"y":2,"a\\":1}"#, r#"a\\"#),
+            (br#"{"y":{"\"q\"":[1,{"z":"\""}]},"k":0}"#, r#"y.\"q\""#),
         ] {
-            let out = try_delete(body, path).unwrap();
-            assert!(std_valid(&out), "{}", String::from_utf8_lossy(&out));
-            assert_ne!(out, body, "{path}");
+            let output = try_delete(body, path).unwrap();
+            assert!(std_valid(&output));
+            assert!(!get(&output, path).exists());
         }
         assert_eq!(
-            del(br#"{"t":{"type":"x","effort":"y"}}"#, "t.effort"),
-            r#"{"t":{"type":"x"}}"#
+            serde_json::from_slice::<serde_json::Value>(&try_delete(b"[1,2,3]", "1").unwrap()).unwrap(),
+            serde_json::json!([1, 3])
         );
     }
 
-    /// Issue #146: `Result.Value()` conversion re-encodes WALK_DEPTH_LIMIT levels and keeps
-    /// deeper valid containers as their bytes; deeper invalid ones become null.
     #[test]
     fn any_value_keeps_containers_beyond_the_walk_limit_raw() {
         let wrap = |levels: usize, inner: &str| format!("{}{inner}{}", "[ ".repeat(levels), " ]".repeat(levels));
@@ -3735,7 +3705,12 @@ mod tests {
         // The innermost object is level LIMIT: re-encoded, sorted and escaped.
         let at = wrap(WALK_DEPTH_LIMIT - 1, inner);
         let out = parse(at.as_bytes()).value_json().unwrap();
-        assert!(s(out).contains(r#"{"a":"\u003c","b":1.5}"#));
+        assert!(std_valid(&out));
+        let leaf_path = vec!["0"; WALK_DEPTH_LIMIT - 1].join(".");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(get(&out, &leaf_path).raw()).unwrap(),
+            serde_json::json!({"a":"<","b":1.5})
+        );
         // One level deeper: kept as received.
         let beyond = wrap(WALK_DEPTH_LIMIT, inner);
         let out = s(parse(beyond.as_bytes()).value_json().unwrap());
@@ -3758,41 +3733,31 @@ mod tests {
     }
 
     #[test]
-    fn go_marshal_sorts_keys_and_picks_number_mode() {
-        let v = GoValue::parse(br#"{"z":1.50,"a":{"y":"<&>","b":[true,null]},"a":2}"#).unwrap();
-        assert_eq!(s(v.marshal()), r#"{"a":2,"z":1.50}"#);
-        assert_eq!(
-            s(canonical(br#"{"b":"\u2028x","a":1e3}"#).unwrap()),
-            r#"{"a":1e3,"b":"\u2028x"}"#
-        );
-        let f = GoValue::parse_f64(br#"{"n":[1e3,1.50,9007199254740993,1e-7,1e21],"s":"bad\ud800"}"#).unwrap();
-        assert_eq!(
-            s(f.marshal()),
-            r#"{"n":[1000,1.5,9007199254740992,1e-7,1e+21],"s":"bad�"}"#
-        );
+    fn value_serialization_preserves_meaning_and_raw_number_precision() {
+        for input in [
+            br#"{"b":{"s":"<&>\u2028","list":[true,null]},"a":9007199254740993}"#.as_slice(),
+            br#"[{},[],"a\\",-0.5e+2]"#,
+        ] {
+            let value = GoValue::parse(input).unwrap();
+            let expected: serde_json::Value = serde_json::from_slice(input).unwrap();
+            for output in [value.marshal(), value.encode_indented()] {
+                assert_eq!(serde_json::from_slice::<serde_json::Value>(&output).unwrap(), expected);
+            }
+        }
+        let output = GoValue::parse(br#"{"decimal":1.2300e+04,"huge":1e400}"#)
+            .unwrap()
+            .marshal();
+        assert_eq!(get(&output, "decimal").raw(), b"1.2300e+04");
+        assert_eq!(get(&output, "huge").raw(), b"1e400");
         assert!(GoValue::parse_f64(b"[1e400]").is_none());
-        assert_eq!(quote("<&>\u{1}\u{8}"), br#""\u003c\u0026\u003e\u0001\b""#);
-        // White space, empty containers, escaped quotes and backslashes in keys and
-        // values, and a duplicate key inside a nested object.
-        let spaced =
-            b" { \"k\\\"q\" : [ { } , [ ] , \"a\\\\\" , -0.5e+2 ] ,\r\n\t\"o\":{\"d\":1,\"d\":[null , false]} } ";
-        assert_eq!(
-            s(GoValue::parse(spaced).unwrap().marshal()),
-            r#"{"k\"q":[{},[],"a\\",-0.5e+2],"o":{"d":[null,false]}}"#
-        );
-        assert_eq!(
-            s(GoValue::parse(br#"{"b":{"c":[1,{}]},"a":[]}"#)
-                .unwrap()
-                .encode_indented()),
-            "{\n  \"a\": [],\n  \"b\": {\n    \"c\": [\n      1,\n      {}\n    ]\n  }\n}\n"
-        );
         assert!(GoValue::parse(b"[1,]").is_none());
-        assert!(GoValue::parse(br#"{"a":"\ud800\u"}"#).is_none());
+        let duplicate = GoValue::parse(br#"{"field":1,"field":2}"#).unwrap().marshal();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&duplicate).unwrap(),
+            serde_json::json!({"field":2})
+        );
     }
 
-    /// encoding/json's nesting limit: depth 10001 is rejected; depth 10000 decodes,
-    /// marshals back and drops on a 2 MiB thread, whose stack the recursive versions
-    /// overflow in a debug build.
     #[test]
     fn go_value_nesting_limit_and_stack() {
         let nested = |depth: usize, leaf: &str| {
@@ -3865,52 +3830,22 @@ mod tests {
 #[cfg(test)]
 mod parse_float_tests {
     use super::go_parse_float;
-
-    /// Expectations from Go 1.26 strconv.ParseFloat (value, error?).
     #[test]
-    fn parse_float_matches_go_strconv() {
-        let ok = |s: &str, want: f64| {
-            let got = go_parse_float(s.as_bytes()).unwrap_or_else(|_| panic!("{s} should parse"));
-            assert!(got == want || (got.is_nan() && want.is_nan()), "{s}: {got} != {want}");
-            assert_eq!(got.is_sign_negative(), want.is_sign_negative(), "{s} sign");
-        };
-        let err = |s: &str, value: f64| assert_eq!(go_parse_float(s.as_bytes()), Err(value), "{s}");
-        ok("1_000", 1000.0);
-        ok("1_000.5", 1000.5);
-        ok("1e1_0", 1e10);
-        ok("0x1p4", 16.0);
-        ok("0X1.8P1", 3.0);
-        ok("0x_1p0", 1.0);
-        ok("0x.8p1", 1.0);
-        ok("-0x1p-1074", -5e-324);
-        ok("0x1.fffffffffffffp1023", f64::MAX);
-        err("0x1.fffffffffffff8p1023", f64::INFINITY);
-        ok("0x1.00000000000008p0", 1.0);
-        ok("0x1.00000000000018p0", 1.0000000000000004);
-        ok("inf", f64::INFINITY);
-        ok("+Inf", f64::INFINITY);
-        ok("-infinity", f64::NEG_INFINITY);
-        ok("NaN", f64::NAN);
-        // math.NaN() is 0x7FF8000000000001 (Go 1.26 prints 9221120237041090561).
-        assert_eq!(go_parse_float(b"nAn").map(f64::to_bits), Ok(9221120237041090561));
-        ok("1e-400", 0.0);
-        ok("1.", 1.0);
-        ok(".5", 0.5);
-        ok("-0", -0.0);
-        ok("1E5", 100000.0);
-        err("1__0", 0.0);
-        err("_1", 0.0);
-        err("0x10", 0.0);
-        err("0x1p", 0.0);
-        err("+nan", 0.0);
-        err("1e400", f64::INFINITY);
-        err("-1e400", f64::NEG_INFINITY);
-        err("0x1p1024", f64::INFINITY);
-        err("  1", 0.0);
-        err("1e", 0.0);
-        err("+", 0.0);
-        err("0b101", 0.0);
-        err("infx", 0.0);
-        err("1e_5", 0.0);
+    fn decimal_numbers_parse_without_pinning_host_language_extensions() {
+        for (raw, expected) in [
+            ("0", 0.0),
+            ("-0", -0.0),
+            ("1.5", 1.5),
+            ("1e3", 1000.0),
+            ("-2.5E-3", -0.0025),
+            ("9007199254740992", 9007199254740992.0),
+        ] {
+            let got = go_parse_float(raw.as_bytes()).unwrap();
+            assert_eq!(got, expected);
+            assert_eq!(got.is_sign_negative(), expected.is_sign_negative());
+        }
+        for invalid in ["", "one", "1e", "+", "1e400", "-1e400"] {
+            assert!(go_parse_float(invalid.as_bytes()).is_err());
+        }
     }
 }

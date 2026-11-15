@@ -1,0 +1,677 @@
+{
+  "_provenance": "Historical client request and synthetic mock-reply inputs extracted from codex_go.json (6fecc6e) plus codex_go_v8.0.35.json. Not first-party provider evidence. No recorded proxy output is retained. Rust tests independently assert CONTRACT.md and local behavior.",
+  "executor": [
+    {
+      "name": "oauth_stream_native",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {
+        "Authorization": "Bearer client-key-FAKE",
+        "Originator": "codex_cli_rs",
+        "Session_id": "sess-FAKE",
+        "User-Agent": "codex_cli_rs/0.150.0 (Linux; x86_64)",
+        "Version": "0.150.0",
+        "X-Client-Request-Id": "req-FAKE",
+        "X-Codex-Beta-Features": "beta-a",
+        "X-Codex-Turn-Metadata": "{\"turn\":1}"
+      },
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}],\"tools\":[{\"type\":\"function\",\"name\":\"shell\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"high\",\"summary\":\"auto\"},\"store\":false,\"stream\":true,\"include\":[\"reasoning.encrypted_content\"],\"prompt_cache_key\":\"pck-FAKE\",\"previous_response_id\":\"resp_0\",\"safety_identifier\":\"sid\",\"prompt_cache_retention\":\"24h\",\"stream_options\":{\"include_obfuscation\":false,\"reasoning_summary_delivery\":\"inline\"},\"service_tier\":\"priority\"}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "oauth_nonstream_no_instructions_free_plan",
+      "config": "{}\n",
+      "attributes": {
+        "plan_type": "free"
+      },
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"hi\"}],\"parallel_tool_calls\":true}",
+      "stream": false,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "apikey_stream_cloak_disabled_headers",
+      "config": "codex:\n  disable-codex-cloaking: true\n",
+      "attributes": {
+        "api_key": "sk-FAKE",
+        "header:X-Custom": "fixed",
+        "header:X-From-Client": "$X-Client-Thing"
+      },
+      "metadata": {},
+      "source": "codex",
+      "headers": {
+        "User-Agent": "my-client/1.0",
+        "X-Client-Thing": "echoed"
+      },
+      "model": "gpt-5.4-mini",
+      "payload": "{\"model\":\"alias-model\",\"instructions\":null,\"input\":[],\"tools\":[{\"type\":\"image_generation\"}],\"stream_options\":{\"include_obfuscation\":true}}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "oauth_usage_limit_429",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 429,
+      "upstream_type": "application/json",
+      "upstream_body": "{\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\",\"resets_in_seconds\":120}}"
+    },
+    {
+      "name": "oauth_context_too_large_400",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": false,
+      "upstream_status": 400,
+      "upstream_type": "application/json",
+      "upstream_body": "{\"error\":{\"message\":\"Your input exceeds the context window of this model.\",\"type\":\"invalid_request_error\"}}"
+    },
+    {
+      "name": "oauth_stream_terminal_failed_in_stream",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\ndata: {\"type\":\"response.failed\",\"sequence_number\":4,\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}}}\n\n"
+    },
+    {
+      "name": "oauth_stream_truncated",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n"
+    },
+    {
+      "name": "oauth_nonstream_empty_incomplete",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": false,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "data: {\"type\":\"response.incomplete\",\"response\":{\"output\":[],\"usage\":{\"output_tokens\":0}}}\n\n"
+    },
+    {
+      "name": "oauth_compact",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {
+        "Session_id": "s-1"
+      },
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"instructions\":\"keep\"}",
+      "stream": false,
+      "alt": "responses/compact",
+      "upstream_status": 200,
+      "upstream_type": "application/json",
+      "upstream_body": "{\"object\":\"response.compaction\",\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"e\"}]}"
+    },
+    {
+      "name": "oauth_execution_session_prompt_cache",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[{\"type\":\"function_call\",\"id\":\"call_x\",\"call_id\":\"c1\",\"name\":\"f\",\"arguments\":\"{}\"},{\"type\":\"reasoning\",\"id\":\"rs_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\",\"encrypted_content\":\"enc\"},{\"type\":\"message\",\"id\":\"item_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\",\"role\":\"user\",\"content\":\"x\"}]}",
+      "stream": true,
+      "exec_metadata": {
+        "execution_session_id": "ws-session-1"
+      },
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "oauth_tool_schema_enum_collapse",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[],\"tools\":[{\"type\":\"function\",\"name\":\"pick\",\"parameters\":{\"type\":\"object\",\"properties\":{\"c\":{\"oneOf\":[{\"const\":\"a\"},{\"const\":\"b\"},{\"const\":\"c\"},{\"const\":\"d\"},{\"const\":\"e\"},{\"const\":\"f\"},{\"const\":\"g\"},{\"const\":\"h\",\"title\":\"H\"}]},\"n\":{\"anyOf\":[{\"const\":1},{\"const\":2}]}}}},{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":[{\"type\":\"function\",\"name\":\"inner\",\"parameters\":{\"type\":\"object\",\"properties\":{\"k\":{\"anyOf\":[{\"const\":1},{\"const\":2},{\"const\":3},{\"const\":4},{\"const\":5},{\"const\":6},{\"const\":7},{\"const\":8.0}],\"enum\":[1,2,3,4,5,6,7,8]}}}}]}]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "oauth_model_override_header",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {
+        "User-Agent": "other/1"
+      },
+      "model": "gpt-5.6-luna",
+      "payload": "{\"model\":\"gpt-5.6-luna\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "oauth_capacity_in_stream_500",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": false,
+      "upstream_status": 500,
+      "upstream_type": "application/json",
+      "upstream_body": "{\"error\":{\"message\":\"Selected model is at capacity. Please try a different model.\"}}"
+    },
+    {
+      "name": "apikey_payload_rules_and_session_headers",
+      "config": "payload:\n  override:\n    - models:\n        - name: gpt-5.4\n      params:\n        reasoning.effort: low\n  default:\n    - models:\n        - name: \"gpt-*\"\n      params:\n        text.verbosity: low\n        reasoning.effort: minimal\n  filter:\n    - models:\n        - name: gpt-5.4\n      params:\n        - tool_choice\n",
+      "attributes": {
+        "api_key": "sk-FAKE",
+        "header:X-Combo": "s=$cpa-session-id;x",
+        "header:X-Session": "$CPA-SESSION-ID"
+      },
+      "metadata": null,
+      "source": "codex",
+      "headers": {
+        "Session_id": "sess-FAKE",
+        "User-Agent": "codex_cli_rs/0.150.0"
+      },
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}],\"tools\":[{\"type\":\"function\",\"name\":\"shell\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"high\",\"summary\":\"auto\"},\"store\":false,\"stream\":true,\"include\":[\"reasoning.encrypted_content\"],\"prompt_cache_key\":\"pck-FAKE\",\"previous_response_id\":\"resp_0\",\"safety_identifier\":\"sid\",\"prompt_cache_retention\":\"24h\",\"stream_options\":{\"include_obfuscation\":false,\"reasoning_summary_delivery\":\"inline\"},\"service_tier\":\"priority\"}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "apikey_session_header_without_session",
+      "config": "{}\n",
+      "attributes": {
+        "api_key": "sk-FAKE",
+        "header:X-Fixed": "v",
+        "header:X-Session": "$CPA-SESSION-ID"
+      },
+      "metadata": null,
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "oauth_bootstrap_overload_failover",
+      "config": "codex:\n  stream-bootstrap-buffering: true\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": ": keepalive\n\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\ndata: {\"type\":\"codex.rate_limits\",\"rate_limits\":{}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"busy\"}}}\n\n"
+    },
+    {
+      "name": "oauth_bootstrap_time_budget_spent",
+      "config": "codex:\n  stream-bootstrap-buffering: true\n  stream-bootstrap-timeout: 1ns\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"service_unavailable_error\",\"code\":\"server_is_overloaded\",\"message\":\"busy\"}}}\n\n"
+    },
+    {
+      "name": "oauth_stream_redirect_307",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+      "redirect": 307,
+      "hops": [
+        {
+          "method": "POST",
+          "path": "/responses",
+          "headers": {
+            "accept": [
+              "text/event-stream"
+            ],
+            "accept-encoding": [
+              "gzip"
+            ],
+            "authorization": [
+              "Bearer at-FAKE"
+            ],
+            "chatgpt-account-id": [
+              "acct-FAKE-1"
+            ],
+            "connection": [
+              "Keep-Alive"
+            ],
+            "content-length": [
+              "108"
+            ],
+            "content-type": [
+              "application/json"
+            ],
+            "originator": [
+              "codex-tui"
+            ],
+            "user-agent": [
+              "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
+            ],
+            "x-codex-routing-hint": [
+              "model=gpt-5.4"
+            ]
+          },
+          "body": "{\"model\":\"gpt-5.4\",\"input\":[],\"instructions\":\"\",\"tools\":[{\"type\":\"image_generation\",\"output_format\":\"png\"}]}"
+        },
+        {
+          "method": "POST",
+          "path": "/moved/responses",
+          "headers": {
+            "accept": [
+              "text/event-stream"
+            ],
+            "accept-encoding": [
+              "gzip"
+            ],
+            "authorization": [
+              "Bearer at-FAKE"
+            ],
+            "chatgpt-account-id": [
+              "acct-FAKE-1"
+            ],
+            "connection": [
+              "Keep-Alive"
+            ],
+            "content-length": [
+              "108"
+            ],
+            "content-type": [
+              "application/json"
+            ],
+            "originator": [
+              "codex-tui"
+            ],
+            "referer": [
+              "http://127.0.0.1:39119/responses"
+            ],
+            "user-agent": [
+              "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
+            ],
+            "x-codex-routing-hint": [
+              "model=gpt-5.4"
+            ]
+          },
+          "body": "{\"model\":\"gpt-5.4\",\"input\":[],\"instructions\":\"\",\"tools\":[{\"type\":\"image_generation\",\"output_format\":\"png\"}]}"
+        }
+      ]
+    },
+    {
+      "name": "apikey_nonstream_redirect_302",
+      "config": "{}\n",
+      "attributes": {
+        "api_key": "sk-FAKE"
+      },
+      "metadata": {},
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": false,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+      "redirect": 302,
+      "hops": [
+        {
+          "method": "POST",
+          "path": "/responses",
+          "headers": {
+            "accept": [
+              "text/event-stream"
+            ],
+            "accept-encoding": [
+              "gzip"
+            ],
+            "authorization": [
+              "Bearer sk-FAKE"
+            ],
+            "connection": [
+              "Keep-Alive"
+            ],
+            "content-length": [
+              "122"
+            ],
+            "content-type": [
+              "application/json"
+            ],
+            "originator": [
+              "codex-tui"
+            ],
+            "user-agent": [
+              "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
+            ]
+          },
+          "body": "{\"model\":\"gpt-5.4\",\"input\":[],\"stream\":true,\"instructions\":\"\",\"tools\":[{\"type\":\"image_generation\",\"output_format\":\"png\"}]}"
+        },
+        {
+          "method": "GET",
+          "path": "/moved/responses",
+          "headers": {
+            "accept": [
+              "text/event-stream"
+            ],
+            "accept-encoding": [
+              "gzip"
+            ],
+            "authorization": [
+              "Bearer sk-FAKE"
+            ],
+            "connection": [
+              "Keep-Alive"
+            ],
+            "originator": [
+              "codex-tui"
+            ],
+            "referer": [
+              "http://127.0.0.1:36859/responses"
+            ],
+            "user-agent": [
+              "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
+            ]
+          },
+          "body": ""
+        }
+      ]
+    },
+    {
+      "name": "apikey_claude_compat_from_config",
+      "config": "codex-api-key:\n  - api-key: sk-FAKE\n    base-url: \"{{base_url}}\"\n    models:\n      - name: gpt-5.4\n        is-compat: true\n",
+      "attributes": {
+        "api_key": "sk-FAKE"
+      },
+      "metadata": {},
+      "source": "claude",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"claude-x\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"\"},{\"type\":\"text\",\"text\":\"ok\"}]},{\"role\":\"user\",\"content\":\"go\"}],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "apikey_claude_not_compat",
+      "config": "{}\n",
+      "attributes": {
+        "api_key": "sk-FAKE"
+      },
+      "metadata": {},
+      "source": "claude",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"claude-x\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"\"},{\"type\":\"text\",\"text\":\"ok\"}]},{\"role\":\"user\",\"content\":\"go\"}],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":2048}}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"
+    },
+    {
+      "name": "apikey_responses_compat_resolved",
+      "config": "{}\n",
+      "attributes": {
+        "api_key": "sk-FAKE"
+      },
+      "metadata": {},
+      "source": "openai-response",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"plan\"}]},{\"type\":\"reasoning\",\"id\":\"rs_2\",\"encrypted_content\":\" bad \"},{\"type\":\"message\",\"role\":\"user\",\"content\":\"go\"}],\"reasoning\":{\"effort\":\"high\"}}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\nevent: response.output_item.done\ndata:{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+      "resolved_compat": true
+    },
+    {
+      "name": "oauth_claude_nonstream_empty_translation",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "claude",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"claude-x\",\"max_tokens\":64,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+      "stream": false,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "data: {\"type\":\"response.completed\"}\n\n"
+    },
+    {
+      "name": "oauth_grok_client_keepalive",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {
+        "User-Agent": "Grok-Shell/1.2"
+      },
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: keepalive\ndata: {\"type\":\"keepalive\"}\n\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n: ping\ndata:  {\"type\":\"keepalive\",\"n\":1} \n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}\n\n"
+    },
+    {
+      "name": "oauth_non_grok_keepalive",
+      "config": "{}\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {
+        "User-Agent": "codex_cli_rs/0.150.0"
+      },
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: keepalive\ndata: {\"type\":\"keepalive\"}\n\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n: ping\ndata:  {\"type\":\"keepalive\",\"n\":1} \n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}\n\n"
+    },
+    {
+      "name": "oauth_grok_keepalive_bootstrap",
+      "config": "codex:\n  stream-bootstrap-buffering: true\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {
+        "User-Agent": "grok-pager"
+      },
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "event: keepalive\ndata: {\"type\":\"keepalive\"}\n\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n: ping\ndata:  {\"type\":\"keepalive\",\"n\":1} \n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}\n\n"
+    },
+    {
+      "name": "oauth_bootstrap_holds_then_releases",
+      "config": "codex:\n  stream-bootstrap-buffering: true\n",
+      "attributes": {},
+      "metadata": {
+        "access_token": "at-FAKE",
+        "account_id": "acct-FAKE-1",
+        "email": "user@example.invalid",
+        "type": "codex"
+      },
+      "source": "codex",
+      "headers": {},
+      "model": "gpt-5.4",
+      "payload": "{\"model\":\"gpt-5.4\",\"input\":[]}",
+      "stream": true,
+      "upstream_status": 200,
+      "upstream_type": "text/event-stream",
+      "upstream_body": "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[]}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}\n\n"
+    }
+  ]
+}

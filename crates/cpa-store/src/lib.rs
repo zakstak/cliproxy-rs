@@ -333,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_follows_go_main() {
+    fn store_selection_respects_explicit_operator_precedence() {
         let wd = Path::new("/srv/app");
         // Postgres wins over the others; blank values do not count; lower-case keys work.
         let env = env_of(&[

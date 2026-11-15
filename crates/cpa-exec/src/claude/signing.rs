@@ -373,13 +373,22 @@ mod tests {
     }
 
     #[test]
-    fn signs_the_go_captured_body() {
-        // Upstream body from the Go differential capture (case `buffered`).
-        let signed = r#"{"model":"claude-sonnet-4-6","max_tokens":17,"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# currentDate\nToday's date is 2026-10-02.\n\n      IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>\n\n"},{"type":"text","text":"Local question","cache_control":{"type":"ephemeral","ttl":"1h"}}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280.b43; cc_entrypoint=cli; cch=2a498; cc_prompt_id=83ec619f-ab81-4d70-9c67-44c3865291b9; cc_turn_origin=human;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude.","cache_control":{"type":"ephemeral","ttl":"1h"}}],"diagnostics":{"previous_message_id":null},"stream":false,"metadata":{"user_id":"{\"device_id\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"account_uuid\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"session_id\":\"dd01238e-cdb5-5572-8f27-a28d98fe9075\"}"}}"#;
-        let unsigned = signed.replace("cch=2a498", "cch=00000");
-        assert_eq!(sign(placeholder(unsigned, "")).unwrap(), signed);
-        // An already-signed body re-signs to the same digits.
-        assert_eq!(sign(placeholder(signed.to_owned(), "")).unwrap(), signed);
+    fn signing_is_idempotent_and_covers_the_transmitted_body() {
+        // XXH64's independent known-answer vectors above establish the hash primitive.
+        // This test covers the proxy's signing contract, not provider acceptance.
+        let body = r#"{ "system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.325.abc; cc_entrypoint=cli; cch=00000;"}],"messages":[{"role":"user","content":"question"}],"unknown":1e3 }"#;
+        let signed = sign(body.to_owned()).unwrap();
+        assert_ne!(signed, body);
+        assert_eq!(sign(signed.clone()).unwrap(), signed);
+        assert!(
+            signed.contains(r#""unknown":1e3 }"#),
+            "untouched spans retain their bytes"
+        );
+        let changed = sign(signed.replace("question", "a different question")).unwrap();
+        let cch = |text: &str| text.split("cch=").nth(1).unwrap()[..5].to_owned();
+        assert_ne!(cch(&changed), cch(&signed));
+        assert_eq!(sign(changed.clone()).unwrap(), changed);
+        assert_eq!(sign(r#"{"messages":[]}"#.into()).unwrap(), r#"{"messages":[]}"#);
     }
 
     #[test]

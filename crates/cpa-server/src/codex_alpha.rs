@@ -355,26 +355,21 @@ mod tests {
 
     /// Go `encoding/json` into `struct{ ID, Model string }`.
     #[test]
-    fn routing_fields_decode_like_go() {
-        let r = |s: &str| routing(s.as_bytes());
-        let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
-        assert_eq!(
-            r(r#"{"id":"s","id":"t","model":"unregistered","query":"q"}"#),
-            pair("t", "unregistered"),
-            "duplicates: last wins, other fields kept"
-        );
-        assert_eq!(r(r#"{"ID":" a ","Model":"m"}"#), pair("a", "m"), "keys fold case");
-        assert_eq!(
-            r(r#"{"id":1,"model":"m","id":null}"#),
-            pair("", "m"),
-            "type errors skip only that field"
-        );
-        assert_eq!(r(r#"{"id":"a","model":"m""#), pair("", ""), "invalid JSON sets nothing");
-        assert_eq!(r("[1]"), pair("", ""));
+    fn routing_fields_read_documented_identifiers_without_changing_extension_bytes() {
+        let body = br#"{"id":" session ","model":" gpt-6-sol ","query":"q","extension":{"n":1.50}}"#;
+        assert_eq!(routing(body), ("session".into(), "gpt-6-sol".into()));
+        assert_eq!(routing(br#"{"query":"q"}"#), (String::new(), String::new()));
+        for malformed in ["[1]", "{broken"] {
+            assert_eq!(routing(malformed.as_bytes()), (String::new(), String::new()));
+        }
+        // Routing only reads the supplied bytes; forwarding is covered by the local
+        // Alpha Search peer integration test.
+        assert!(body.windows(4).any(|part| part == b"1.50"));
     }
 
     #[test]
-    fn credential_policy_matches_go() {
+    // Product policy: Alpha Search requires an eligible Codex OAuth credential or an operator-enabled Codex API key; other providers and unknown identities are refused.
+    fn alpha_search_requires_an_eligible_codex_credential() {
         let oauth = cred(serde_json::json!({"type":"codex","access_token":"t"}), &[]);
         assert!(allowed(&oauth));
         let key = cred(serde_json::json!({"type":"codex"}), &[("api_key", "k")]);

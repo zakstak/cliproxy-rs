@@ -1,20 +1,11 @@
-//! Expected values come from gorilla/websocket as CLIProxyAPI dials Codex
-//! (`tests/fixtures/codex_ws_deflate_go.json`, `tests/reference/codex_ws_deflate`): its
-//! offer, how it treats each `Sec-WebSocket-Extensions` answer, and what it reads from raw
-//! server frames, RFC 7692's examples included.
+//! RFC 7692 compression examples and locally constructed WebSocket inputs.
+//! Expected messages are authored here; no recorder output defines the contract.
 
 use super::*;
-use std::sync::LazyLock;
-
 use futures_util::StreamExt;
-use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::protocol::Role;
-
-static GO: LazyLock<Value> =
-    LazyLock::new(|| serde_json::from_str(include_str!("../tests/fixtures/codex_ws_deflate_go.json")).unwrap());
+use tokio_tungstenite::tungstenite::{Message, protocol::Role};
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -23,17 +14,15 @@ fn hex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// Text messages read from `bytes` (followed by EOF) through [`Inflate`] and tungstenite.
 async fn read(bytes: &[u8], limit: usize) -> Vec<String> {
     let (mut server, client) = tokio::io::duplex(1 << 20);
     server.write_all(bytes).await.unwrap();
-    // EOF for the reader; the server half stays open so pong writes succeed.
     server.shutdown().await.unwrap();
     let mut socket = WebSocketStream::from_raw_socket(Inflate::new(client, true, limit), Role::Client, None).await;
     let mut messages = Vec::new();
     while let Some(Ok(message)) = socket.next().await {
         match message {
-            Message::Text(text) => messages.push(text.as_str().to_owned()),
+            Message::Text(text) => messages.push(text.to_string()),
             Message::Binary(bytes) => messages.push(String::from_utf8_lossy(&bytes).into_owned()),
             _ => {}
         }
@@ -42,58 +31,97 @@ async fn read(bytes: &[u8], limit: usize) -> Vec<String> {
     messages
 }
 
+/// The local client supports no-context-takeover in both directions. Incomplete
+/// agreements are refused; unrelated extensions do not enable compression.
 #[test]
-fn offer_and_negotiation_match_gorilla() {
-    for case in GO["negotiations"].as_array().unwrap() {
-        assert_eq!(case["offer"], OFFER);
+fn compression_requires_both_no_context_takeover_parameters() {
+    assert_eq!(
+        OFFER,
+        "permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+    );
+    for (values, expected) in [
+        (vec![], Ok(false)),
+        (vec!["unrelated"], Ok(false)),
+        (vec!["permessage-deflate"], Err(())),
+        (vec!["permessage-deflate; server_no_context_takeover"], Err(())),
+        (vec!["permessage-deflate; client_no_context_takeover"], Err(())),
+        (vec![OFFER], Ok(true)),
+        (
+            vec!["permessage-deflate;client_no_context_takeover;server_no_context_takeover"],
+            Ok(true),
+        ),
+        (vec!["unrelated", OFFER], Ok(true)),
+        (
+            vec!["unrelated, permessage-deflate; server_no_context_takeover; client_no_context_takeover"],
+            Ok(true),
+        ),
+        (
+            vec![
+                "permessage-deflate; server_no_context_takeover; client_no_context_takeover; server_max_window_bits=10",
+            ],
+            Ok(true),
+        ),
+        (vec!["permessage-deflate; client_no_context_takeover", OFFER], Err(())),
+        (
+            vec!["permessage-deflate; server_no_context_takeover; client_no_context_takeover; bad@"],
+            Ok(false),
+        ),
+    ] {
         let mut headers = HeaderMap::new();
-        for value in case["headers"].as_array().into_iter().flatten() {
-            headers.append(
-                http::header::SEC_WEBSOCKET_EXTENSIONS,
-                value.as_str().unwrap().parse().unwrap(),
-            );
+        for value in &values {
+            headers.append(http::header::SEC_WEBSOCKET_EXTENSIONS, value.parse().unwrap());
         }
-        // Go reads the compressed "Hello" only when compression was agreed.
-        let want = if case["dial_error"].is_string() {
-            Err(())
-        } else {
-            Ok(!case["messages"].as_array().unwrap().is_empty())
-        };
-        assert_eq!(negotiated(&headers), want, "{case}");
+        assert_eq!(negotiated(&headers), expected, "{values:?}");
+    }
+}
+
+/// RFC 7692 section 7.2.3.1 encodes "Hello" as f2 48 cd c9 c9 07 00.
+/// Section 7.2.3.2 permits a ping between its fragments.
+#[tokio::test]
+async fn compressed_uncompressed_fragmented_and_repeated_messages_keep_their_payloads() {
+    for (frame, messages) in [
+        ("c107f248cdc9c90700", vec!["Hello"]),
+        ("4103f248cd89008004c9c90700", vec!["Hello"]),
+        ("c10b000500faff48656c6c6f00", vec!["Hello"]),
+        ("810548656c6c6f", vec!["Hello"]),
+        ("0102486580036c6c6f", vec!["Hello"]),
+        ("c107f248cdc9c90700c107f248cdc9c90700", vec!["Hello", "Hello"]),
+    ] {
+        assert_eq!(read(&hex(frame), 1024).await, messages, "{frame}");
     }
 }
 
 #[tokio::test]
-async fn server_frames_read_like_gorilla() {
-    for case in GO["frames"].as_array().unwrap() {
-        let messages = read(&hex(case["bytes"].as_str().unwrap()), 64 << 20).await;
-        let want: Vec<String> = serde_json::from_value(case["messages"].clone()).unwrap();
-        assert_eq!(messages, want, "{}", case["name"]);
+async fn corrupt_reserved_masked_and_interleaved_data_frames_do_not_deliver_payloads() {
+    for frame in [
+        "a10548656c6c6f",           // unnegotiated RSV2
+        "81850000000048656c6c6f",   // servers must not mask
+        "4103f248cd810548656c6c6f", // data before continuation completes
+        "c103ffffff",               // corrupt DEFLATE
+        "e107f248cdc9c90700",       // reserved bit on compressed data
+        "4103f248cd9004c9c90700",   // reserved bit on continuation
+    ] {
+        assert!(read(&hex(frame), 1024).await.is_empty(), "{frame}");
     }
+    assert_eq!(read(&hex("c107f248cdc9c90700c103ffffff"), 1024).await, ["Hello"]);
 }
 
-/// The bound Go does not have: an inflated message larger than the socket's message
-/// limit fails instead of growing without bound.
 #[tokio::test]
 async fn inflated_messages_are_bounded() {
-    let case = GO["frames"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "big_json")
-        .unwrap();
-    let frame = hex(case["bytes"].as_str().unwrap());
-    let message = case["messages"][0].as_str().unwrap();
-    assert!(
-        frame.len() < message.len() - 1,
-        "the frame fits a limit its message exceeds"
-    );
-    assert_eq!(read(&frame, message.len()).await, [message]);
+    use std::io::Write as _;
+    let message = format!("{{\"response\":\"{}\"}}", "a".repeat(4096));
+    let mut compressor = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    compressor.write_all(message.as_bytes()).unwrap();
+    let compressed = compressor.finish().unwrap();
+    let mut frame = vec![0xc1, compressed.len() as u8];
+    assert!(compressed.len() < 126);
+    frame.extend(compressed);
+    assert!(frame.len() < message.len() - 1);
+    assert_eq!(read(&frame, message.len()).await, [message.as_str()]);
     assert!(read(&frame, message.len() - 1).await.is_empty());
 }
 
-/// Without an agreement the layer is transparent: tungstenite rejects RSV1 as gorilla
-/// does when it did not negotiate.
+/// Without an agreement the layer is transparent and tungstenite rejects RSV1.
 #[tokio::test]
 async fn without_agreement_frames_pass_through() {
     let (mut server, client) = tokio::io::duplex(1024);

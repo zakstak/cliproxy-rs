@@ -281,12 +281,8 @@ pub(crate) fn refused_logged(credential_id: &str) -> bool {
     })
 }
 
-/// The host the Stainless headers describe. Unit tests pin Linux x64, the host the
-/// Go fixtures were recorded on, so they compare the same on every machine.
-#[cfg(not(test))]
+/// Host identity reported by the transport's Stainless headers.
 const HOST: (&str, &str) = (std::env::consts::OS, std::env::consts::ARCH);
-#[cfg(test)]
-const HOST: (&str, &str) = ("linux", "x86_64");
 
 /// Stainless OS/arch names for this host (`mapStainlessOS`, `mapStainlessArch`).
 pub(crate) fn host_os() -> String {
@@ -763,16 +759,16 @@ mod tests {
         assert_eq!(default_version(&s), "2.1.325");
     }
 
-    /// A stabilized device profile forwards only the exact baseline tuple, so Go's
-    /// 2.1 patch rule stays: a newer minor release is cloaked as on master.
+    /// A stabilized device profile forwards only the configured software tuple.
+    /// Other releases use the measured baseline identity.
     #[test]
-    fn stabilized_profiles_keep_go_patch_rule() {
+    fn stabilized_profiles_send_one_supported_software_tuple() {
         let mut s = Settings::default();
         s.header_defaults.stabilize_device_profile = true;
         assert!(!plausible_user_agent("claude-cli/2.2.0 (external, cli)", &s));
         assert!(plausible_user_agent("claude-cli/2.1.290 (external, cli)", &s));
         assert!(!own_release("claude-cli/2.2.0 (external, cli)", &s));
-        // Nothing newer is forwarded under a stabilized profile, so Go's rules apply:
+        // A stabilized profile forwards no alternate software tuple:
         // baseline billing, and no Stainless requirement.
         let newer_patch = "claude-cli/2.1.290 (external, cli)";
         assert!(!own_release(newer_patch, &s));
@@ -827,68 +823,129 @@ mod tests {
         assert_eq!(billing_version("OpenAI/Python 1.0", true, &s), "2.1.325");
     }
 
-    /// Go `resolveClaudeDeviceProfileHome` against the same scenarios, recorded by
-    /// the reference's zz_rustgolden_test.go: the KV calls in order, their keys,
-    /// values and TTLs, and the profile or error each request resolves to.
+    /// Profiles use the measured Claude Code software tuple, preserve configured
+    /// platform fields semantically, and fail closed when shared state cannot be read.
     #[tokio::test]
-    async fn home_kv_profiles_match_go() {
-        let golden: serde_json::Value =
-            serde_json::from_str(include_str!("testdata/go_device_profile_home.json")).unwrap();
-        for case in golden["cases"].as_array().unwrap() {
-            let scenario = &case["scenario"];
-            let name = scenario["name"].as_str().unwrap();
-            let values = std::sync::Arc::new(Mutex::new(HashMap::new()));
-            if let Some(preset) = scenario["preset"].as_object() {
-                for (k, v) in preset {
-                    values.lock().unwrap().insert(k.clone(), v.as_str().unwrap().to_owned());
-                }
-            }
-            let home = cpa_home::fake::FakeHome::start(super::super::kv_test::kv_home(values.clone())).await;
-            let client = home.client();
-            let mut settings = Settings::default();
-            // Recorded against the 2.1.280 baseline: an unset value replays as that tuple
-            // (settings::as_recorded_with_2_1_280_profile).
-            let config = |key: &str, recorded: &str| match scenario["config"][key].as_str().unwrap_or_default() {
-                "" => recorded.to_owned(),
-                set => set.to_owned(),
-            };
-            settings.header_defaults.user_agent = config("user-agent", "claude-cli/2.1.280 (external, cli)");
-            settings.header_defaults.package_version = config("package-version", "0.112.1");
-            settings.header_defaults.runtime_version = config("runtime-version", "v26.3.0");
-            settings.header_defaults.os = config("os", "");
-            settings.header_defaults.arch = config("arch", "");
-            let steps = scenario["steps"].as_array().unwrap();
-            for (i, (step, want)) in steps.iter().zip(case["results"].as_array().unwrap()).enumerate() {
-                let mut headers = HeaderMap::new();
-                for (k, v) in step["headers"].as_object().unwrap() {
-                    headers.insert(
-                        http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                        v.as_str().unwrap().parse().unwrap(),
-                    );
-                }
-                let before = home.commands().len();
-                let got = resolve_home(
-                    &client,
-                    step["auth"].as_str().unwrap(),
-                    step["api_key"].as_str().unwrap(),
-                    &headers,
-                    &settings,
-                )
-                .await;
-                let calls: Vec<_> = home.commands()[before..]
-                    .iter()
-                    .filter_map(|c| super::super::kv_test::as_go_call(c))
-                    .collect();
-                assert_eq!(serde_json::Value::from(calls), want["calls"], "{name} step {i}: calls");
-                match got {
-                    Ok(p) => assert_eq!(
-                        [p.user_agent, p.package_version, p.runtime_version, p.os, p.arch],
-                        serde_json::from_value::<[String; 5]>(want["profile"].clone()).unwrap(),
-                        "{name} step {i}: profile"
-                    ),
-                    Err(e) => assert_eq!(e, want["error"].as_str().unwrap(), "{name} step {i}: error"),
-                }
-            }
+    async fn home_profiles_share_the_supported_tuple_and_handle_locks_and_corruption() {
+        let values = std::sync::Arc::new(Mutex::new(HashMap::new()));
+        let home = cpa_home::fake::FakeHome::start(super::super::kv_test::kv_home(values.clone())).await;
+        let client = home.client();
+        let settings = Settings::default();
+        let baseline = Profile::default_for(&settings);
+        let headers: HeaderMap = [
+            ("user-agent", baseline.user_agent.as_str()),
+            ("x-stainless-package-version", baseline.package_version.as_str()),
+            ("x-stainless-runtime-version", baseline.runtime_version.as_str()),
+            ("x-stainless-os", "Windows"),
+            ("x-stainless-arch", "x64"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.parse().unwrap(), v.parse().unwrap()))
+        .collect();
+        let key = |scope: &str, lock: bool| {
+            format!(
+                "cpa:claude:device-profile{}:{}",
+                if lock { "-lock" } else { "" },
+                cpa_home::kv::hash_key_part(scope)
+            )
+        };
+        let first = resolve_home(&client, "cred-one", "", &headers, &settings)
+            .await
+            .unwrap();
+        assert_eq!(first, baseline);
+        assert_eq!(
+            resolve_home(&client, "cred-one", "", &HeaderMap::new(), &settings)
+                .await
+                .unwrap(),
+            first
+        );
+        let stored: serde_json::Value =
+            serde_json::from_str(&values.lock().unwrap()[&key("auth:cred-one", false)]).unwrap();
+        assert_eq!(stored["user_agent"], baseline.user_agent);
+        assert_eq!(stored["package_version"], baseline.package_version);
+        assert_eq!(stored["runtime_version"], baseline.runtime_version);
+        assert_eq!(stored["os"], baseline.os);
+        assert_eq!(stored["arch"], baseline.arch);
+        // Without a native candidate, absent shared state uses the local configured baseline.
+        assert_eq!(
+            resolve_home(&client, "missing", "", &HeaderMap::new(), &settings)
+                .await
+                .unwrap(),
+            baseline
+        );
+        values.lock().unwrap().insert(key("auth:locked", true), "1".into());
+        assert!(resolve_home(&client, "locked", "", &headers, &settings).await.is_err());
+        values.lock().unwrap().insert(
+            key("auth:locked", false),
+            serde_json::json!({
+                "user_agent": "claude-cli/2.1.100 (external, cli)", "package_version":"0.1.0",
+                "runtime_version":"v1.0.0", "os":"Linux", "arch":"x64"
+            })
+            .to_string(),
+        );
+        assert_eq!(
+            resolve_home(&client, "locked", "", &headers, &settings).await.unwrap(),
+            baseline
+        );
+        values
+            .lock()
+            .unwrap()
+            .insert(key("auth:empty", false), r#"{"user_agent":"  "}"#.into());
+        assert_eq!(
+            resolve_home(&client, "empty", "", &headers, &settings).await.unwrap(),
+            baseline
+        );
+        values
+            .lock()
+            .unwrap()
+            .insert(key("auth:corrupt", false), "not json".into());
+        assert!(resolve_home(&client, "corrupt", "", &headers, &settings).await.is_err());
+        // Credential, API-key, and native subclient scopes do not share records.
+        for (auth, api_key, scope) in [
+            ("second", "", "auth:second"),
+            ("", " key-two ", "api_key:key-two"),
+            ("", "", "global"),
+        ] {
+            assert_eq!(
+                resolve_home(&client, auth, api_key, &headers, &settings).await.unwrap(),
+                baseline
+            );
+            assert!(values.lock().unwrap().contains_key(&key(scope, false)));
         }
+        for subclient in ["sdk-cli", "sdk-ts"] {
+            let mut sub = headers.clone();
+            sub.insert(
+                "user-agent",
+                baseline
+                    .user_agent
+                    .replace("external, cli", &format!("external, {subclient}"))
+                    .parse()
+                    .unwrap(),
+            );
+            let profile = resolve_home(&client, "subclient", "", &sub, &settings).await.unwrap();
+            assert!(profile.user_agent.contains(subclient));
+            assert!(
+                values
+                    .lock()
+                    .unwrap()
+                    .contains_key(&key(&format!("auth:subclient|subclient:{subclient}"), false))
+            );
+        }
+        let mut configured = settings.clone();
+        configured.header_defaults.os = "Mac<OS>&co".into();
+        configured.header_defaults.arch = "arm\u{2028}x".into();
+        let profile = resolve_home(&client, "configured", "", &headers, &configured)
+            .await
+            .unwrap();
+        assert_eq!(profile.os, configured.header_defaults.os);
+        assert_eq!(profile.arch, configured.header_defaults.arch);
+        let saved: serde_json::Value =
+            serde_json::from_str(&values.lock().unwrap()[&key("auth:configured", false)]).unwrap();
+        assert_eq!(saved["os"], profile.os);
+        assert_eq!(saved["arch"], profile.arch);
+        let commands = home.commands();
+        assert!(commands.iter().any(|c| c[0].eq_ignore_ascii_case("expire")
+            && c[1] == key("auth:cred-one", false)
+            && c[2] == PROFILE_TTL.as_secs().to_string()));
     }
 }

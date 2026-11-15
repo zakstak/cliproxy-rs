@@ -1,0 +1,1868 @@
+{
+  "provenance": "Historical input scenarios from Go commit 6fecc6e. Recorded outputs removed; expectations are independently checked against the Home snapshot protocol in Rust.",
+  "cases": [
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 262144,
+        "max_part_count": 64,
+        "max_revision_bytes": 16777216,
+        "max_aggregate_groups": 100000,
+        "max_details": 10000,
+        "max_string_bytes": 256
+      },
+      "name": "empty",
+      "observations": null,
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 262144,
+        "max_part_count": 64,
+        "max_revision_bytes": 16777216,
+        "max_aggregate_groups": 100000,
+        "max_details": 10000,
+        "max_string_bytes": 256
+      },
+      "name": "fixture_like",
+      "observations": [
+        {
+          "request_id": "req-1",
+          "credential_id": "cred-a",
+          "model": "gpt-5",
+          "request_kind": "sse",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-2",
+          "credential_id": "cred-a",
+          "model": "gpt-5",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-3",
+          "credential_id": "cred-a",
+          "model": "GPT-5(high)",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198123456789,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 4,
+        "max_revision_bytes": 4096,
+        "max_aggregate_groups": 100000,
+        "max_details": 10000,
+        "max_string_bytes": 256
+      },
+      "name": "multipart_truncated",
+      "observations": [
+        {
+          "request_id": "req-0000",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0039",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0038",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0037",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0036",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0035",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0034",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0033",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0032",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0031",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0030",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0029",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0028",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0027",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0026",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0025",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0024",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0023",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0022",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0021",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0020",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0019",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0018",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0017",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0016",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0015",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0014",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0013",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0012",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0011",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0010",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0009",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0008",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0007",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0006",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0005",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0004",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0003",
+          "credential_id": "cred-1",
+          "model": "model-<x>&",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-0002",
+          "credential_id": "cred-2",
+          "model": "model-<x>&",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0001",
+          "credential_id": "cred-0",
+          "model": "model-<x>&",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 2,
+        "max_revision_bytes": 2048,
+        "max_aggregate_groups": 100000,
+        "max_details": 10000,
+        "max_string_bytes": 256
+      },
+      "name": "part_count_limit",
+      "observations": [
+        {
+          "request_id": "req-0000",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0029",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0028",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0027",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0026",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0025",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0024",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0023",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0022",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0021",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0020",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0019",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0018",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0017",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0016",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0015",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0014",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0013",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0012",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0011",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0010",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0009",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0008",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0007",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0006",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0005",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0004",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0003",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0002",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0001",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 262144,
+        "max_part_count": 64,
+        "max_revision_bytes": 16777216,
+        "max_aggregate_groups": 3,
+        "max_details": 10000,
+        "max_string_bytes": 256
+      },
+      "name": "aggregate_overflow",
+      "observations": [
+        {
+          "request_id": "req-0000",
+          "credential_id": "c0",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0009",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0008",
+          "credential_id": "c2",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0007",
+          "credential_id": "c3",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0006",
+          "credential_id": "c4",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0005",
+          "credential_id": "c5",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0004",
+          "credential_id": "c6",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0003",
+          "credential_id": "c7",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0002",
+          "credential_id": "c8",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0001",
+          "credential_id": "c9",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 1,
+        "max_revision_bytes": 1024,
+        "max_aggregate_groups": 100000,
+        "max_details": 10000,
+        "max_string_bytes": 256
+      },
+      "name": "aggregates_dont_fit",
+      "observations": [
+        {
+          "request_id": "req-0000",
+          "credential_id": "credential-00",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0039",
+          "credential_id": "credential-01",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0038",
+          "credential_id": "credential-02",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0037",
+          "credential_id": "credential-03",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0036",
+          "credential_id": "credential-04",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0035",
+          "credential_id": "credential-05",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0034",
+          "credential_id": "credential-06",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0033",
+          "credential_id": "credential-07",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0032",
+          "credential_id": "credential-08",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0031",
+          "credential_id": "credential-09",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0030",
+          "credential_id": "credential-10",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0029",
+          "credential_id": "credential-11",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0028",
+          "credential_id": "credential-12",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0027",
+          "credential_id": "credential-13",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0026",
+          "credential_id": "credential-14",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0025",
+          "credential_id": "credential-15",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0024",
+          "credential_id": "credential-16",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0023",
+          "credential_id": "credential-17",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0022",
+          "credential_id": "credential-18",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0021",
+          "credential_id": "credential-19",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0020",
+          "credential_id": "credential-20",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0019",
+          "credential_id": "credential-21",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0018",
+          "credential_id": "credential-22",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0017",
+          "credential_id": "credential-23",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0016",
+          "credential_id": "credential-24",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0015",
+          "credential_id": "credential-25",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0014",
+          "credential_id": "credential-26",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0013",
+          "credential_id": "credential-27",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0012",
+          "credential_id": "credential-28",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0011",
+          "credential_id": "credential-29",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0010",
+          "credential_id": "credential-30",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0009",
+          "credential_id": "credential-31",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0008",
+          "credential_id": "credential-32",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0007",
+          "credential_id": "credential-33",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0006",
+          "credential_id": "credential-34",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0005",
+          "credential_id": "credential-35",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0004",
+          "credential_id": "credential-36",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0003",
+          "credential_id": "credential-37",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0002",
+          "credential_id": "credential-38",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0001",
+          "credential_id": "credential-39",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 262144,
+        "max_part_count": 64,
+        "max_revision_bytes": 16777216,
+        "max_aggregate_groups": 100000,
+        "max_details": 10000,
+        "max_string_bytes": 8
+      },
+      "name": "long_strings",
+      "observations": [
+        {
+          "request_id": "request-ééé-long",
+          "credential_id": "c1",
+          "model": "unknown-model-name",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "r",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "  ",
+          "credential_id": "c1",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 262144,
+        "max_part_count": 64,
+        "max_revision_bytes": 16777216,
+        "max_aggregate_groups": 100000,
+        "max_details": 10000,
+        "max_string_bytes": 4
+      },
+      "name": "long_credential",
+      "observations": [
+        {
+          "request_id": "r",
+          "credential_id": "credential",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 262144,
+        "max_part_count": 64,
+        "max_revision_bytes": 16777216,
+        "max_aggregate_groups": 100000,
+        "max_details": 3,
+        "max_string_bytes": 256
+      },
+      "name": "max_details",
+      "observations": [
+        {
+          "request_id": "req-0000",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0008",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0007",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0006",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0005",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0004",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0003",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0002",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0001",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 0,
+        "max_part_count": 0,
+        "max_revision_bytes": 0,
+        "max_aggregate_groups": 0,
+        "max_details": 0,
+        "max_string_bytes": 0
+      },
+      "name": "zero_config",
+      "observations": [
+        {
+          "request_id": "req-0000",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0001",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 11,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 8,
+        "max_revision_bytes": 1500,
+        "max_aggregate_groups": 100000,
+        "max_details": 10000,
+        "max_string_bytes": 256
+      },
+      "name": "revision_limit",
+      "observations": [
+        {
+          "request_id": "req-0000",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0019",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0013",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0007",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0001",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0020",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0014",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0008",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0002",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0021",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0015",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0009",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0003",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0022",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0016",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0010",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0004",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0023",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0017",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0011",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0005",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635198000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0024",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635199500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0018",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "stream",
+          "started_unix_nano": 1784635201000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0012",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "websocket",
+          "started_unix_nano": 1784635202500000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-0006",
+          "credential_id": "c",
+          "model": "m",
+          "request_kind": "http",
+          "started_unix_nano": 1784635204000000000,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 1784635200120000000,
+      "revision": 7
+    },
+    {
+      "barrier": 14,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 64,
+        "max_revision_bytes": 16384,
+        "max_aggregate_groups": 100000,
+        "max_details": 1,
+        "max_string_bytes": 256
+      },
+      "name": "TestEncodeHomeInFlightFreezePreservesPartitionsAndBarrier",
+      "observations": [
+        {
+          "request_id": "req-a",
+          "credential_id": "cred",
+          "model": "gpt-5",
+          "request_kind": "http",
+          "started_unix_nano": 10000000000,
+          "accounted": true
+        },
+        {
+          "request_id": "req-b",
+          "credential_id": "cred",
+          "model": "gpt-5",
+          "request_kind": "sse",
+          "started_unix_nano": 11000000000,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 12000000000,
+      "revision": 9
+    },
+    {
+      "barrier": 15,
+      "cfg": {
+        "max_part_bytes": 256,
+        "max_part_count": 1,
+        "max_revision_bytes": 256,
+        "max_aggregate_groups": 1,
+        "max_details": 0,
+        "max_string_bytes": 256
+      },
+      "name": "TestEncodeHomeInFlightFreezeUsesOverflowWithoutPartialAggregates",
+      "observations": [
+        {
+          "request_id": "",
+          "credential_id": "a",
+          "model": "m1",
+          "request_kind": "http",
+          "started_unix_nano": 0,
+          "accounted": false
+        },
+        {
+          "request_id": "",
+          "credential_id": "b",
+          "model": "m2",
+          "request_kind": "http",
+          "started_unix_nano": 0,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 10
+    },
+    {
+      "barrier": 0,
+      "cfg": {
+        "max_part_bytes": 300,
+        "max_part_count": 8,
+        "max_revision_bytes": 2048,
+        "max_aggregate_groups": 8,
+        "max_details": 3,
+        "max_string_bytes": 256
+      },
+      "name": "TestEncodeHomeInFlightFreezeUsesDeterministicBoundedMultipartFrames",
+      "observations": [
+        {
+          "request_id": "req-c",
+          "credential_id": "cred",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 12000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-a",
+          "credential_id": "cred",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 10000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "req-b",
+          "credential_id": "cred",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 11000000000,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 4
+    },
+    {
+      "barrier": 0,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 2,
+        "max_revision_bytes": 2048,
+        "max_aggregate_groups": 3,
+        "max_details": 0,
+        "max_string_bytes": 512
+      },
+      "name": "TestEncodeHomeInFlightFreezeOverflowsWhenFinalAggregatePartExceedsPartCount",
+      "observations": [
+        {
+          "request_id": "",
+          "credential_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "model": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "request_kind": "",
+          "started_unix_nano": 0,
+          "accounted": true
+        },
+        {
+          "request_id": "",
+          "credential_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "model": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "request_kind": "",
+          "started_unix_nano": 0,
+          "accounted": true
+        },
+        {
+          "request_id": "",
+          "credential_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "model": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "request_kind": "",
+          "started_unix_nano": 0,
+          "accounted": true
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 13
+    },
+    {
+      "barrier": 0,
+      "cfg": {
+        "max_part_bytes": 512,
+        "max_part_count": 8,
+        "max_revision_bytes": 1000,
+        "max_aggregate_groups": 8,
+        "max_details": 5,
+        "max_string_bytes": 128
+      },
+      "name": "TestEncodeHomeInFlightFreezeTruncatesDetailsBeforeTotalOverflow",
+      "observations": [
+        {
+          "request_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "credential_id": "cred",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 0,
+          "accounted": false
+        },
+        {
+          "request_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "credential_id": "cred",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 1000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "credential_id": "cred",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 2000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "credential_id": "cred",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 3000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "credential_id": "cred",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 4000000000,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 12
+    },
+    {
+      "barrier": 0,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 2,
+        "max_revision_bytes": 2048,
+        "max_aggregate_groups": 8,
+        "max_details": 1,
+        "max_string_bytes": 8
+      },
+      "name": "TestEncodeHomeInFlightFreezeBoundsStringsAndExcludesSensitiveFields",
+      "observations": [
+        {
+          "request_id": "requestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequestrequest",
+          "credential_id": "credentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredentialcredential",
+          "model": "modelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodelmodel",
+          "request_kind": "kindkindkindkindkindkindkindkindkindkindkindkindkindkindkindkindkindkindkindkind",
+          "started_unix_nano": 0,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 3
+    },
+    {
+      "barrier": 0,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 2,
+        "max_revision_bytes": 2048,
+        "max_aggregate_groups": 2,
+        "max_details": 1,
+        "max_string_bytes": 8
+      },
+      "name": "TestEncodeHomeInFlightFreezeOverflowsForRawAggregateKey",
+      "observations": [
+        {
+          "request_id": "",
+          "credential_id": "credential-id-exceeds-limit",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 0,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 0
+    },
+    {
+      "barrier": 0,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 2,
+        "max_revision_bytes": 2048,
+        "max_aggregate_groups": 1,
+        "max_details": 0,
+        "max_string_bytes": 8
+      },
+      "name": "TestEncodeHomeInFlightFreezeKeepsRawAggregateGroupsDistinct",
+      "observations": [
+        {
+          "request_id": "",
+          "credential_id": "credential-a",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 0,
+          "accounted": false
+        },
+        {
+          "request_id": "",
+          "credential_id": "credential-b",
+          "model": "model",
+          "request_kind": "http",
+          "started_unix_nano": 0,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 0
+    },
+    {
+      "barrier": 0,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 2,
+        "max_revision_bytes": 2048,
+        "max_aggregate_groups": 2,
+        "max_details": 2,
+        "max_string_bytes": 64
+      },
+      "name": "TestEncodeHomeInFlightFreezeDropsInvalidDetailsWithoutDiscardingAggregates",
+      "observations": [
+        {
+          "request_id": "",
+          "credential_id": "cred-a",
+          "model": "model-a",
+          "request_kind": "http",
+          "started_unix_nano": 1000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "request-b",
+          "credential_id": "cred-a",
+          "model": "model-a",
+          "request_kind": "http",
+          "started_unix_nano": 2000000000,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 21
+    },
+    {
+      "barrier": 0,
+      "cfg": {
+        "max_part_bytes": 1024,
+        "max_part_count": 2,
+        "max_revision_bytes": 2048,
+        "max_aggregate_groups": 3,
+        "max_details": 2,
+        "max_string_bytes": 64
+      },
+      "name": "TestEncodeHomeInFlightFreezeCanonicalizesUnaccountedModelsWithFallback",
+      "observations": [
+        {
+          "request_id": "request-a",
+          "credential_id": "cred-a",
+          "model": "GPT-5(HIGH)",
+          "request_kind": "http",
+          "started_unix_nano": 1000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "request-b",
+          "credential_id": "cred-b",
+          "model": "   ",
+          "request_kind": "http",
+          "started_unix_nano": 2000000000,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 22
+    },
+    {
+      "barrier": 0,
+      "cfg": {
+        "max_part_bytes": 300,
+        "max_part_count": 8,
+        "max_revision_bytes": 2048,
+        "max_aggregate_groups": 4,
+        "max_details": 2,
+        "max_string_bytes": 8
+      },
+      "name": "TestEncodeHomeInFlightFreezeSetsGlobalDetailTruncationMetadata",
+      "observations": [
+        {
+          "request_id": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "credential_id": "cred-a",
+          "model": "model-a",
+          "request_kind": "http",
+          "started_unix_nano": 1000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "request-b",
+          "credential_id": "cred-b",
+          "model": "model-b",
+          "request_kind": "http",
+          "started_unix_nano": 2000000000,
+          "accounted": false
+        },
+        {
+          "request_id": "request-c",
+          "credential_id": "cred-c",
+          "model": "model-c",
+          "request_kind": "http",
+          "started_unix_nano": 3000000000,
+          "accounted": false
+        }
+      ],
+      "observed_unix_nano": 20000000000,
+      "revision": 0
+    }
+  ]
+}

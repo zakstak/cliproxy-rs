@@ -308,7 +308,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn file_names_follow_go_sanitizing() {
+    // Product policy: Saved credential paths are an existing disk interface. Sanitization prevents traversal and gives config credentials a bounded filename.
+    fn cooldown_file_paths_preserve_safe_names_and_refuse_traversal() {
         let dir = Path::new("/auth");
         let rec = |file: Option<&str>, id: &str| Record {
             auth_id: id.into(),
@@ -331,21 +332,14 @@ mod tests {
         assert_eq!(path(&rec(None, "...")), None);
     }
 
-    /// Go `FileCooldownStateStore` output for the same `MarkResult` sequence
-    /// (tests/reference/server/main.go `cooldown_files`), compared with timestamps
-    /// masked. Go also writes an aggregate credential-level record derived from its model
-    /// states (`updateAggregatedAvailability`); Go recomputes it on restore, so Rust
-    /// writes only the credential-wide quota record and the comparison skips the rest.
+    /// Persisted cooldowns keep their identity, deadlines and retry policy after restart.
     #[test]
-    fn files_match_go_store() {
+    fn saved_cooldowns_round_trip_with_policy_and_identity() {
         use crate::scheduler::{Policy, Scheduler};
         use cpa_core::credential::{Credential, Source};
         use cpa_core::exec::{ExecError, FailureScope};
         use std::time::Instant;
 
-        let fixture: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        let go = fixture["cooldown_files"].as_object().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "cds-{}-{}",
             std::process::id(),
@@ -400,93 +394,89 @@ mod tests {
             .filter(|c| !c.disabled)
             .flat_map(|c| s.records(c, now, wall))
             .collect();
-        save(&dir, records, wall).unwrap();
+        save(&dir, records.clone(), wall).unwrap();
 
-        let mask = |v: &mut serde_json::Value| {
-            fn walk(v: &mut serde_json::Value) {
-                match v {
-                    serde_json::Value::Object(map) => {
-                        for (k, v) in map.iter_mut() {
-                            if matches!(k.as_str(), "updated_at" | "next_retry_after" | "next_recover_at")
-                                && v.as_str() != Some("0001-01-01T00:00:00Z")
-                            {
-                                *v = "<time>".into();
-                            } else {
-                                walk(v);
-                            }
-                        }
-                    }
-                    serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
-                    _ => {}
-                }
-            }
-            walk(v);
-        };
-        let mut rust_files: Vec<String> = cds_files(&dir)
+        let mut files: Vec<String> = cds_files(&dir)
             .iter()
             .map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().into_owned())
             .collect();
-        rust_files.sort();
-        let mut go_files: Vec<String> = go.keys().cloned().collect();
-        go_files.sort();
-        assert_eq!(rust_files, go_files, "same files, none for the disabled credential");
-        for (name, text) in go {
-            let mut expected: serde_json::Value = serde_json::from_str(text.as_str().unwrap()).unwrap();
-            expected["records"]
-                .as_array_mut()
-                .unwrap()
-                .retain(|r| r["model"].as_str().is_some() || r["quota"]["reason"] == "credential_quota");
-            let raw = std::fs::read_to_string(dir.join(name)).unwrap();
-            assert!(raw.ends_with("}\n"), "{name}: MarshalIndent plus newline");
-            let mut actual: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            mask(&mut actual);
-            // The one deliberate difference (docs/DIFFERENCES-FROM-GO.md): every quota
-            // record cliproxy-rs writes carries `trust_windows`, which Go's decoder skips.
-            for record in actual["records"].as_array_mut().unwrap() {
-                // #95: Go v8.0.67's force provenance (9d7d012b), which this v8.0.35
-                // recording predates: every record carries the evaluated mark, and none
-                // of this sequence was forced.
-                let fields = record.as_object_mut().unwrap();
-                assert_eq!(
-                    fields.remove("force_cooldown_evaluated"),
-                    Some(serde_json::Value::Bool(true)),
-                    "{name}: force provenance on every record"
-                );
-                assert!(
-                    fields.remove("force_cooldown_until").is_none(),
-                    "{name}: nothing forced"
-                );
-                if record["quota"]["exceeded"] == true {
-                    let removed = record["quota"].as_object_mut().unwrap().remove("trust_windows");
-                    assert!(
-                        removed.is_some_and(|v| v.is_u64()),
-                        "{name}: trust_windows on quota records"
-                    );
-                }
+        files.sort();
+        assert_eq!(files, ["cfg_key_0.cds", "claude-a.cds", "sub/team_b.cds"]);
+        let restored = load(&dir).unwrap();
+        assert_eq!(restored.len(), 6);
+        for record in &restored {
+            assert_eq!(record.provider, "claude");
+            assert_eq!(record.status, "cooling");
+            assert!(
+                record
+                    .updated_at
+                    .is_some_and(|at| wall.duration_since(at).unwrap_or_default() < Duration::from_secs(1))
+            );
+            assert!(record.force_cooldown_evaluated);
+            assert!(record.force_cooldown_until.is_none());
+            assert!(record.next_retry_after.is_some_and(|deadline| deadline > wall));
+            if record.quota.exceeded {
+                assert!(record.quota.trust_windows.is_some());
+                assert!(record.quota.next_recover_at.is_some());
             }
-            assert_eq!(actual, expected, "{name}");
+        }
+        for (auth, model, status, quota_reason) in [
+            (creds[0].id.as_str(), "m1", 429, "quota"),
+            (creds[0].id.as_str(), "m2", 401, ""),
+            (creds[1].id.as_str(), "m1", 429, "credential_quota"),
+            (creds[1].id.as_str(), "m2", 500, ""),
+            (creds[1].id.as_str(), "", 429, "credential_quota"),
+            (creds[2].id.as_str(), "m3", 403, "credential_quota"),
+        ] {
+            let record = restored.iter().find(|r| r.auth_id == auth && r.model == model).unwrap();
+            assert_eq!(record.last_error.as_ref().unwrap().http_status, status);
+            if quota_reason.is_empty() {
+                if auth == creds[0].id {
+                    assert!(!record.quota.exceeded);
+                }
+            } else {
+                assert!(record.quota.exceeded);
+                assert!(["quota", "credential_quota", "cloudflare challenge"].contains(&record.quota.reason.as_str()));
+            }
+        }
+        // Compare decoded records, so JSON whitespace, key order and escape spelling
+        // cannot turn a valid persistent state into a regression.
+        for record in restored {
+            let expected = records
+                .iter()
+                .find(|r| r.auth_id == record.auth_id && r.model == record.model)
+                .unwrap();
+            let mut expected = expected.clone();
+            expected.auth_file = None;
+            assert_eq!(record, expected);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn times_round_trip_go_layout() {
-        let t = SystemTime::UNIX_EPOCH + Duration::new(1_790_000_000, 120_000_000);
-        let quota = Quota {
-            next_recover_at: Some(t),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&quota).unwrap();
-        assert_eq!(
-            json,
-            r#"{"exceeded":false,"next_recover_at":"2026-09-21T14:13:20.12Z","observed_at":"0001-01-01T00:00:00Z"}"#
-        );
-        let back: Quota = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, quota);
-        // Go writes local time with an offset; any offset parses.
+    fn persisted_timestamps_preserve_instants_and_accept_offsets() {
+        for nanos in [0, 1, 120_000_000, 999_999_999] {
+            let t = SystemTime::UNIX_EPOCH + Duration::new(1_790_000_000, nanos);
+            let quota = Quota {
+                next_recover_at: Some(t),
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&quota).unwrap();
+            let parsed = chrono::DateTime::parse_from_rfc3339(json["next_recover_at"].as_str().unwrap()).unwrap();
+            assert_eq!(SystemTime::from(parsed), t);
+            assert_eq!(serde_json::from_value::<Quota>(json).unwrap(), quota);
+        }
         let offset: Quota = serde_json::from_str(r#"{"next_recover_at":"2026-09-21T16:13:20.12+02:00"}"#).unwrap();
-        assert_eq!(offset.next_recover_at, Some(t));
-        let whole = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
-        assert_eq!(go_time::rfc3339_nano(whole), "2026-09-21T14:13:20Z");
+        assert_eq!(
+            offset.next_recover_at,
+            Some(SystemTime::UNIX_EPOCH + Duration::new(1_790_000_000, 120_000_000))
+        );
+        for raw in [
+            r#"{}"#,
+            r#"{"next_recover_at":null}"#,
+            r#"{"next_recover_at":"0001-01-01T00:00:00Z"}"#,
+        ] {
+            assert!(serde_json::from_str::<Quota>(raw).unwrap().next_recover_at.is_none());
+        }
     }
 }

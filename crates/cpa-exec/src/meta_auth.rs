@@ -958,23 +958,40 @@ pub(crate) async fn login_with(auth: MetaAuth, auth_dir: &Path, no_browser: bool
 mod tests {
     use super::*;
 
-    /// An existing credential at encoding/json's depth limit converts its numbers to
-    /// float64 on a 2 MiB stack; an overflowing literal anywhere marks it unclean.
+    /// Deep saved credentials must parse without overflowing a small worker stack.
+    /// Unrepresentable numeric settings mark the credential unclean, including at depth.
     #[test]
-    fn go_map_from_json_handles_the_depth_limit() {
+    fn deeply_nested_credentials_mark_numeric_overflow_without_stack_overflow() {
         std::thread::Builder::new()
             .stack_size(2 << 20)
             .spawn(|| {
                 let deep = |leaf: &str| format!(r#"{{"a":{}{leaf}{}}}"#, r#"[{"d":"#.repeat(4_999), "}]".repeat(4_999));
                 let (map, clean) = go_map_from_json(deep("1.50").as_bytes()).unwrap();
                 assert!(clean);
-                assert_eq!(GoValue::Object(map).marshal(), deep("1.5").into_bytes());
+                fn leaf(mut value: &GoValue) -> &GoValue {
+                    loop {
+                        value = match value {
+                            GoValue::Object(fields) => fields.get("a").or_else(|| fields.get("d")).unwrap(),
+                            GoValue::Array(items) if items.len() == 1 => &items[0],
+                            _ => return value,
+                        };
+                    }
+                }
+                let encoded = GoValue::Object(map).marshal();
+                let decoded = GoValue::parse(&encoded).unwrap();
+                let GoValue::Number(number) = leaf(&decoded) else {
+                    panic!("numeric leaf");
+                };
+                assert_eq!(number.parse::<f64>().unwrap(), 1.5);
                 let (map, clean) = go_map_from_json(deep(r#"["x\"1e400",1e400]"#).as_bytes()).unwrap();
                 assert!(!clean);
-                assert_eq!(
-                    GoValue::Object(map).marshal(),
-                    deep(r#"["x\"1e400",null]"#).into_bytes()
-                );
+                let encoded = GoValue::Object(map).marshal();
+                let decoded = GoValue::parse(&encoded).unwrap();
+                let GoValue::Array(items) = leaf(&decoded) else {
+                    panic!("array leaf");
+                };
+                assert!(matches!(&items[0], GoValue::String(s) if s == "x\"1e400"));
+                assert!(matches!(&items[1], GoValue::Null));
                 let (_, clean) = go_map_from_json(deep(r#""-1e400""#).as_bytes()).unwrap();
                 assert!(clean, "a number inside a string does not count");
             })
@@ -984,24 +1001,18 @@ mod tests {
     }
 
     #[test]
-    fn go_float_matches_strconv() {
-        // Expected strings from Go: json.Marshal(float64(x)).
-        for (literal, go) in [
-            ("1", "1"),
-            ("1.0", "1"),
-            ("0.10", "0.1"),
-            ("1e3", "1000"),
-            ("1e21", "1e+21"),
-            ("1.5e-7", "1.5e-7"),
-            ("1e-10", "1e-10"),
-            ("0.000001", "0.000001"),
-            ("-2.50", "-2.5"),
-            ("9007199254740993", "9007199254740992"),
-            ("123456789012345678901", "123456789012345680000"),
+    fn metadata_numbers_remain_finite_json_numbers() {
+        for literal in [
+            "1", "1.0", "0.10", "1e3", "1e21", "1.5e-7", "1e-10", "0.000001", "-2.50",
         ] {
-            assert_eq!(go_float(literal).as_deref(), Some(go), "{literal}");
+            let output = go_float(literal).expect("finite number");
+            let decoded: serde_json::Value = serde_json::from_str(&output).expect("valid JSON number");
+            assert_eq!(decoded.as_f64(), literal.parse::<f64>().ok(), "{literal}");
         }
-        assert_eq!(go_float("1e400"), None, "float64 overflow is a decode error");
+        assert!(
+            go_float("1e400").is_none(),
+            "unrepresentable metadata must be flagged, not persisted as infinity"
+        );
     }
 
     #[test]

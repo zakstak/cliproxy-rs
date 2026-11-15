@@ -261,7 +261,7 @@ pub fn stream_with(
     registered(client, upstream).map(|r| stream::framed_with(client, upstream, (r.go_stream)(ctx), options))
 }
 
-/// The Go-shaped line translator behind a pair's `stream`, for golden tests.
+/// The line-oriented translator behind a pair's framed `stream` adapter.
 #[doc(hidden)]
 pub fn go_stream(client: Format, upstream: Format) -> Option<GoStreamFn> {
     registered(client, upstream).map(|r| r.go_stream)
@@ -360,4 +360,4 @@ pub fn translate_token_count(client: Format, upstream: Format, count: i64, body:
 }
 
 #[cfg(test)]
-mod go_helper_tests;
+mod helper_contract_tests;

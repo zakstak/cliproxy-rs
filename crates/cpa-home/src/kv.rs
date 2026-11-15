@@ -306,7 +306,7 @@ mod tests {
 
     /// Go `TestHashKeyPart`.
     #[test]
-    fn hash_and_log_prefix_match_go() {
+    fn shared_key_namespace_hashes_are_stable_and_logs_hide_the_input() {
         // sha256("abc").
         assert_eq!(
             hash_key_part("abc"),

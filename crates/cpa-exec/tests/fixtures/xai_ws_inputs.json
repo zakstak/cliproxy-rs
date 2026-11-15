@@ -1,0 +1,1524 @@
+{
+  "_provenance": "Historical xAI client requests and synthetic upstream stimuli extracted from xai_ws_go.json. No recorded proxy output is retained. Expected behavior is independently specified by the Rust session contract tests.",
+  "scenarios": [
+    {
+      "name": "basic_then_previous",
+      "session": "sess-basic",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"again\"}]}],\"stream\":true,\"previous_response_id\":\"resp_1\"}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_2\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_2\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi again\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_2\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi again\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_2\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "close": true
+        }
+      ]
+    },
+    {
+      "name": "repeated_response_id",
+      "session": "sess-repeat",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"one\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_r\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_r\",\"output_index\":0,\"content_index\":0,\"delta\":\"one\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_r\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"one\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_r\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"two\"}]}],\"stream\":true,\"previous_response_id\":\"resp_r\"}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_r\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_r\",\"output_index\":0,\"content_index\":0,\"delta\":\"two\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_r\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"two\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_r\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"three\"}]}],\"stream\":true,\"previous_response_id\":\"resp_r-xai-1\"}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_r3\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_r3\",\"output_index\":0,\"content_index\":0,\"delta\":\"three\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_r3\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"three\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_r3\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "target_change_replays_transcript",
+      "session": "sess-target",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        },
+        "auth-b": {
+          "api_key": "sk-fake-xai-b",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"first\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_t1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_t1\",\"output_index\":0,\"content_index\":0,\"delta\":\"first\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_t1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_t1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-b",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"second\"}]}],\"stream\":true,\"previous_response_id\":\"resp_t1\"}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_t2\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_t2\",\"output_index\":0,\"content_index\":0,\"delta\":\"second\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_t2\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_t2\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "compaction_from_transcript",
+      "session": "sess-compact",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"long context\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_c1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_c1\",\"output_index\":0,\"content_index\":0,\"delta\":\"noted\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_c1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"noted\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_c1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"compaction_trigger\"}],\"stream\":true,\"previous_response_id\":\"resp_c1\"}",
+          "compact": {
+            "status": 200,
+            "body": "{\"id\":\"cmp_1\",\"object\":\"response.compaction\",\"created_at\":1700000000,\"completed_at\":1700000001,\"model\":\"grok-4.3\",\"output\":[{\"type\":\"compaction\",\"id\":\"cmp_item_1\",\"encrypted_content\":\"ENCRYPTED\"}],\"usage\":{\"input_tokens\":30,\"output_tokens\":3,\"total_tokens\":33}}"
+          }
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"type\":\"response.append\",\"model\":\"grok-4.3\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"after compaction\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_c3\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_c3\",\"output_index\":0,\"content_index\":0,\"delta\":\"continued\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_c3\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"continued\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_c3\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "compaction_fresh_input",
+      "session": "sess-compact-fresh",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"context\"}]},{\"type\":\"compaction_trigger\"}],\"stream\":true}",
+          "compact": {
+            "status": 200,
+            "body": "{\"id\":\"cmp_1\",\"object\":\"response.compaction\",\"created_at\":1700000000,\"completed_at\":1700000001,\"model\":\"grok-4.3\",\"output\":[{\"type\":\"compaction\",\"id\":\"cmp_item_1\",\"encrypted_content\":\"ENCRYPTED\"}],\"usage\":{\"input_tokens\":30,\"output_tokens\":3,\"total_tokens\":33}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "compaction_previous_only",
+      "session": "sess-compact-prev",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"compaction_trigger\"}],\"stream\":true,\"previous_response_id\":\"resp_elsewhere\"}",
+          "compact": {
+            "status": 200,
+            "body": "{\"id\":\"cmp_1\",\"object\":\"response.compaction\",\"created_at\":1700000000,\"completed_at\":1700000001,\"model\":\"grok-4.3\",\"output\":[{\"type\":\"compaction\",\"id\":\"cmp_item_1\",\"encrypted_content\":\"ENCRYPTED\"}],\"usage\":{\"input_tokens\":30,\"output_tokens\":3,\"total_tokens\":33}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "compaction_empty_context",
+      "session": "sess-compact-empty",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"compaction_trigger\"}],\"stream\":true}"
+        }
+      ]
+    },
+    {
+      "name": "compaction_invalid_response",
+      "session": "sess-compact-bad",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"x\"}]},{\"type\":\"compaction_trigger\"}],\"stream\":true}",
+          "compact": {
+            "status": 200,
+            "body": "{\"id\":\"cmp_2\",\"output\":[{\"type\":\"message\"}]}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "warmup_generate_false",
+      "session": "sess-warmup",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"warm\"}]}],\"stream\":true,\"generate\":false}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":4,\"response\":{\"id\":\"resp_w\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\"}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"real\"}]}],\"stream\":true,\"previous_response_id\":\"resp_w\"}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_w2\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_w2\",\"output_index\":0,\"content_index\":0,\"delta\":\"real\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_w2\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"real\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_w2\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "error_frames",
+      "session": "sess-errors",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"error\",\"status\":429,\"error\":{\"type\":\"rate_limit\",\"code\":\"free-usage-exhausted\",\"message\":\"included free usage exhausted\"}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"b\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"error\",\"status\":403,\"error\":{\"type\":\"auth\",\"code\":\"bad-credentials\",\"message\":\"Access token could not be validated\"}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"c\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"status\":403,\"error\":{\"code\":\"bad-credentials\",\"message\":\"Access token could not be validated\"}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"d\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"error\":{\"code\":\"400\",\"message\":\"bad request\"}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"e\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"error\":{\"message\":\"{\\\"code\\\":\\\"400\\\"} Request validation error\"}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"f\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"code\":\"free-usage-exhausted\",\"error\":\"included free usage exhausted\",\"status_code\":429}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "handshake_rejected",
+      "session": "sess-reject",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]}],\"stream\":true}",
+          "reject": {
+            "status": 403,
+            "body": "{\"code\":\"bad-credentials\",\"error\":\"Access token could not be validated\"}"
+          }
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"b\"}]}],\"stream\":true}",
+          "reject": {
+            "status": 429,
+            "body": "{\"code\":\"free-usage-exhausted\",\"error\":\"included free usage exhausted\"}"
+          }
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"c\"}]}],\"stream\":true}",
+          "reject": {
+            "status": 500,
+            "body": ""
+          }
+        }
+      ]
+    },
+    {
+      "name": "close_message_too_big",
+      "session": "sess-1009",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"huge\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "close": 1009,
+              "close_text": "frame too large"
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"smaller\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_after\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_after\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_after\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_after\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "upstream_closes_mid_turn",
+      "session": "sess-close",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_x\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_x\",\"output_index\":0,\"content_index\":0,\"delta\":\"partial\"}"
+              ],
+              "close": 1011,
+              "close_text": "internal"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "binary_frame",
+      "session": "sess-binary",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_b\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}"
+              ],
+              "binary": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "continuation_without_socket",
+      "session": "sess-cont-none",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]}],\"stream\":true,\"previous_response_id\":\"resp_gone\"}",
+          "continuation": true
+        }
+      ]
+    },
+    {
+      "name": "continuation_on_socket",
+      "session": "sess-cont",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]}],\"stream\":true}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_k1\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_k1\",\"output_index\":0,\"content_index\":0,\"delta\":\"a\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_k1\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"a\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_k1\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"b\"}]}],\"stream\":true,\"previous_response_id\":\"resp_k1\"}",
+          "continuation": true,
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_k2\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"msg_resp_k2\",\"output_index\":0,\"content_index\":0,\"delta\":\"b\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_resp_k2\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"b\",\"annotations\":[]}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_k2\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"previous_response_id\":null,\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"total_tokens\":7}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "websockets_disabled_continuation",
+      "session": "sess-http",
+      "auths": {
+        "auth-h": {
+          "api_key": "sk-fake-xai-h",
+          "base_url": "http://UPSTREAM/v1"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-h",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"}]}],\"stream\":true,\"previous_response_id\":\"resp_1\"}",
+          "continuation": true
+        }
+      ]
+    },
+    {
+      "name": "reasoning_summary_events",
+      "session": "sess-reasoning",
+      "auths": {
+        "auth-a": {
+          "api_key": "sk-fake-xai-a",
+          "base_url": "http://UPSTREAM/v1",
+          "header:X-Trace": "trace-1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"instructions\":\"be brief\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"think\"}]}],\"stream\":true,\"reasoning\":{\"effort\":\"high\",\"summary\":\"auto\"}}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_z\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"grok-4.3\",\"output\":[]}}",
+                "{\"type\":\"response.reasoning_summary_text.delta\",\"sequence_number\":1,\"item_id\":\"rs_1\",\"output_index\":0,\"summary_index\":0,\"delta\":\"thinking\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thinking\"}],\"encrypted_content\":\"ENC\"}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":3,\"response\":{\"id\":\"resp_z\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":9,\"output_tokens_details\":{\"reasoning_tokens\":7},\"total_tokens\":14}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "RequiredUpstreamRejectsCompactionHTTPFallback",
+      "session": "sess-req-compact",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4\",\"input\":[{\"type\":\"compaction_trigger\"}]}",
+          "model": "grok-4",
+          "continuation": true
+        }
+      ]
+    },
+    {
+      "name": "RestoresNamespaceToolCalls",
+      "session": "sess-RestoresNamespaceToolCalls",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"input\":[{\"type\":\"additional_tools\",\"role\":\"developer\",\"tools\":[{\"type\":\"namespace\",\"name\":\"mcp__exa\",\"tools\":[{\"type\":\"function\",\"name\":\"web_search_exa\",\"parameters\":{\"type\":\"object\"}}]}]},{\"role\":\"user\",\"content\":\"use Exa\"}]}",
+          "model": "grok-4.3",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"mcp__exa__web_search_exa\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "RestoresAliasedWebSearch",
+      "session": "sess-RestoresAliasedWebSearch",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.6\",\"input\":[{\"role\":\"user\",\"content\":\"search query\"}],\"tools\":[{\"type\":\"function\",\"name\":\"web_search\",\"parameters\":{\"type\":\"object\"}}]}",
+          "model": "grok-4.6",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"clientfn_web_search\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[{\"type\":\"function_call\",\"name\":\"clientfn_web_search\",\"call_id\":\"call_1\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "DoesNotRestoreNamespacedClientfnWebSearch",
+      "session": "sess-DoesNotRestoreNamespacedClientfnWebSearch",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.6\",\"input\":[{\"role\":\"user\",\"content\":\"search query\"}],\"tools\":[{\"type\":\"function\",\"name\":\"web_search\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"namespace\",\"name\":\"acme\",\"tools\":[{\"type\":\"function\",\"name\":\"clientfn_web_search\",\"parameters\":{\"type\":\"object\"}}]}]}",
+          "model": "grok-4.6",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"acme__clientfn_web_search\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"name\":\"clientfn_web_search\",\"call_id\":\"call_2\",\"arguments\":\"{}\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[{\"type\":\"function_call\",\"name\":\"acme__clientfn_web_search\",\"call_id\":\"call_1\"},{\"type\":\"function_call\",\"name\":\"clientfn_web_search\",\"call_id\":\"call_2\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "PreservesClientSameNameToolsWithXSearch",
+      "session": "sess-PreservesClientSameNameToolsWithXSearch",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.5\",\"input\":\"search X\",\"tools\":[{\"type\":\"x_search\"},{\"type\":\"function\",\"name\":\"x_keyword_search\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"namespace\",\"name\":\"acme\",\"tools\":[{\"type\":\"function\",\"name\":\"x_keyword_search\",\"parameters\":{\"type\":\"object\"}}]}]}",
+          "model": "grok-4.5",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"xs_call-1\",\"name\":\"x_keyword_search\",\"input\":\"{}\",\"status\":\"completed\"}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"fc_ns\",\"type\":\"function_call\",\"call_id\":\"call_ns\",\"name\":\"acme__x_keyword_search\",\"arguments\":\"{}\",\"status\":\"completed\"}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"id\":\"fc_plain\",\"type\":\"function_call\",\"call_id\":\"call_plain\",\"name\":\"x_keyword_search\",\"arguments\":\"{}\",\"status\":\"completed\"}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":3,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}],\"status\":\"completed\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"xs_call-1\",\"name\":\"x_keyword_search\",\"input\":\"{}\"},{\"id\":\"fc_ns\",\"type\":\"function_call\",\"call_id\":\"call_ns\",\"name\":\"acme__x_keyword_search\",\"arguments\":\"{}\"},{\"id\":\"fc_plain\",\"type\":\"function_call\",\"call_id\":\"call_plain\",\"name\":\"x_keyword_search\",\"arguments\":\"{}\"},{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "PreservesNormalizedCustomSameNameToolWithXSearch",
+      "session": "sess-PreservesNormalizedCustomSameNameToolWithXSearch",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.5\",\"input\":\"search X\",\"tools\":[{\"type\":\"x_search\"},{\"type\":\"custom\",\"name\":\"x_keyword_search\"}]}",
+          "model": "grok-4.5",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"xs_call-1\",\"name\":\"x_keyword_search\",\"input\":\"{}\",\"status\":\"completed\"}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"id\":\"fc_custom\",\"type\":\"function_call\",\"call_id\":\"call_custom\",\"name\":\"x_keyword_search\",\"arguments\":\"{}\",\"status\":\"completed\"}}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}],\"status\":\"completed\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"id\":\"ctc_1\",\"type\":\"custom_tool_call\",\"call_id\":\"xs_call-1\",\"name\":\"x_keyword_search\",\"input\":\"{}\"},{\"id\":\"fc_custom\",\"type\":\"function_call\",\"call_id\":\"call_custom\",\"name\":\"x_keyword_search\",\"arguments\":\"{}\"},{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "NormalizesReasoningTextEvents",
+      "session": "sess-reasoning-text",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"input\":\"hello\"}",
+          "model": "grok-4.3",
+          "response": "codex",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"status\":\"in_progress\",\"summary\":[]}}",
+                "{\"type\":\"response.content_part.added\",\"sequence_number\":2,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"reasoning_text\",\"text\":\"\"}}",
+                "{\"type\":\"response.reasoning_text.delta\",\"sequence_number\":3,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"thinking\"}",
+                "{\"type\":\"response.reasoning_text.done\",\"sequence_number\":4,\"item_id\":\"rs_1\",\"output_index\":0,\"content_index\":0,\"text\":\"thinking\"}",
+                "{\"type\":\"response.output_item.done\",\"sequence_number\":5,\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"status\":\"completed\",\"summary\":[],\"content\":[{\"type\":\"reasoning_text\",\"text\":\"thinking\"}]}}",
+                "{\"type\":\"response.completed\",\"sequence_number\":6,\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "RewritesRepeatedResponseIDForDownstream",
+      "session": "xai-id-map-session",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}]}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp-real\",\"previous_response_id\":\"PREVIOUS_ID\",\"output\":[{\"id\":\"rs_resp-real\",\"type\":\"reasoning\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"previous_response_id\":\"resp-real\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"ok\"}]}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp-real\",\"previous_response_id\":\"PREVIOUS_ID\",\"output\":[{\"id\":\"rs_resp-real\",\"type\":\"reasoning\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"previous_response_id\":\"resp-real-xai-1\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"ok\"}]}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp-real\",\"previous_response_id\":\"PREVIOUS_ID\",\"output\":[{\"id\":\"rs_resp-real\",\"type\":\"reasoning\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "RewritesRepeatedResponseIDWithoutPreviousResponseID",
+      "session": "xai-id-map-no-prev-session",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"first\"}]}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp-real\",\"output\":[{\"id\":\"msg_resp-real\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"second\"}]}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp-real\",\"output\":[{\"id\":\"msg_resp-real\",\"type\":\"message\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ReplaysTranscriptWhenAuthChanges",
+      "session": "xai-auth-switch-session",
+      "auths": {
+        "auth-a": {
+          "access_token": "token-a",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        },
+        "auth-b": {
+          "access_token": "token-b",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        },
+        "auth-c": {
+          "access_token": "token-c",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "auth-a",
+          "payload": "{\"model\":\"grok-4.3\",\"input\":[{\"type\":\"message\",\"id\":\"user-1\",\"role\":\"user\",\"content\":\"first\"}]}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp-auth-a\",\"output\":[{\"type\":\"message\",\"id\":\"msg-resp-auth-a\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "auth-b",
+          "payload": "{\"model\":\"grok-4.3\",\"previous_response_id\":\"resp-auth-a\",\"input\":[{\"type\":\"message\",\"id\":\"user-2\",\"role\":\"user\",\"content\":\"second\"}]}",
+          "reject": {
+            "status": 401,
+            "body": "rejected\n"
+          }
+        },
+        {
+          "auth": "auth-c",
+          "payload": "{\"model\":\"grok-4.3\",\"previous_response_id\":\"resp-auth-a\",\"input\":[{\"type\":\"message\",\"id\":\"user-2\",\"role\":\"user\",\"content\":\"second\"}]}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp-auth-c\",\"output\":[{\"type\":\"message\",\"id\":\"msg-resp-auth-c\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "CompactionTriggerUsesHTTPCompactWithRecordedContext",
+      "session": "xai-compaction-session",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"stream\":true,\"input\":[{\"type\":\"message\",\"id\":\"msg-1\",\"role\":\"user\",\"content\":\"first\"}]}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp-real\",\"output\":[{\"type\":\"message\",\"id\":\"out-1\",\"role\":\"assistant\",\"content\":\"first answer\"}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}"
+              ]
+            }
+          ]
+        },
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"stream\":true,\"previous_response_id\":\"resp-real-xai-1\",\"input\":[{\"type\":\"compaction_trigger\"}]}",
+          "compact": {
+            "status": 200,
+            "body": "{\"id\":\"resp_compact\",\"model\":\"grok-4.3\",\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"TEBc6xxf6DyNkPj1QNTesR4JCJYcHihxUnwlgPSjn+O/Sf1HGiYCvgcqOP4Hwy0vm24gtOLoJUPdgQ3AcF4hnBe15ywiYA8267TF8gwA082T0cvTibY19XGaaMwUf6+DX3Vux2xVY7IPzxnFURZgEUelrUzWHNbW8TJTBekiVVYlJCVNHB1wv8sYrNS6OzVql1QVHfJiop58Oux+9qINlOnzN7noUWhJ3gptUxUG/8a6m3/5u2pQCdtUi2x3ubofSRQ1hPyIcfDmWn2zg+bM/kSqauPvJA+q+0RMyrZKJdfG/tReprXeigxPgyfJyVzSDB7PdfqsL0kFDIg5GXISRQ\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}"
+          }
+        },
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"stream\":true,\"previous_response_id\":\"resp_compact\",\"input\":[{\"type\":\"message\",\"id\":\"msg-2\",\"role\":\"user\",\"content\":\"second\"}]}",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"resp-after-compact\",\"output\":[{\"type\":\"message\",\"id\":\"out-2\",\"role\":\"assistant\",\"content\":\"second answer\"}],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "CompletesGenerateFalseWarmup",
+      "session": "sess-CompletesGenerateFalseWarmup",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"generate\":false,\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"warm up\"}]}",
+          "model": "grok-4.3",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.created\",\"response\":{\"id\":\"resp-warmup-1\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":[]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "HandshakeFreeUsageExhaustedSetsRetryAfter",
+      "session": "sess-free-usage",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"input\":\"hello\"}",
+          "reject": {
+            "status": 429,
+            "body": "{\"code\":\"subscription:free-usage-exhausted\",\"error\":\"You've used all the included free usage for now.\"}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "StopsOnBareErrorPayload",
+      "session": "sess-StopsOnBareErrorPayload",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"input\":\"hello\"}",
+          "model": "grok-4.3",
+          "acts": [
+            {
+              "send": [
+                "{\"error\":{\"message\":\"Request validation error: {\\\"code\\\":\\\"400\\\",\\\"error\\\":\\\"Argument not supported: instructions and previous_response_id together\\\"}\",\"type\":\"api_error\"}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "CompactionTriggerFreshSessionFallback/xai-compaction-fresh-input-session",
+      "session": "xai-compaction-fresh-input-session",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"stream\":true,\"previous_response_id\":\"resp-should-be-dropped\",\"input\":[{\"type\":\"message\",\"id\":\"msg-fresh-1\",\"role\":\"user\",\"content\":\"hello\"},{\"type\":\"compaction_trigger\"}]}",
+          "compact": {
+            "status": 200,
+            "body": "{\"id\":\"resp_compact_fresh\",\"output\":[{\"id\":\"cmp-1\",\"type\":\"compaction\",\"encrypted_content\":\"ZW5jcnlwdGVk\"}]}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "CompactionTriggerFreshSessionFallback/xai-compaction-fresh-prev-session",
+      "session": "xai-compaction-fresh-prev-session",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"stream\":true,\"previous_response_id\":\"resp-prev-123\",\"input\":[{\"type\":\"compaction_trigger\"}]}",
+          "compact": {
+            "status": 200,
+            "body": "{\"id\":\"resp_compact_fresh\",\"output\":[{\"id\":\"cmp-1\",\"type\":\"compaction\",\"encrypted_content\":\"ZW5jcnlwdGVk\"}]}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "CompactionTriggerFreshSessionFallback/xai-compaction-fresh-empty-session",
+      "session": "xai-compaction-fresh-empty-session",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"stream\":true,\"input\":[{\"type\":\"compaction_trigger\"}]}",
+          "compact": {
+            "status": 200,
+            "body": "{\"id\":\"resp_compact_fresh\",\"output\":[{\"id\":\"cmp-1\",\"type\":\"compaction\",\"encrypted_content\":\"ZW5jcnlwdGVk\"}]}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "KeepalivePingDuringUpload_WithSession",
+      "session": "xai-session-ping-test",
+      "auths": {
+        "x": {
+          "api_key": "xai-test-key",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"ping test\"}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "ping": "xai-session-ping",
+              "send": [
+                "{\"type\":\"response.done\",\"response\":{\"id\":\"resp-1\",\"status\":\"completed\",\"output\":[]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=false/snapshotOnly=false/sparseTerminal=false/lateName=false",
+      "session": "sess-ApplyPatchTransport/fold=false/snapshotOnly=false/sparseTerminal=false/lateName=false",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"apply_patch\",\"arguments\":\"\"}}",
+                "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"a\",\"delta\":\"{\\\"input\\\":\\\"p\\\\n中😀\\\"}\"}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"input\\\":\\\"p\\\\n中😀\\\"}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"p\\\\n中😀\\\"}\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=false/snapshotOnly=true/sparseTerminal=false/lateName=false",
+      "session": "sess-ApplyPatchTransport/fold=false/snapshotOnly=true/sparseTerminal=false/lateName=false",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"name\":\"apply_patch\",\"arguments\":\"\"}}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"input\\\":\\\"p\\\\n中😀\\\"}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"apply_patch\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=false/snapshotOnly=true/sparseTerminal=true/lateName=false",
+      "session": "sess-ApplyPatchTransport/fold=false/snapshotOnly=true/sparseTerminal=true/lateName=false",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"name\":\"apply_patch\",\"arguments\":\"\"}}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"input\\\":\\\"p\\\\n中😀\\\"}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"apply_patch\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"apply_patch\"}]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=false/snapshotOnly=true/sparseTerminal=false/lateName=true",
+      "session": "sess-ApplyPatchTransport/fold=false/snapshotOnly=true/sparseTerminal=false/lateName=true",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\"}}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"input\\\":\\\"p\\\\n中😀\\\"}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"apply_patch\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=false/snapshotOnly=true/sparseTerminal=true/lateName=true",
+      "session": "sess-ApplyPatchTransport/fold=false/snapshotOnly=true/sparseTerminal=true/lateName=true",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\"}}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"input\\\":\\\"p\\\\n中😀\\\"}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"apply_patch\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"apply_patch\"}]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=true/snapshotOnly=false/sparseTerminal=false/lateName=false",
+      "session": "sess-ApplyPatchTransport/fold=true/snapshotOnly=false/sparseTerminal=false/lateName=false",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"namespace\",\"name\":\"n\",\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"},{\"type\":\"function\",\"name\":\"lookup0\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup1\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup2\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup3\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup4\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup5\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup6\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup7\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup8\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup9\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup10\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup11\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup12\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup13\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup14\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup15\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup16\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup17\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup18\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup19\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup20\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup21\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup22\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup23\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup24\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup25\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup26\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup27\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup28\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup29\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup30\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup31\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup32\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup33\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup34\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup35\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup36\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup37\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup38\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup39\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup40\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup41\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup42\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup43\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup44\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup45\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup46\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup47\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup48\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup49\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup50\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup51\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup52\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup53\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup54\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup55\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup56\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup57\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup58\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup59\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup60\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup61\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup62\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup63\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup64\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup65\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup66\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup67\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup68\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup69\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup70\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup71\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup72\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup73\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup74\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup75\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup76\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup77\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup78\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup79\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup80\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup81\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup82\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup83\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup84\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup85\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup86\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup87\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup88\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup89\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup90\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup91\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup92\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup93\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup94\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup95\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup96\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup97\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup98\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup99\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup100\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup101\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup102\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup103\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup104\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup105\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup106\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup107\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup108\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup109\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup110\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup111\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup112\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup113\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup114\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup115\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup116\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup117\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup118\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup119\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup120\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup121\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup122\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup123\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup124\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup125\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup126\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup127\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup128\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup129\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup130\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup131\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup132\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup133\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup134\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup135\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup136\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup137\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup138\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup139\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup140\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup141\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup142\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup143\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup144\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup145\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup146\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup147\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup148\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup149\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup150\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup151\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup152\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup153\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup154\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup155\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup156\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup157\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup158\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup159\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup160\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup161\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup162\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup163\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup164\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup165\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup166\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup167\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup168\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup169\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup170\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup171\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup172\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup173\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup174\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup175\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup176\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup177\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup178\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup179\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup180\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup181\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup182\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup183\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup184\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup185\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup186\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup187\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup188\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup189\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup190\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup191\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup192\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup193\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup194\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup195\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup196\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup197\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup198\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup199\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup200\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup201\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup202\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup203\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup204\",\"parameters\":{\"type\":\"object\"}}]}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"n\",\"arguments\":\"\"}}",
+                "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"a\",\"delta\":\"{\\\"name\\\":\\\"apply_patch\\\",\\\"arguments\\\":{\\\"input\\\":\\\"p\\\\n中😀\\\"}}\"}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"name\\\":\\\"apply_patch\\\",\\\"arguments\\\":{\\\"input\\\":\\\"p\\\\n中😀\\\"}}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"n\",\"arguments\":\"{\\\"name\\\":\\\"apply_patch\\\",\\\"arguments\\\":{\\\"input\\\":\\\"p\\\\n中😀\\\"}}\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=true/snapshotOnly=true/sparseTerminal=false/lateName=false",
+      "session": "sess-ApplyPatchTransport/fold=true/snapshotOnly=true/sparseTerminal=false/lateName=false",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"namespace\",\"name\":\"n\",\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"},{\"type\":\"function\",\"name\":\"lookup0\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup1\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup2\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup3\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup4\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup5\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup6\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup7\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup8\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup9\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup10\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup11\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup12\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup13\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup14\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup15\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup16\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup17\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup18\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup19\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup20\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup21\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup22\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup23\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup24\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup25\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup26\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup27\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup28\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup29\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup30\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup31\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup32\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup33\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup34\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup35\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup36\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup37\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup38\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup39\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup40\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup41\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup42\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup43\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup44\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup45\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup46\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup47\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup48\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup49\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup50\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup51\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup52\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup53\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup54\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup55\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup56\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup57\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup58\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup59\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup60\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup61\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup62\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup63\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup64\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup65\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup66\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup67\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup68\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup69\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup70\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup71\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup72\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup73\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup74\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup75\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup76\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup77\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup78\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup79\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup80\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup81\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup82\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup83\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup84\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup85\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup86\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup87\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup88\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup89\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup90\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup91\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup92\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup93\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup94\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup95\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup96\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup97\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup98\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup99\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup100\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup101\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup102\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup103\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup104\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup105\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup106\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup107\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup108\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup109\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup110\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup111\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup112\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup113\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup114\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup115\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup116\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup117\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup118\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup119\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup120\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup121\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup122\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup123\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup124\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup125\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup126\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup127\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup128\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup129\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup130\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup131\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup132\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup133\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup134\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup135\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup136\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup137\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup138\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup139\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup140\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup141\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup142\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup143\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup144\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup145\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup146\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup147\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup148\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup149\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup150\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup151\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup152\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup153\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup154\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup155\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup156\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup157\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup158\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup159\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup160\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup161\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup162\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup163\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup164\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup165\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup166\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup167\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup168\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup169\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup170\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup171\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup172\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup173\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup174\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup175\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup176\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup177\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup178\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup179\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup180\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup181\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup182\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup183\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup184\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup185\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup186\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup187\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup188\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup189\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup190\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup191\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup192\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup193\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup194\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup195\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup196\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup197\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup198\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup199\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup200\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup201\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup202\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup203\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup204\",\"parameters\":{\"type\":\"object\"}}]}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"name\":\"n\",\"arguments\":\"\"}}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"name\\\":\\\"apply_patch\\\",\\\"arguments\\\":{\\\"input\\\":\\\"p\\\\n中😀\\\"}}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"n\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=true/snapshotOnly=true/sparseTerminal=true/lateName=false",
+      "session": "sess-ApplyPatchTransport/fold=true/snapshotOnly=true/sparseTerminal=true/lateName=false",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"namespace\",\"name\":\"n\",\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"},{\"type\":\"function\",\"name\":\"lookup0\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup1\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup2\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup3\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup4\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup5\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup6\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup7\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup8\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup9\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup10\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup11\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup12\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup13\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup14\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup15\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup16\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup17\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup18\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup19\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup20\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup21\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup22\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup23\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup24\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup25\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup26\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup27\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup28\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup29\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup30\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup31\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup32\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup33\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup34\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup35\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup36\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup37\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup38\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup39\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup40\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup41\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup42\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup43\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup44\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup45\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup46\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup47\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup48\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup49\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup50\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup51\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup52\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup53\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup54\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup55\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup56\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup57\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup58\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup59\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup60\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup61\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup62\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup63\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup64\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup65\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup66\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup67\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup68\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup69\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup70\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup71\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup72\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup73\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup74\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup75\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup76\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup77\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup78\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup79\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup80\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup81\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup82\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup83\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup84\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup85\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup86\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup87\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup88\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup89\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup90\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup91\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup92\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup93\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup94\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup95\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup96\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup97\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup98\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup99\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup100\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup101\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup102\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup103\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup104\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup105\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup106\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup107\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup108\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup109\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup110\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup111\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup112\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup113\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup114\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup115\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup116\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup117\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup118\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup119\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup120\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup121\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup122\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup123\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup124\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup125\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup126\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup127\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup128\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup129\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup130\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup131\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup132\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup133\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup134\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup135\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup136\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup137\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup138\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup139\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup140\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup141\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup142\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup143\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup144\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup145\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup146\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup147\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup148\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup149\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup150\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup151\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup152\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup153\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup154\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup155\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup156\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup157\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup158\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup159\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup160\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup161\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup162\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup163\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup164\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup165\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup166\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup167\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup168\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup169\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup170\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup171\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup172\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup173\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup174\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup175\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup176\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup177\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup178\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup179\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup180\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup181\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup182\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup183\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup184\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup185\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup186\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup187\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup188\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup189\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup190\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup191\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup192\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup193\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup194\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup195\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup196\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup197\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup198\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup199\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup200\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup201\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup202\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup203\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup204\",\"parameters\":{\"type\":\"object\"}}]}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"name\":\"n\",\"arguments\":\"\"}}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"name\\\":\\\"apply_patch\\\",\\\"arguments\\\":{\\\"input\\\":\\\"p\\\\n中😀\\\"}}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"n\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"n\"}]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=true/snapshotOnly=true/sparseTerminal=false/lateName=true",
+      "session": "sess-ApplyPatchTransport/fold=true/snapshotOnly=true/sparseTerminal=false/lateName=true",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"namespace\",\"name\":\"n\",\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"},{\"type\":\"function\",\"name\":\"lookup0\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup1\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup2\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup3\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup4\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup5\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup6\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup7\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup8\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup9\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup10\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup11\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup12\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup13\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup14\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup15\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup16\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup17\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup18\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup19\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup20\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup21\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup22\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup23\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup24\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup25\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup26\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup27\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup28\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup29\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup30\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup31\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup32\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup33\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup34\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup35\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup36\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup37\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup38\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup39\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup40\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup41\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup42\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup43\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup44\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup45\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup46\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup47\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup48\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup49\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup50\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup51\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup52\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup53\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup54\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup55\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup56\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup57\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup58\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup59\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup60\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup61\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup62\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup63\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup64\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup65\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup66\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup67\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup68\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup69\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup70\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup71\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup72\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup73\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup74\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup75\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup76\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup77\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup78\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup79\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup80\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup81\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup82\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup83\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup84\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup85\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup86\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup87\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup88\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup89\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup90\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup91\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup92\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup93\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup94\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup95\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup96\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup97\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup98\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup99\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup100\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup101\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup102\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup103\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup104\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup105\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup106\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup107\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup108\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup109\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup110\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup111\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup112\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup113\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup114\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup115\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup116\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup117\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup118\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup119\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup120\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup121\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup122\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup123\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup124\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup125\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup126\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup127\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup128\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup129\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup130\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup131\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup132\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup133\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup134\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup135\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup136\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup137\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup138\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup139\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup140\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup141\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup142\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup143\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup144\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup145\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup146\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup147\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup148\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup149\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup150\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup151\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup152\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup153\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup154\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup155\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup156\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup157\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup158\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup159\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup160\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup161\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup162\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup163\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup164\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup165\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup166\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup167\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup168\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup169\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup170\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup171\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup172\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup173\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup174\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup175\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup176\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup177\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup178\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup179\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup180\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup181\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup182\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup183\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup184\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup185\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup186\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup187\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup188\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup189\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup190\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup191\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup192\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup193\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup194\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup195\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup196\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup197\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup198\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup199\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup200\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup201\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup202\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup203\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup204\",\"parameters\":{\"type\":\"object\"}}]}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\"}}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"name\\\":\\\"apply_patch\\\",\\\"arguments\\\":{\\\"input\\\":\\\"p\\\\n中😀\\\"}}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"n\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchTransport/fold=true/snapshotOnly=true/sparseTerminal=true/lateName=true",
+      "session": "sess-ApplyPatchTransport/fold=true/snapshotOnly=true/sparseTerminal=true/lateName=true",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"namespace\",\"name\":\"n\",\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"},{\"type\":\"function\",\"name\":\"lookup0\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup1\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup2\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup3\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup4\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup5\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup6\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup7\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup8\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup9\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup10\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup11\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup12\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup13\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup14\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup15\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup16\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup17\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup18\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup19\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup20\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup21\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup22\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup23\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup24\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup25\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup26\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup27\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup28\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup29\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup30\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup31\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup32\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup33\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup34\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup35\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup36\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup37\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup38\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup39\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup40\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup41\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup42\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup43\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup44\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup45\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup46\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup47\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup48\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup49\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup50\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup51\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup52\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup53\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup54\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup55\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup56\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup57\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup58\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup59\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup60\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup61\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup62\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup63\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup64\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup65\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup66\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup67\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup68\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup69\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup70\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup71\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup72\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup73\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup74\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup75\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup76\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup77\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup78\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup79\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup80\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup81\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup82\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup83\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup84\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup85\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup86\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup87\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup88\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup89\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup90\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup91\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup92\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup93\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup94\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup95\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup96\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup97\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup98\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup99\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup100\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup101\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup102\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup103\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup104\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup105\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup106\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup107\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup108\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup109\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup110\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup111\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup112\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup113\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup114\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup115\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup116\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup117\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup118\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup119\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup120\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup121\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup122\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup123\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup124\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup125\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup126\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup127\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup128\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup129\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup130\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup131\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup132\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup133\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup134\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup135\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup136\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup137\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup138\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup139\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup140\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup141\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup142\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup143\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup144\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup145\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup146\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup147\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup148\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup149\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup150\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup151\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup152\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup153\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup154\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup155\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup156\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup157\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup158\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup159\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup160\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup161\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup162\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup163\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup164\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup165\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup166\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup167\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup168\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup169\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup170\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup171\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup172\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup173\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup174\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup175\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup176\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup177\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup178\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup179\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup180\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup181\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup182\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup183\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup184\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup185\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup186\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup187\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup188\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup189\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup190\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup191\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup192\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup193\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup194\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup195\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup196\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup197\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup198\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup199\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup200\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup201\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup202\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup203\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"lookup204\",\"parameters\":{\"type\":\"object\"}}]}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\"}}",
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"a\",\"arguments\":\"{\\\"name\\\":\\\"apply_patch\\\",\\\"arguments\\\":{\\\"input\\\":\\\"p\\\\n中😀\\\"}}\"}",
+                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"n\"}}",
+                "{\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[{\"type\":\"function_call\",\"id\":\"a\",\"call_id\":\"c\",\"name\":\"n\"}]}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ApplyPatchIncompleteEOF",
+      "session": "sess-apply-patch-eof",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"a\",\"name\":\"apply_patch\",\"arguments\":\"\"}}"
+              ],
+              "drop": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "usage_ignores_incomplete",
+      "session": "sess-usage-incomplete",
+      "auths": {
+        "x": {
+          "api_key": "test",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"input\":[],\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"}]}",
+          "model": "grok-4",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_u\",\"status\":\"incomplete\",\"model\":\"grok-4\",\"output\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":4,\"total_tokens\":8}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "usage_on_done",
+      "session": "sess-usage_on_done",
+      "auths": {
+        "x": {
+          "access_token": "xai-token",
+          "base_url": "http://UPSTREAM/v1",
+          "websockets": "true"
+        }
+      },
+      "turns": [
+        {
+          "auth": "x",
+          "payload": "{\"model\":\"grok-4.3\",\"input\":\"hello\"}",
+          "model": "grok-4.3",
+          "acts": [
+            {
+              "send": [
+                "{\"type\":\"response.done\",\"response\":{\"id\":\"resp_d\",\"status\":\"completed\",\"model\":\"grok-4.3\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

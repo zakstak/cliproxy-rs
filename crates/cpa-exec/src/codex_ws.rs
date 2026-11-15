@@ -2880,15 +2880,21 @@ mod tests;
 mod close_text_tests {
     use super::close_error_text;
 
-    /// gorilla/websocket `CloseError.Error()` texts, which Go returns unchanged.
+    /// A useful close diagnostic keeps its RFC 6455 code and peer reason. Library
+    /// prefixes and parenthesized descriptions are not part of the client contract.
     #[test]
-    fn close_errors_read_like_gorilla() {
-        assert_eq!(close_error_text(1000, ""), "websocket: close 1000 (normal)");
-        assert_eq!(close_error_text(1001, "bye"), "websocket: close 1001 (going away): bye");
-        assert_eq!(
-            close_error_text(1006, "unexpected EOF"),
-            "websocket: close 1006 (abnormal closure): unexpected EOF"
-        );
-        assert_eq!(close_error_text(4000, "x"), "websocket: close 4000: x");
+    fn close_diagnostics_retain_the_status_code_and_peer_reason() {
+        for (code, reason) in [
+            (1000, ""),
+            (1001, "bye"),
+            (1006, "unexpected EOF"),
+            (4000, "application reason"),
+        ] {
+            let message = close_error_text(code, reason);
+            assert!(message.contains(&code.to_string()), "{message}");
+            if !reason.is_empty() {
+                assert!(message.ends_with(reason), "{message}");
+            }
+        }
     }
 }

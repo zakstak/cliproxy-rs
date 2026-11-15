@@ -266,21 +266,17 @@ pub fn parse_jwt_identity(token: &str) -> (String, String) {
     (claim("email"), claim("sub"))
 }
 
-/// `time.Duration(seconds) * time.Second` in nanoseconds, wrapping like Go's int64.
-fn go_seconds(seconds: i64) -> i64 {
-    seconds.wrapping_mul(1_000_000_000)
-}
-
 /// `buildTokenData`. Identity comes from the untrimmed ID token, as in Go.
 fn token_data(decoded: &Decoded, now: DateTime<Utc>) -> TokenData {
     let (email, subject) = parse_jwt_identity(&decoded.s("id_token"));
     let expires_in = decoded.i("expires_in");
-    let expire = (expires_in > 0).then(|| {
-        let at = now
-            .checked_add_signed(chrono::Duration::nanoseconds(go_seconds(expires_in)))
-            .unwrap_or(now);
-        rfc3339_utc(at)
-    });
+    // OAuth expires_in is seconds. An unrepresentable duration is an unknown
+    // expiry, never a wrapping timestamp that can put a fresh token in the past.
+    let expire = (expires_in > 0)
+        .then(|| chrono::Duration::try_seconds(expires_in))
+        .flatten()
+        .and_then(|duration| now.checked_add_signed(duration))
+        .map(rfc3339_utc);
     TokenData {
         access_token: decoded.s("access_token").trim().to_owned(),
         refresh_token: decoded.s("refresh_token").trim().to_owned(),
@@ -293,26 +289,26 @@ fn token_data(decoded: &Decoded, now: DateTime<Utc>) -> TokenData {
     }
 }
 
-/// The poll interval Go starts with (`PollForToken`).
+/// Device polling respects the provider interval and the configured minimum,
+/// bounded by the maximum lifetime of the device flow.
 fn initial_interval(device_interval: i64, min_poll: Option<Duration>) -> Duration {
-    let min = min_poll.unwrap_or(DEFAULT_POLL_INTERVAL);
-    let interval = go_seconds(device_interval);
-    if (min_poll.is_some() && device_interval <= 0) || interval < min.as_nanos() as i64 {
-        min
-    } else {
-        Duration::from_nanos(interval as u64)
-    }
+    let minimum = min_poll.unwrap_or(DEFAULT_POLL_INTERVAL);
+    let interval = u64::try_from(device_interval)
+        .map(Duration::from_secs)
+        .unwrap_or_default();
+    interval.max(minimum).min(MAX_POLL_DURATION)
 }
 
-/// When polling stops, in nanoseconds after the first poll: 30 minutes, or the device
-/// code lifetime when that is earlier (Go's wrapped duration can lie in the past).
+/// Nanoseconds until polling stops: the earlier of the positive device lifetime
+/// and the 30-minute protection cap. Saturation prevents a remote integer from
+/// turning a future deadline into an already expired one.
 fn poll_deadline(expires_in: i64) -> i64 {
-    let max = MAX_POLL_DURATION.as_nanos() as i64;
-    if expires_in > 0 {
-        go_seconds(expires_in).min(max)
+    let seconds = if expires_in > 0 {
+        (expires_in as u64).min(MAX_POLL_DURATION.as_secs())
     } else {
-        max
-    }
+        MAX_POLL_DURATION.as_secs()
+    };
+    (seconds * 1_000_000_000) as i64
 }
 
 /// One xAI OAuth client.

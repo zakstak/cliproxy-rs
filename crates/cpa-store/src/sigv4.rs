@@ -1,4 +1,4 @@
-//! AWS Signature Version 4 for S3, as minio-go's `signer.SignV4` computes it.
+//! AWS Signature Version 4 for S3.
 
 use chrono::{DateTime, Utc};
 use cpa_core::gostr::GoStr;
@@ -149,61 +149,64 @@ mod tests {
     }
 
     #[test]
-    fn signatures_match_minio_go() {
-        let doc: Value = serde_json::from_str(include_str!("../tests/fixtures/go_sigv4_golden.json")).unwrap();
-        for case in doc.as_array().unwrap() {
-            let input = &case["case"];
-            let url = url::Url::parse(input["url"].as_str().unwrap()).unwrap();
-            let signed = &case["signed_headers"];
-            let amz_date = signed["X-Amz-Date"].as_str().unwrap();
-            let now = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
-                .unwrap()
-                .and_utc();
-            let query: Vec<(String, String)> = url
-                .query_pairs()
-                .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                .collect();
-            let headers: Vec<(String, String)> = input["headers"]
-                .as_object()
-                .unwrap()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
-                .collect();
-            let host = match url.port() {
-                Some(port) => format!("{}:{port}", url.host_str().unwrap()),
-                None => url.host_str().unwrap().to_owned(),
-            };
-            let path = percent_decode(url.path());
-            let payload = input["headers"]["X-Amz-Content-Sha256"].as_str().unwrap();
+    fn s3_signatures_match_independent_aws_canonical_request_vectors() {
+        // AWS SigV4 is the authority. The companion Python standard-library script
+        // signs explicit canonical requests without executing this implementation.
+        let doc: Value = serde_json::from_str(include_str!("../tests/fixtures/sigv4_contract.json")).unwrap();
+        let date = doc["date"].as_str().unwrap();
+        let now = chrono::NaiveDateTime::parse_from_str(date, "%Y%m%dT%H%M%SZ")
+            .unwrap()
+            .and_utc();
+        for case in doc["cases"].as_array().unwrap() {
+            let query: Vec<(String, String)> = serde_json::from_value(case["query"].clone()).unwrap();
+            let headers: Vec<(String, String)> = serde_json::from_value(case["headers"].clone()).unwrap();
             let request = Request {
-                method: input["method"].as_str().unwrap(),
-                path: &path,
+                method: case["method"].as_str().unwrap(),
+                path: case["path"].as_str().unwrap(),
                 query: &query,
                 headers: &headers,
-                host: &host,
-                payload_sha256: payload,
+                host: case["host"].as_str().unwrap(),
+                payload_sha256: case["payload_sha256"].as_str().unwrap(),
             };
-            let (date, authorization) = sign(
+            let canonical = case["canonical_request"]
+                .as_str()
+                .unwrap()
+                .split('\n')
+                .collect::<Vec<_>>();
+            assert_eq!(encode_path(request.path), canonical[1]);
+            assert_eq!(canonical_query(&query), canonical[2]);
+            let (actual_date, actual) = sign(
                 &request,
-                "AKIAEXAMPLE",
-                "secret/key+EXAMPLE",
-                input["region"].as_str().unwrap(),
+                doc["access_key"].as_str().unwrap(),
+                doc["secret_key"].as_str().unwrap(),
+                case["region"].as_str().unwrap(),
                 now,
             );
-            assert_eq!(date, amz_date);
+            assert_eq!(actual_date, date);
+            assert_eq!(actual, case["authorization"], "{} {}", request.method, request.path);
+            // Header order, casing and insignificant whitespace do not change the signature.
+            let mut reordered: Vec<_> = headers
+                .iter()
+                .rev()
+                .map(|(key, value)| (key.to_ascii_uppercase(), format!("  {value}  ")))
+                .collect();
+            reordered.push(("User-Agent".into(), "different client".into()));
+            reordered.push(("Authorization".into(), "must be ignored".into()));
+            let altered = Request {
+                headers: &reordered,
+                ..request
+            };
             assert_eq!(
-                authorization,
-                signed["Authorization"].as_str().unwrap(),
-                "{}",
-                input["url"]
+                sign(
+                    &altered,
+                    doc["access_key"].as_str().unwrap(),
+                    doc["secret_key"].as_str().unwrap(),
+                    case["region"].as_str().unwrap(),
+                    now
+                )
+                .1,
+                actual
             );
         }
-    }
-
-    fn percent_decode(path: &str) -> String {
-        url::form_urlencoded::parse(format!("x={}", path.replace('+', "%2B")).as_bytes())
-            .next()
-            .map(|(_, v)| v.into_owned())
-            .unwrap()
     }
 }

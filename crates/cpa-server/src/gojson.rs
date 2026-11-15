@@ -150,48 +150,59 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn strings_and_maps_match_go_marshal() {
-        // Values checked against Go 1.26 json.Marshal.
+    fn generated_json_preserves_values_and_escapes_controls() {
+        for value in ["a<b>&\"\u{2028}\u{1}", "q\"é", "plain <b>", "\r\n\t\\"] {
+            for encoded in [string(value), sjson_string(value)] {
+                assert_eq!(serde_json::from_str::<String>(&encoded).unwrap(), value);
+                assert!(!encoded.contains('\n'), "a string cannot create a new JSON line");
+                assert!(!encoded.contains('\r'));
+            }
+        }
+        let value = serde_json::json!({"z": 1, "a": {"y": [true, null], "b": "x"}});
+        assert_eq!(serde_json::from_str::<Value>(&sorted(&value)).unwrap(), value);
+        let encoded = Obj::new().str("message", "m<&>").str("type", "t").finish();
         assert_eq!(
-            string("a<b>&\"\u{2028}\u{1}"),
-            r#""a\u003cb\u003e\u0026\"\u2028\u0001""#
-        );
-        let v: Value = serde_json::from_str(r#"{"z":1,"a":{"y":[true,null],"b":"x"}}"#).unwrap();
-        assert_eq!(sorted(&v), r#"{"a":{"b":"x","y":[true,null]},"z":1}"#);
-        assert_eq!(sjson_string("q\"é"), r#""q\"é""#);
-        assert_eq!(sjson_string("plain <b>"), r#""plain <b>""#);
-        assert_eq!(
-            Obj::new().str("message", "m").str("type", "t").finish(),
-            r#"{"message":"m","type":"t"}"#
+            serde_json::from_str::<Value>(&encoded).unwrap(),
+            serde_json::json!({"message":"m<&>","type":"t"})
         );
     }
 
     #[test]
-    fn durations_match_go_string() {
-        for (d, s) in [
-            (Duration::ZERO, "0s"),
-            (Duration::from_secs(1), "1s"),
-            (Duration::from_secs(60), "1m0s"),
-            (Duration::from_secs(3600), "1h0m0s"),
-            (Duration::from_secs(5400), "1h30m0s"),
-            (Duration::from_millis(1500), "1.5s"),
-            (Duration::from_millis(250), "250ms"),
-            (Duration::from_micros(3), "3µs"),
-            (Duration::from_secs(43200), "12h0m0s"),
+    fn displayed_durations_round_trip_without_losing_precision() {
+        for value in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_micros(3),
+            Duration::from_millis(250),
+            Duration::from_millis(1500),
+            Duration::from_secs(60),
+            Duration::from_secs(5400),
+            Duration::from_secs(43200),
         ] {
-            assert_eq!(duration(d), s);
+            let rendered = duration(value);
+            assert_eq!(
+                cpa_core::config::parse_duration(&rendered),
+                Some(i64::try_from(value.as_nanos()).unwrap()),
+                "{rendered}"
+            );
         }
     }
 
     #[test]
-    fn gjson_string_matches_result_string() {
-        let v: Value = serde_json::from_str(r#"{"a":"x","b":5,"c":true,"d":null,"e":{"k":1}}"#).unwrap();
-        let get = |k| gjson_string(v.get(k));
+    fn diagnostic_values_are_readable_and_missing_values_are_empty() {
+        let value = serde_json::json!({"text": "x", "number": 5, "flag": true, "none": null, "object": {"k": 1}});
+        for (field, expected) in [
+            ("text", "x"),
+            ("number", "5"),
+            ("flag", "true"),
+            ("none", ""),
+            ("missing", ""),
+        ] {
+            assert_eq!(gjson_string(value.get(field)), expected);
+        }
         assert_eq!(
-            (get("a"), get("b"), get("c"), get("d")),
-            ("x".into(), "5".into(), "true".into(), String::new())
+            serde_json::from_str::<Value>(&gjson_string(value.get("object"))).unwrap(),
+            value["object"]
         );
-        assert_eq!(get("e"), r#"{"k":1}"#);
-        assert_eq!(get("missing"), "");
     }
 }

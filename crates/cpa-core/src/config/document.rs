@@ -743,9 +743,8 @@ impl ConfigDocument {
     }
 }
 
-/// Go's `buildV8Paths` output for v8.0.35, in its order: the declared legacy leaves
-/// and structs, each with its v8 path. Regenerate with
-/// `tests/reference/legacy_paths/main.go`.
+/// Legacy configuration paths accepted by the migration layer, recorded from v8.0.35.
+/// Keep this table with the supported operator-facing legacy spellings.
 #[derive(serde::Deserialize)]
 struct LegacyPaths {
     leaves: Vec<(String, String)>,

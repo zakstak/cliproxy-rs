@@ -198,7 +198,7 @@ mod tests {
 
     /// Go `TestStatusFromHomeErrorCodeMapsAuthenticationErrorToUnauthorized`.
     #[test]
-    fn error_codes_map_to_go_statuses() {
+    fn refresh_errors_map_to_public_statuses() {
         for code in ["authentication_error", "unauthorized"] {
             assert_eq!(status_from_code(code), 401);
         }

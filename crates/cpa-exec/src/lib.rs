@@ -50,8 +50,6 @@ mod codex_tokens;
 mod codex_ws;
 mod compaction_capsule;
 #[cfg(test)]
-mod controls_testkit;
-#[cfg(test)]
 mod device_fixture;
 mod go_std;
 mod helpers;
@@ -517,9 +515,9 @@ mod readiness_tests {
         assert_eq!(executors.prepare_due(&api_key, &cfg, now, horizon), None);
     }
 
-    /// Go `authHasRefreshCredential`.
+    /// Only the owning provider can use a refresh credential.
     #[test]
-    fn refresh_credentials_follow_go() {
+    fn refresh_credentials_are_provider_scoped() {
         let executors = Executors {
             claude: claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),

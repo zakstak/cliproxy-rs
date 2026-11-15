@@ -126,9 +126,10 @@ pub(crate) fn stripped(body: &Bytes) -> Option<Bytes> {
 mod tests {
     use super::*;
 
-    /// Go helps/responses_tool_search_test.go.
+    /// Fallback removes client search declarations and their transcript, while
+    /// ordinary tools and caller messages keep their meaning.
     #[test]
-    fn detects_and_strips_client_tool_search_like_go() {
+    fn fallback_removes_client_search_and_keeps_ordinary_tools_and_messages() {
         for (payload, want) in [
             (
                 r#"{"tools":[{"type":"tool_search","execution":"client"}],"input":"hi"}"#,
@@ -178,16 +179,30 @@ mod tests {
         ] {
             let got = strip(payload.as_bytes());
             if !tools.is_empty() {
-                assert_eq!(gj::get(&got, "tools").raw(), tools.as_bytes(), "{payload}");
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(gj::get(&got, "tools").raw()).unwrap(),
+                    serde_json::from_str::<serde_json::Value>(tools).unwrap(),
+                    "{payload}"
+                );
             }
-            assert_eq!(gj::get(&got, "input").raw(), input.as_bytes(), "{payload}");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(gj::get(&got, "input").raw()).unwrap(),
+                serde_json::from_str::<serde_json::Value>(input).unwrap(),
+                "{payload}"
+            );
+            assert!(!has(&got), "fallback retained client search: {payload}");
+            assert_eq!(strip(&got), got, "fallback is idempotent");
         }
         let unchanged =
             Bytes::from_static(br#"{"tools":[{"type":"function","name":"a"},{"type":"tool_search"}],"input":[{"type":"message","role":"user","content":"hi"}]}"#);
         assert!(stripped(&unchanged).is_none());
+        let preserved = br#"{ "opaque": 9007199254740993, "tools":[{"type":"function","name":"a"},{"type":"tool_search","execution":"client"}], "input":"hello" }"#;
+        let edited = strip(preserved);
+        assert!(String::from_utf8_lossy(&edited).contains(r#""opaque": 9007199254740993"#));
+        assert_eq!(gj::get(&edited, "input").raw(), br#""hello""#);
     }
 
-    /// Go helps/claude_tool_search_model_test.go.
+    /// Supported native-search model policy, including routed model IDs.
     #[test]
     fn legacy_models_lack_tool_search() {
         for model in [

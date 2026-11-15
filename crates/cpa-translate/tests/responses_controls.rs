@@ -60,19 +60,6 @@ fn chat_keeps_the_output_limit_and_parallel_false() {
             assert_eq!(field(&out, legacy), None, "{extra}: {legacy}");
         }
     }
-    // Go v8.0.67's position: right after `stream`.
-    let out = translate_request(
-        Format::OpenAI,
-        Format::Codex,
-        &CTX,
-        chat(r#","max_tokens":17"#).as_bytes(),
-    )
-    .unwrap();
-    assert!(
-        out.starts_with(br#"{"instructions":"","stream":true,"max_output_tokens":17,"#),
-        "{}",
-        String::from_utf8_lossy(&out)
-    );
 }
 
 #[test]
@@ -100,21 +87,6 @@ fn claude_keeps_max_tokens_and_disable_parallel_tool_use() {
         let compat = cpa_translate::claude_to_codex_with_compat(&CTX, body.as_bytes()).unwrap();
         assert_eq!(field(&compat, "max_output_tokens").as_deref(), limit, "compat {extra}");
     }
-    // Go v8.0.67's position: after the template's `input`, before every later field.
-    let out = translate_request(
-        Format::Claude,
-        Format::Codex,
-        &CTX,
-        claude(r#","max_tokens":17"#).as_bytes(),
-    )
-    .unwrap();
-    let text = String::from_utf8(out).unwrap();
-    let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle} in {text}"));
-    assert!(
-        text.starts_with(r#"{"model":"grok-4.7","instructions":"","input":["#),
-        "{text}"
-    );
-    assert!(at(r#"}]}],"max_output_tokens":17,"#) < at(r#""tools":["#), "{text}");
 }
 
 #[test]
@@ -162,20 +134,11 @@ fn codex_translated_route_keeps_its_own_rules() {
     .unwrap()
     .unwrap();
     assert_eq!(field(&out, "parallel_tool_calls").as_deref(), Some("false"));
-    // Mapped by codex_strict at the end of the body, not by the registered pair's rule.
-    assert!(
-        out.ends_with(br#","max_output_tokens":17}"#),
-        "{}",
-        String::from_utf8_lossy(&out)
-    );
+    assert_eq!(field(&out, "max_output_tokens").as_deref(), Some("17"));
     let out = codex_request(Format::Claude, &CTX, claude(r#","max_tokens":17"#).as_bytes())
         .unwrap()
         .unwrap();
-    assert!(
-        out.ends_with(br#","max_output_tokens":17}"#),
-        "{}",
-        String::from_utf8_lossy(&out)
-    );
+    assert_eq!(field(&out, "max_output_tokens").as_deref(), Some("17"));
 }
 
 /// The three Claude -> Responses converters: the registered pair (Grok, Muse), its

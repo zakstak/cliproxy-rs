@@ -192,7 +192,8 @@ mod tests {
     }
 
     #[test]
-    fn query_matches_go_parse_query() {
+    // Product policy: Query credentials preserve raw bytes, first-value precedence and existing authentication sources; malformed pairs never become a valid key.
+    fn query_credentials_decode_form_bytes_and_keep_first_value() {
         let get = |q, n| query_get(q, n).map(|v| String::from_utf8(v).unwrap());
         assert_eq!(
             get("key=wrong&key=good", "key").as_deref(),
@@ -220,7 +221,8 @@ mod tests {
     }
 
     #[test]
-    fn candidates_and_errors_match_go() {
+    // Product policy: Query credentials preserve raw bytes, first-value precedence and existing authentication sources; malformed pairs never become a valid key.
+    fn authentication_sources_distinguish_missing_and_invalid_credentials() {
         assert_eq!(auth("key=wrong&key=good", &[]), Err("Invalid API key"));
         assert_eq!(auth("key=%FF&key=good", &[]), Err("Invalid API key"));
         assert_eq!(auth("%6bey=good", &[]).unwrap().source, "query-key");

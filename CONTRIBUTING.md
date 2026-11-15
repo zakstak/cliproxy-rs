@@ -24,6 +24,8 @@ This fork has no GitHub Actions workflows. Run these checks locally before openi
 
 Tests use local mock upstreams only. Never point a test at a real provider or use a real account or key, and run the tests with external network access blocked and loopback available. The BoringSSL build and the release link use a lot of memory, so on a small machine set `CARGO_BUILD_JOBS=2`.
 
+Write tests from supported API contracts, explicit Rust input tables, and independently specified protocol examples. Test generated JSON by its values. Test native passthrough and untouched JSON spans by their bytes. Historical recordings may supply regression inputs, but recorded Go output does not define correctness. Never generate expected output by running the implementation under test. Casing comes from the input contract: use Rust Unicode conversion for text and ASCII conversion for protocol tokens, retaining existing identity compatibility where required.
+
 Tests check behaviour. Do not add benchmark scores, wall-clock speed bounds, allocation counts or memory limits as test assertions or CI gates ([#45](https://github.com/zakstak/cliproxy-rs/issues/45)). Tests of a configured timeout, a cancellation or a resource limit that protects the server are behaviour and are welcome.
 
 The dashboard lives in `ui/` (Svelte 5). `npm ci`, `npm run check`, `npm test` and `npm run build` there. See [ui/README.md](ui/README.md).

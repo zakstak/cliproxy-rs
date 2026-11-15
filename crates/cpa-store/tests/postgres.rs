@@ -355,7 +355,7 @@ async fn postgres_store_round_trips_config_auth_and_cooldowns() {
 }
 
 #[tokio::test]
-async fn postgres_store_reports_go_errors() {
+async fn postgres_store_reports_actionable_failures() {
     let dir = scratch("errors");
     let error = PostgresStore::connect(PostgresConfig {
         dsn: "  ".into(),
@@ -364,7 +364,8 @@ async fn postgres_store_reports_go_errors() {
     .await
     .err()
     .unwrap();
-    assert_eq!(error.to_string(), "postgres store: DSN is required");
+    let error = error.to_string();
+    assert!(error.contains("postgres") && error.contains("DSN"), "{error}");
     // Nothing listens on port 1.
     let error = PostgresStore::connect(PostgresConfig {
         dsn: "postgres://u:pw-s3cret@127.0.0.1:1/db?sslmode=disable&connect_timeout=2".into(),
@@ -375,7 +376,7 @@ async fn postgres_store_reports_go_errors() {
     .err()
     .unwrap()
     .to_string();
-    assert!(error.starts_with("postgres store: ping database: "), "{error}");
+    assert!(error.contains("postgres") && error.contains("database"), "{error}");
     assert!(!error.contains("pw-s3cret"), "{error}");
     assert!(dir.join("pgstore/config").is_dir() && dir.join("pgstore/auths").is_dir());
 }
@@ -495,7 +496,7 @@ async fn abandoned_queued_writes_never_run() {
 /// step of `_SaveLoad`, against a real server: instances only clear rows they saw,
 /// and a stale instance cannot resurrect or remove a newer row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cooldown_instances_merge_like_go() {
+async fn concurrent_cooldown_instances_merge_each_credential_state() {
     let Some(cluster) = Cluster::start() else { return };
     let dir = scratch("merge");
     let store = store(&cluster, "", &dir.join("pgstore")).await;

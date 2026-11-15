@@ -87,7 +87,8 @@ mod tests {
     /// bumps the credential version only when its tokens change; removal forgets it, and
     /// the same ID registered again later is a new registration.
     #[test]
-    fn registrations_follow_go_epochs_and_credential_versions() {
+    // Product policy: Registration epochs and credential revisions fence stale work so removed or replaced credentials cannot publish into current state.
+    fn registration_epochs_fence_replacements_and_credential_versions() {
         let regs = Registrations::default();
         let a1 = credential("a.json", 1, "t1");
         register(&regs, &[], std::slice::from_ref(&a1));

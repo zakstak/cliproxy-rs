@@ -1145,10 +1145,6 @@ impl<'a> Ctx<'a> {
         } else {
             now.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string()
         };
-        #[cfg(test)]
-        if let Some(today) = tests::pinned_today() {
-            self.today = today;
-        }
         self
     }
 
@@ -2103,9 +2099,5 @@ fn strip_attribution_system(body: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod go_exec;
-#[cfg(test)]
-mod go_unit;
 #[cfg(test)]
 mod tests;

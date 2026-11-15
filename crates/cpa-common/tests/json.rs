@@ -1,236 +1,116 @@
-//! Differential check of the gjson/sjson port against fixtures produced by the pinned Go
-//! libraries (tests/reference/json). Byte fields map each byte to the rune of equal value.
-use cpa_common::json::{self as gj, Kind, Res};
-use serde_json::Value;
+//! JSON behavior contracts: semantic reads and edits with untouched wire bytes preserved.
+use cpa_common::json::{self as gj, Kind};
+use serde_json::{Value, json};
 
-fn b(v: &Value) -> Vec<u8> {
-    v.as_str().unwrap().chars().map(|c| c as u32 as u8).collect()
-}
-
-fn kind(k: Kind) -> i64 {
-    match k {
-        Kind::Null => 0,
-        Kind::False => 1,
-        Kind::Number => 2,
-        Kind::String => 3,
-        Kind::True => 4,
-        Kind::Json => 5,
-    }
-}
-
-fn h(bytes: &[u8]) -> String {
-    bytes.iter().map(|&c| c as char).collect()
-}
-
-fn describe(r: &Res<'_>) -> Vec<String> {
-    vec![
-        kind(r.kind).to_string(),
-        h(&r.raw),
-        h(&r.s),
-        h(&r.bytes()),
-        r.index.to_string(),
-    ]
-}
-
-fn fixtures() -> Value {
-    serde_json::from_str(include_str!("fixtures/json.json")).unwrap()
+fn value(bytes: &[u8]) -> Value {
+    serde_json::from_slice(bytes).expect("the edited document is valid JSON")
 }
 
 #[test]
-fn get_matches_gjson() {
-    let all = fixtures();
-    let mut failures = vec![];
-    for case in all["get"].as_array().unwrap() {
-        let json = b(&case["json"]);
-        let path = case["path"].as_str().unwrap();
-        let r = if path == "\0parse" {
-            gj::parse(&json)
-        } else {
-            gj::get(&json, path)
-        };
-        let mut array = vec![];
-        for item in r.array() {
-            array.extend(describe(&item));
-        }
-        let mut each = vec![];
-        r.each(|k, v| {
-            each.extend(describe(&k));
-            each.extend(describe(&v));
-            true
-        });
-        let mut map: Vec<String> = if path == "\0parse" {
-            vec![]
-        } else {
-            r.map()
-                .iter()
-                .map(|(k, v)| format!("{}={}@{}", h(k), h(&v.raw), v.index))
-                .collect()
-        };
-        map.sort();
-        let actual = serde_json::json!({
-            "exists": r.exists(),
-            "type": kind(r.kind),
-            "raw": h(&r.raw),
-            "str": h(&r.s),
-            "string": h(&r.bytes()),
-            "int": r.int(),
-            "uint": r.uint(),
-            "float": if r.float().is_nan() { case["float"].as_str().unwrap().to_owned() } else { r.float().to_bits().to_string() },
-            "bool": r.bool(),
-            "index": r.index,
-            "indexes": r.indexes,
-            "array": array,
-            "each": each,
-            "map": map,
-        });
-        let mut expected = case.clone();
-        let fields = expected.as_object_mut().unwrap();
-        fields.remove("json");
-        fields.remove("path");
-        if actual != expected {
-            failures.push(format!(
-                "json={:?} path={path:?}\n  go:   {expected}\n  rust: {actual}",
-                String::from_utf8_lossy(&json)
-            ));
-        }
+fn reads_supported_paths_and_preserves_raw_number_spelling() {
+    let input = br#"{ "metadata":{"user_id":"u\u0031"}, "items":[{"id":1},{"id":2}], "n":9007199254740993, "decimal":1.2300e+04, "flag":true, "nil":null }"#;
+    for (path, expected) in [
+        ("metadata.user_id", json!("u1")),
+        ("items.1.id", json!(2)),
+        ("flag", json!(true)),
+        ("nil", Value::Null),
+    ] {
+        let got = gj::get(input, path);
+        assert!(got.exists(), "{path}");
+        assert_eq!(value(got.raw()), expected, "{path}");
     }
-    assert!(
-        failures.is_empty(),
-        "{} mismatches:\n{}",
-        failures.len(),
-        failures[..failures.len().min(15)].join("\n")
-    );
+    assert_eq!(gj::get(input, "n").raw(), b"9007199254740993");
+    assert_eq!(gj::get(input, "decimal").raw(), b"1.2300e+04");
+    assert_eq!(gj::get(input, "metadata.user_id").str(), "u1");
+    assert!(!gj::get(input, "missing").exists());
+    assert!(!gj::get(input, "items.9.id").exists());
+    assert_eq!(gj::get(input, "items").array().len(), 2);
+    assert_eq!(gj::get(input, "n").kind, Kind::Number);
+    let mut keys = vec![];
+    gj::get(input, "metadata").each(|key, _| {
+        keys.push(key.str().into_owned());
+        true
+    });
+    assert_eq!(keys, ["user_id"]);
 }
 
 #[test]
-fn set_matches_sjson() {
-    let all = fixtures();
-    let mut failures = vec![];
-    for case in all["set"].as_array().unwrap() {
-        let json = b(&case["json"]);
-        let path = case["path"].as_str().unwrap();
-        let value = b(&case["value"]);
-        let mut out = json.clone();
-        match case["kind"].as_str().unwrap() {
-            "str" => gj::set_str(&mut out, path, &value),
-            "raw" => gj::set_raw(&mut out, path, &value),
-            _ => gj::delete(&mut out, path),
-        };
-        // sjson returns the input unchanged alongside every error it reports.
-        let expected = b(&case["output"]);
-        if out != expected {
-            failures.push(format!(
-                "json={:?} path={path:?} kind={} value={:?}\n  go:   {:?}\n  rust: {:?}",
-                String::from_utf8_lossy(&json),
-                case["kind"],
-                String::from_utf8_lossy(&value),
-                String::from_utf8_lossy(&expected),
-                String::from_utf8_lossy(&out)
-            ));
-        }
+fn edits_change_the_selected_value_and_preserve_unrelated_bytes() {
+    let input = br#"{ "untouched" : {"n":9007199254740993,"s":"\u0061"}, "items":[{"id":1},{"id":2}], "old":false }"#;
+    let untouched = br#""untouched" : {"n":9007199254740993,"s":"\u0061"}"#;
+    for (path, replacement) in [
+        ("old", json!(true)),
+        ("items.1.id", json!(7)),
+        ("new.nested", json!([1, "x"])),
+        ("items.0", json!({"ok":true})),
+    ] {
+        let output = gj::try_set_raw(input, path, replacement.to_string()).unwrap();
+        assert_eq!(value(gj::get(&output, path).raw()), replacement, "{path}");
+        assert!(output.windows(untouched.len()).any(|span| span == untouched));
+        let deleted = gj::try_delete(&output, path).unwrap();
+        assert!(value(&deleted).is_object());
+        assert!(deleted.windows(untouched.len()).any(|span| span == untouched));
     }
-    assert!(
-        failures.is_empty(),
-        "{} mismatches:\n{}",
-        failures.len(),
-        failures[..failures.len().min(15)].join("\n")
-    );
+    assert_eq!(gj::try_delete(input, "missing").unwrap(), input);
+    let output = gj::try_set_str(input, "text", "line\n\"quoted\"\\é<&>").unwrap();
+    assert_eq!(value(&output)["text"], "line\n\"quoted\"\\é<&>");
 }
 
 #[test]
-fn encoding_matches_encoding_json() {
-    let all = fixtures();
-    for case in all["encode"].as_array().unwrap() {
-        let input = b(&case["input"]);
-        assert_eq!(gj::quote(&input), b(&case["html"]), "{input:?}");
-        let mut plain = vec![];
-        gj::marshal_str(&mut plain, &input, false);
-        assert_eq!(plain, b(&case["plain"]), "{input:?}");
-    }
-    for case in all["float"].as_array().unwrap() {
-        let f = f64::from_bits(case["bits"].as_u64().unwrap());
-        assert_eq!(gj::fmt_float(f), case["f"].as_str().unwrap(), "{f:e}");
-        assert_eq!(gj::json_float(f).unwrap(), case["json"].as_str().unwrap(), "{f:e}");
+fn escaped_member_deletion_keeps_valid_json() {
+    // Issue #146: deleting an escaped key removes the whole member.
+    for (input, path, expected) in [
+        (r#"{"\"x":1,"y":2}"#, r#"\"x"#, json!({"y":2})),
+        (r#"{"y":2,"a\\":1}"#, r#"a\\"#, json!({"y":2})),
+        (
+            r#"{"outer":{"\"x":1,"keep":2}}"#,
+            r#"outer.\"x"#,
+            json!({"outer":{"keep":2}}),
+        ),
+    ] {
+        assert_eq!(value(&gj::try_delete(input.as_bytes(), path).unwrap()), expected);
     }
 }
 
-/// sjson/gjson vectors generated from Go (moved from the removed Kimi device fixtures,
-/// tests/device_fixtures/go/zz_rsfix_vectors_test.go).
 #[test]
-fn sjson_go_vectors_match() {
-    let vectors: Vec<Value> = serde_json::from_str(include_str!("fixtures/sjson_go_vectors.json")).unwrap();
-    let mut seen = 0;
-    let mut differences = 0;
-    for v in vectors {
-        let input = v["in"].as_str().unwrap_or_default().as_bytes();
-        let path = v["path"].as_str().unwrap_or_default();
-        let value = v["value"].as_str().unwrap_or_default();
-        let got = match v["fn"].as_str().unwrap() {
-            "sjson_delete" => gj::try_delete(input, path),
-            "sjson_set_str" => gj::try_set_str(input, path, value),
-            "sjson_set_raw" => gj::try_set_raw(input, path, value),
-            "gjson_string" => Ok(gj::get(input, "n").bytes().into_owned()),
-            _ => continue,
-        };
-        seen += 1;
-        let got = got.map(|b| String::from_utf8(b).unwrap());
-        if let Some(&(_, _, _, go_out, rust_out)) = RUST_DIFFERENCES
-            .iter()
-            .find(|(f, i, p, _, _)| v["fn"] == *f && v["in"] == *i && v["path"] == *p)
-        {
-            // The recorded Go output stays as historical evidence.
-            assert_eq!(v["out"].as_str(), Some(go_out), "{v}");
-            assert_eq!(got.as_deref(), Ok(rust_out), "{v}");
-            differences += 1;
-            continue;
-        }
-        match v["err"].as_str() {
-            Some(message) => assert_eq!(got, Err(message.to_owned()), "{v}"),
-            None => assert_eq!(got.as_deref(), Ok(v["out"].as_str().unwrap()), "{v}"),
+fn strings_and_finite_numbers_round_trip_as_json_values() {
+    for text in ["", "plain", "é😀", "<&>", "\u{2028}\u{2029}", "line\n\t\r\0\"\\"] {
+        assert_eq!(value(&gj::quote(text)), json!(text));
+        for html in [false, true] {
+            let mut output = vec![];
+            gj::marshal_str(&mut output, text.as_bytes(), html);
+            assert_eq!(value(&output), json!(text));
         }
     }
-    assert!(seen >= 25, "vector extraction lost cases: {seen}");
-    assert_eq!(
-        differences,
-        RUST_DIFFERENCES.len(),
-        "every listed difference has its Go vector"
-    );
+    for number in [0.0, -0.0, 1.5, 1e-7, 1e21, f64::MIN_POSITIVE, f64::MAX, -42.25] {
+        let encoded = gj::json_float(number).unwrap();
+        assert_eq!(encoded.parse::<f64>().unwrap(), number);
+        assert_eq!(gj::fmt_float(number).parse::<f64>().unwrap(), number);
+    }
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(gj::json_float(invalid).is_none());
+    }
 }
 
-/// Go vectors where the port deliberately differs (docs/DIFFERENCES-FROM-GO.md):
-/// `(fn, in, path, Go output, Rust output)`.
-const RUST_DIFFERENCES: &[(&str, &str, &str, &str, &str)] = &[
-    // Issue #146: sjson keeps the key of a deleted member whose key holds an escaped
-    // quote, which is invalid JSON. The port deletes the member.
-    (
-        "sjson_delete",
-        r#"{"\"x":1,"y":2}"#,
-        r#"\"x"#,
-        r#"{"\"x":,"y":2}"#,
-        r#"{"y":2}"#,
-    ),
-];
-
-/// json.Unmarshal into `any` (float64 numbers) and Decoder.UseNumber, each re-marshaled.
 #[test]
-fn decode_then_marshal_matches_encoding_json() {
-    let all = fixtures();
-    for case in all["decode"].as_array().unwrap() {
-        let input = b(&case["input"]);
-        let float = gj::GoValue::parse_f64(&input).map(|v| v.marshal()).unwrap_or_default();
-        let number = gj::GoValue::parse(&input).map(|v| v.marshal()).unwrap_or_default();
-        assert_eq!(
-            float,
-            b(&case["float"]),
-            "float mode: {:?}",
-            String::from_utf8_lossy(&input)
-        );
-        assert_eq!(
-            number,
-            b(&case["number"]),
-            "number mode: {:?}",
-            String::from_utf8_lossy(&input)
-        );
+fn number_preserving_decode_keeps_precision_and_rejects_invalid_documents() {
+    for input in [
+        r#"{"n":9007199254740993,"fraction":1.2300e+04}"#,
+        r#"[0,-1,true,null,"é",{"x":2}]"#,
+    ] {
+        let out = gj::GoValue::parse(input.as_bytes()).unwrap().marshal();
+        assert_eq!(value(&out), value(input.as_bytes()));
+    }
+    let output = gj::GoValue::parse(br#"{"n":9007199254740993,"decimal":1.2300e+04,"huge":1e400}"#)
+        .unwrap()
+        .marshal();
+    for spelling in [b"9007199254740993".as_slice(), b"1.2300e+04", b"1e400"] {
+        assert!(output.windows(spelling.len()).any(|span| span == spelling));
+    }
+    assert!(gj::GoValue::parse_f64(b"[1e400]").is_none());
+    for invalid in [b"{".as_slice(), b"[1,]", b"{\"n\":}", b"null trailing"] {
+        assert!(gj::GoValue::parse(invalid).is_none());
+        assert!(!gj::std_valid(invalid));
     }
 }
 

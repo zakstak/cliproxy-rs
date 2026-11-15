@@ -1,6 +1,5 @@
-//! Connection lifecycle under backpressure. Behavioural parity with Go is covered by
-//! `tests/ws_e2e.rs` (Go fixtures); this checks the bound Rust adds where Go closes the
-//! socket under a blocked writer.
+//! WebSocket lifecycle, cancellation, capture ordering, and backpressure cleanup.
+//! Local peers and explicit transcripts exercise the server without provider accounts.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -184,7 +183,7 @@ async fn steering_reader_cancels_the_turn_when_the_client_leaves() {
     }
 }
 
-/// The request log of a Responses WebSocket connection: Go's downstream timeline
+/// The request log of a Responses WebSocket connection: downstream timeline
 /// (`openai_responses_websocket_timeline.go`) with one `websocket.request` part per client
 /// message, one `websocket.response` part per frame written and the read error that ended
 /// the connection as `websocket.disconnect` (gorilla's close text), plus the upstream
@@ -269,7 +268,7 @@ async fn request_log_records_the_websocket_timeline_and_each_turn() {
         let body = &rest[rest.find('\n').unwrap() + 1..];
         body[..body.find("\n=== ").unwrap_or(body.len())].to_owned()
     };
-    // Timestamps vary; the events, their order and payloads are Go's.
+    // Timestamps vary; event order and relayed payloads are the behavior contract.
     let timeline: Vec<(String, String)> = section("WEBSOCKET TIMELINE ===")
         .split("\n\n")
         .filter(|part| !part.trim().is_empty())
@@ -567,30 +566,30 @@ fn timeline_events(log: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Go's terminal-error timeline (`writeResponsesWebsocketTerminalError`): an exposed
+/// Terminal-error logging: an exposed
 /// request fault is the `websocket.response` part the client received; a hidden failure
 /// (quota) keeps the upstream reason as a `websocket.disconnect` part although the client
 /// only sees the close. Either way the connection then ends with gorilla's "close sent".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn request_log_records_terminal_errors_like_go() {
+async fn request_log_records_terminal_error_delivery_and_disconnects() {
     const REQUEST: &str = r#"{"type":"response.create","model":"gpt-fixture","input":[]}"#;
-    const CLOSE_SENT: &str = "websocket: close sent";
-
     let (frames, log) = logged_failure(
         400,
         r#"{"error":{"message":"bad input","type":"invalid_request_error","code":"invalid_value"}}"#,
     )
     .await;
     assert_eq!(frames.len(), 1, "the exposed error event: {frames:?}");
-    assert_eq!(
-        timeline_events(&log),
-        [
-            ("websocket.request".to_owned(), REQUEST.to_owned()),
-            ("websocket.response".to_owned(), frames[0].clone()),
-            ("websocket.disconnect".to_owned(), CLOSE_SENT.to_owned()),
-        ],
-        "\n{log}"
-    );
+    let exposed: Value = serde_json::from_str(&frames[0]).unwrap();
+    assert_eq!(exposed["type"], "error");
+    assert_eq!(exposed["status"], 400);
+    assert_eq!(exposed["error"]["code"], "invalid_value");
+    let events = timeline_events(&log);
+    assert_eq!(events.len(), 3, "{log}");
+    assert_eq!(events[0], ("websocket.request".into(), REQUEST.into()));
+    assert_eq!(events[1], ("websocket.response".into(), frames[0].clone()));
+    assert_eq!(events[2].0, "websocket.disconnect");
+    assert!(!events[2].1.is_empty(), "disconnect has a diagnostic");
+    assert!(!log.contains("sk-FAKE"), "upstream credentials are redacted");
 
     const QUOTA: &str = r#"{"error":{"type":"usage_limit_reached","message":"quota exhausted"}}"#;
     let (frames, log) = logged_failure(429, QUOTA).await;
@@ -604,7 +603,9 @@ async fn request_log_records_terminal_errors_like_go() {
         "the upstream reason: {}",
         events[1].1
     );
-    assert_eq!(events[2], ("websocket.disconnect".to_owned(), CLOSE_SENT.to_owned()));
+    assert_eq!(events[2].0, "websocket.disconnect");
+    assert!(!events[2].1.is_empty());
+    assert!(!log.contains("sk-FAKE"), "upstream credentials are redacted");
 }
 
 /// Go `TestResponsesInterruptDiagnosticsAreSanitized` and the outcome check of

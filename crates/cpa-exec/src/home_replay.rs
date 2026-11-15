@@ -191,12 +191,28 @@ mod tests {
     }
 
     #[test]
-    fn envelopes_marshal_like_go() {
-        assert_eq!(envelope("g", None), br#"{"generation":"g","deleted":true}"#);
+    fn replay_envelopes_preserve_generation_deletion_and_content_meaning() {
+        let decode = |bytes: Vec<u8>| serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
         assert_eq!(
-            envelope("g", Some(Payload::Contents(&[b"[1]".to_vec(), b"[ 2 ]".to_vec()]))),
-            br#"{"generation":"g","contents":[[1],[2]]}"#
+            decode(envelope("g", None)),
+            serde_json::json!({"generation":"g","deleted":true})
         );
-        assert_eq!(envelope("g", Some(Payload::Contents(&[]))), br#"{"generation":"g"}"#);
+        assert_eq!(
+            decode(envelope(
+                "g",
+                Some(Payload::Contents(&[b"[1]".to_vec(), b"[ 2 ]".to_vec()]))
+            )),
+            serde_json::json!({"generation":"g","contents":[[1],[2]]})
+        );
+        assert_eq!(
+            decode(envelope("g", Some(Payload::Contents(&[])))),
+            serde_json::json!({"generation":"g"})
+        );
+        // Omission and deletion are distinct shared Home protocol states.
+        assert!(
+            decode(envelope("g", Some(Payload::Contents(&[]))))
+                .get("deleted")
+                .is_none()
+        );
     }
 }

@@ -1540,10 +1540,9 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// Go `strings.ToLower` equality, allocation-free for ASCII (#95 cost): a non-ASCII
-    /// rune that Go lowers to ASCII still matches, and different names stay route-keyed.
+    /// Existing case variants share state identity; different model names keep separate routing keys.
     #[test]
-    fn state_keys_compare_under_go_lower() {
+    fn state_keys_share_identity_across_existing_case_variants() {
         assert_eq!(state_model("Claude-X", "route", "claude-x", false), "claude-x");
         assert_eq!(
             state_model("\u{212A}imi", "route", "kimi", false),
@@ -1571,11 +1570,9 @@ mod tests {
         Arc::new(c)
     }
 
-    /// Go `GetStaticModelDefinitionsByChannel` and `LookupStaticModelInfoByChannel`: Go's
-    /// channel names (folded with Unicode case rules), its getters' built-ins, trimmed
-    /// IDs and Claude family entries; raw catalog sections are not channels.
+    /// Public channel aliases, trimmed model IDs and Claude family suffixes keep their routing behavior.
     #[test]
-    fn static_channel_lookup_matches_go() {
+    fn static_channels_accept_supported_operator_aliases() {
         let ids = |name: &str| static_channel(name).into_iter().map(|m| m.id).collect::<Vec<_>>();
         for (name, same_as) in [
             (" Claude ", "claude"),
@@ -1597,7 +1594,7 @@ mod tests {
             "kimi",
             "devin",
         ] {
-            assert!(static_channel(raw).is_empty(), "{raw} is not a Go channel");
+            assert!(static_channel(raw).is_empty(), "{raw} is not a supported channel");
         }
         assert!(
             ids("codex").iter().any(|id| id == "gpt-image-2"),
@@ -1621,10 +1618,9 @@ mod tests {
         assert_eq!(found("xai", &renamed, "claude-opus-5-5[1m]"), None);
     }
 
-    /// Go `Auth.AccountInfo` (sdk/cliproxy/auth/types.go): kind first, then the
-    /// trimmed email or API key; a non-string email or an unclassified auth is empty.
+    /// Account display identifies the credential kind and trims its relevant identity field.
     #[test]
-    fn account_info_matches_go() {
+    fn account_information_uses_credential_kind_and_trimmed_identity() {
         let oauth = file(
             "o.json",
             serde_json::json!({"type":"claude","email":" a@b.test ","access_token":"t"}),
@@ -1672,13 +1668,17 @@ mod tests {
     }
 
     #[test]
-    fn oauth_claude_registers_go_catalog_minus_disabled() {
+    fn oauth_claude_registers_current_catalog_for_enabled_credentials() {
         let cfg = Config::default();
         let live = file("a.json", serde_json::json!({"type":"claude"}), &[]);
         let off = file("b.json", serde_json::json!({"type":"claude","disabled":true}), &[]);
         let r = Registry::build(&cfg, &[live, off]);
-        // Go v8.0.35's 19 Claude models plus Claude Fable 5.2 (K1, #68).
-        assert_eq!(r.available().count(), 20, "the Claude catalog registers whole");
+        // Registration tracks the current product catalog, not a historical recorder count.
+        let mut expected: Vec<_> = static_channel("claude").into_iter().map(|m| m.id).collect();
+        let mut actual: Vec<_> = r.ids().map(str::to_owned).collect();
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected);
         assert_eq!(r.providers("claude-sonnet-4-6"), ["claude"]);
         assert!(r.has_client("a.json") && !r.has_client("b.json"));
         assert!(r.providers("gpt-5.5").is_empty());
@@ -1697,7 +1697,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusions_aliases_forks_and_prefixes_follow_go() {
+    fn model_aliases_exclusions_and_prefixes_compose() {
         let cfg = Config::parse(
             "oauth:\n  model-alias:\n    claude:\n      - {name: claude-opus-5, alias: big, fork: true}\n      - {name: claude-sonnet-5, alias: mid, display-name: Mid}\n",
         )
@@ -1739,11 +1739,9 @@ mod tests {
         );
     }
 
-    /// Exclusions match the way Go lowercases both sides (`strings.ToLower`, where U+0130
-    /// becomes a plain `i`): a configured `MİNİ` excluded as `MİNİ` or `mini` is not
-    /// registered.
+    /// Existing Unicode model spellings and their configured exclusions retain the same identity.
     #[test]
-    fn exclusions_match_with_go_lowercasing() {
+    fn model_exclusions_keep_existing_unicode_identity() {
         for excluded in ["MİNİ", "mini"] {
             let cfg = Config::parse(&format!(
                 "claude-api-key:\n  - api-key: k\n    models: [{{name: MİNİ}}, {{name: keep}}]\n    excluded-models: [{excluded}]\n"
@@ -1904,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_matches_go() {
+    fn wildcard_patterns_are_anchored_and_ordered() {
         for (p, v, ok) in [
             ("a*c", "abc", true),
             ("a*c", "ab", false),

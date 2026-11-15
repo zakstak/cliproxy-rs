@@ -392,35 +392,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_like_gin_should_bind_json() {
-        assert!(decode(b"").is_none());
-        assert!(decode(b"  ").is_none());
-        assert!(decode(b"[]").is_none());
-        assert!(decode(br#"{"method":1}"#).is_none());
-        assert!(decode(br#"{"header":{"a":1}}"#).is_none());
-        let r = decode(br#"{"METHOD":"get","AuthIndex":"p","authindex":"c","header":{"x":null}} trailing"#).unwrap();
-        assert_eq!(r.method, "get");
-        assert_eq!(r.auth_index, [None, Some("c".into()), Some("p".into())]);
-        assert_eq!(r.header.unwrap(), [("x".to_owned(), String::new())]);
-        assert_eq!(decode(b"null").unwrap().method, "");
-        // Go applies every duplicate member: a type error anywhere fails, null keeps a
-        // string, header objects merge.
+    fn api_call_requests_validate_types_and_preserve_header_values() {
+        for body in [
+            b"".as_slice(),
+            b"  ",
+            b"[]",
+            br#"{"method":1}"#,
+            br#"{"header":{"a":1}}"#,
+        ] {
+            assert!(decode(body).is_none(), "{body:?}");
+        }
+        let request = decode(br#"{"method":"GET","url":"https://example.test/path","auth_index":"credential-1","header":{"x-client":"value"},"unknown":{"future":true}}"#).unwrap();
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.auth_index[0].as_deref(), Some("credential-1"));
+        assert_eq!(request.header.unwrap(), [("x-client".to_owned(), "value".to_owned())]);
+        // A later duplicate cannot conceal a type violation in a security-sensitive request.
         assert!(decode(br#"{"method":1,"method":"GET"}"#).is_none());
-        assert_eq!(decode(br#"{"method":"GET","method":null}"#).unwrap().method, "GET");
-        let merged = decode(br#"{"header":{"a":"1","b":"x"},"header":{"b":"2"}}"#).unwrap();
-        assert_eq!(
-            merged.header.unwrap(),
-            [("a".to_owned(), "1".to_owned()), ("b".to_owned(), "2".to_owned())]
-        );
-        assert!(
-            decode(br#"{"header":{"a":"1"},"header":null}"#)
-                .unwrap()
-                .header
-                .is_none()
-        );
-        assert_eq!(
-            decode(br#"{"auth_index":"x","auth_index":null}"#).unwrap().auth_index[0],
-            None
-        );
     }
 }

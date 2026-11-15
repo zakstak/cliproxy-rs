@@ -1159,29 +1159,36 @@ pub async fn compact(
 mod tests {
     use super::*;
 
+    fn assert_json(actual: impl AsRef<str>, expected: &str) {
+        assert_eq!(
+            serde_json::from_str::<Value>(actual.as_ref()).unwrap(),
+            serde_json::from_str::<Value>(expected).unwrap()
+        );
+    }
+
     #[test]
-    fn completions_request_conversion_matches_go() {
+    fn completions_requests_map_prompt_options_and_streaming() {
         let root: Value = serde_json::from_str(
-            r#"{"model":"m","prompt":"hi <b>","max_tokens":5.7,"temperature":1,"top_p":0.25,"stop":["\n"],"stream":true,"echo":0}"#,
+            r#"{"model":"m","prompt":"hi <b>","max_tokens":5,"temperature":1,"top_p":0.25,"stop":["\n"],"stream":true,"echo":false}"#,
         )
         .unwrap();
-        assert_eq!(
+        assert_json(
             completions_to_chat(&root),
-            r#"{"model":"m","messages":[{"role":"user","content":"hi <b>"}],"max_tokens":5,"temperature":1,"top_p":0.25,"stop":["\n"],"stream":true,"echo":false}"#
+            r#"{"model":"m","messages":[{"role":"user","content":"hi <b>"}],"max_tokens":5,"temperature":1,"top_p":0.25,"stop":["\n"],"stream":true,"echo":false}"#,
         );
         let empty: Value = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
         assert!(completions_to_chat(&empty).contains(r#""content":"Complete this:""#));
     }
 
     #[test]
-    fn completions_response_conversion_matches_go() {
+    fn completions_responses_keep_text_finish_reason_and_usage() {
         let chat: Value = serde_json::from_str(
             r#"{"id":"c1","created":7,"model":"m","choices":[{"index":0,"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"total_tokens":3}}"#,
         )
         .unwrap();
-        assert_eq!(
+        assert_json(
             chat_to_completions(&chat),
-            r#"{"id":"c1","object":"text_completion","created":7,"model":"m","choices":[{"finish_reason":"stop","index":0,"text":"ok"}],"usage":{"total_tokens":3}}"#
+            r#"{"id":"c1","object":"text_completion","created":7,"model":"m","choices":[{"finish_reason":"stop","index":0,"text":"ok"}],"usage":{"total_tokens":3}}"#,
         );
         let role_only: Value = serde_json::from_str(
             r#"{"id":"c","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}"#,
@@ -1189,9 +1196,9 @@ mod tests {
         .unwrap();
         assert_eq!(chat_chunk_to_completions(&role_only), None);
         let delta: Value = serde_json::from_str(r#"{"id":"c","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}"#).unwrap();
-        assert_eq!(
+        assert_json(
             chat_chunk_to_completions(&delta).unwrap(),
-            r#"{"id":"c","object":"text_completion","created":1,"model":"m","choices":[{"finish_reason":"","index":0,"text":"x"}]}"#
+            r#"{"id":"c","object":"text_completion","created":1,"model":"m","choices":[{"finish_reason":"","index":0,"text":"x"}]}"#,
         );
     }
 

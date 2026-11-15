@@ -967,38 +967,33 @@ mod tests {
         }
     }
 
-    /// Go's `NormalizeCodexToolIntegerTypes` vectors (tests/fixtures/codex_tool_schema_go.json,
-    /// recorded from v8.0.35): a Codex client's `number` tool parameters become `integer`
-    /// for the providers that are not Codex (`cpa_common::payload`). The fixture's
-    /// `schemas` vectors replayed the Codex executor's own schema normalization, which #28
-    /// deleted: a Codex request keeps the caller's schemas.
+    /// Non-Codex translators adapt known client tool parameters. The exhaustive
+    /// schema-position table lives in cpa-common's payload tests; this integration
+    /// checks the selected field, unrelated schema data, and repeatability.
     #[test]
-    fn codex_tool_integer_types_match_go() {
-        let go: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/codex_tool_schema_go.json")).unwrap();
-        let expected = |case: &serde_json::Value| case.get("out").unwrap_or(&case["in"]).as_str().unwrap().to_owned();
-        let integers = go["integers"].as_array().unwrap();
-        assert!(!integers.is_empty());
-        for case in integers {
-            let mut headers = HeaderMap::new();
-            if let Some(ua) = case["ua"].as_str() {
-                headers.insert(http::header::USER_AGENT, ua.parse().unwrap());
-            }
-            let out = cpa_common::payload::normalize_codex_tool_integer_types(
-                case["in"].as_str().unwrap().as_bytes(),
-                &headers,
-            );
-            assert_eq!(
-                String::from_utf8(out.clone()).unwrap(),
-                expected(case),
-                "{} {:?}",
-                case["name"],
-                case["ua"]
-            );
-            // Go's tests also require a second pass to leave the output alone.
-            let again = cpa_common::payload::normalize_codex_tool_integer_types(&out, &headers);
-            assert_eq!(again, out, "{} is not idempotent", case["name"]);
-        }
+    fn client_integer_schema_adaptation_is_targeted_and_idempotent() {
+        let body=br#"{ "tools": [{"type":"function","name":"exec_command","parameters":{"type":"object","properties":{"yield_time_ms":{"type":"number"},"custom":{"type":"number"}}}}], "opaque": 1.2300e+04 }"#;
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::USER_AGENT, "codex_cli_rs/0.1.0".parse().unwrap());
+        let output = cpa_common::payload::normalize_codex_tool_integer_types(body, &headers);
+        let parsed: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            parsed["tools"][0]["parameters"]["properties"]["yield_time_ms"]["type"],
+            "integer"
+        );
+        assert_eq!(
+            parsed["tools"][0]["parameters"]["properties"]["custom"]["type"],
+            "number"
+        );
+        assert!(String::from_utf8_lossy(&output).contains(r#""opaque": 1.2300e+04"#));
+        assert_eq!(
+            cpa_common::payload::normalize_codex_tool_integer_types(&output, &headers),
+            output
+        );
+        assert_eq!(
+            cpa_common::payload::normalize_codex_tool_integer_types(body, &HeaderMap::new()),
+            body
+        );
     }
 
     /// Go `TestHomeCodexCompatUsesSelectedCredentialOptions`: without a binding or config
@@ -1073,16 +1068,31 @@ mod tests {
     }
 
     #[test]
-    fn durations_follow_go_parse_duration() {
-        assert_eq!(go_duration("1m30s"), Some(Duration::from_secs(90)));
-        assert_eq!(go_duration("1.5s"), Some(Duration::from_millis(1500)));
-        assert_eq!(go_duration("45"), Some(Duration::from_secs(45)));
-        assert_eq!(go_duration("off"), None);
-        assert_eq!(go_duration("soon"), None);
-        assert_eq!(go_duration("+2s"), Some(Duration::from_secs(2)));
-        assert_eq!(go_duration("3\u{3bc}s"), Some(Duration::from_micros(3)));
-        assert_eq!(go_duration("-1s"), None);
-        assert_eq!(go_duration("+15"), Some(Duration::from_secs(15)));
+    fn bootstrap_timeout_accepts_existing_units_and_refuses_disabled_invalid_or_negative_values() {
+        for (input, expected) in [
+            ("1m30s", Some(Duration::from_secs(90))),
+            ("1.5s", Some(Duration::from_millis(1500))),
+            ("45", Some(Duration::from_secs(45))),
+            ("+2s", Some(Duration::from_secs(2))),
+            ("3\u{3bc}s", Some(Duration::from_micros(3))),
+            ("+15", Some(Duration::from_secs(15))),
+        ] {
+            assert_eq!(go_duration(input), expected, "{input}");
+        }
+        for input in [
+            "off",
+            "soon",
+            "-1s",
+            "0",
+            "",
+            "none",
+            "unlimited",
+            "disabled",
+            "never",
+            "9223372036854775807",
+        ] {
+            assert_eq!(go_duration(input), None, "{input}");
+        }
     }
 
     /// `chatgpt-keep-alive` is on unless the config turns it off (#147), in the v8 layout

@@ -129,7 +129,8 @@ fn section<'a>(log: &'a str, name: &str) -> &'a str {
 }
 
 #[tokio::test]
-async fn call_and_hangup_are_captured_like_go() {
+// Product policy: Call and hangup capture uses the shared logging sink, preserves timeline sections and redacts credentials.
+async fn call_and_hangup_capture_retains_sections_and_redacts_credentials() {
     let dir = scratch();
     let upstream_url = upstream().await;
     let proxy = start(&dir, &upstream_url).await;

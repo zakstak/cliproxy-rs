@@ -278,7 +278,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn viewport_scrolls_like_bubbles() {
+    fn viewport_scroll_clamps_to_visible_content() {
         let mut vp = Viewport {
             height: 3,
             ..Default::default()
@@ -306,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn text_input_edits_like_bubbles() {
+    fn text_input_preserves_cursor_unicode_and_secret_masking() {
         let mut input = TextInput::new(5);
         input.focus();
         input.insert("ab\tcdef");
@@ -331,7 +331,7 @@ mod tests {
         input.key("end");
         input.key("ctrl+w");
         assert_eq!(input.value(), "");
-        // Go's SetValue keeps a cursor that is still inside the new value.
+        // Replacing a value preserves a cursor that remains within it.
         let mut edit = TextInput::new(0);
         edit.focus();
         edit.set_value("abcd");
@@ -339,5 +339,12 @@ mod tests {
         edit.set_value("abcd");
         edit.key("x");
         assert_eq!(edit.value(), "xabcd");
+        edit.set_value("é猫🦀");
+        edit.key("end");
+        edit.key("left");
+        edit.key("backspace");
+        assert_eq!(edit.value(), "é🦀");
+        edit.key("界");
+        assert_eq!(edit.value(), "é界🦀");
     }
 }

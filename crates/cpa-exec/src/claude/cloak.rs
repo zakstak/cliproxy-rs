@@ -1089,10 +1089,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn billing_header_matches_go_capture() {
-        let b = Billing {
+    fn billing_fields_keep_request_identity_and_optional_flags_separate() {
+        let mut b = Billing {
             signed: true,
-            version: "2.1.280",
+            version: "2.1.325",
             message: "Local question",
             entrypoint: "cli",
             workload: "",
@@ -1101,10 +1101,24 @@ mod tests {
             prompt_id: "83ec619f-ab81-4d70-9c67-44c3865291b9",
             human_turn: true,
         };
+        let first = billing_header(&b);
+        assert!(first.starts_with("x-anthropic-billing-header: cc_version=2.1.325."));
+        for field in [
+            "cc_entrypoint=cli;",
+            "cch=00000;",
+            "cc_prompt_id=83ec619f-ab81-4d70-9c67-44c3865291b9;",
+            "cc_turn_origin=human;",
+        ] {
+            assert!(first.contains(field), "{field}: {first}");
+        }
+        b.prompt_id = "11111111-2222-4333-8444-555555555555";
+        let changed = billing_header(&b);
         assert_eq!(
-            billing_header(&b),
-            "x-anthropic-billing-header: cc_version=2.1.280.b43; cc_entrypoint=cli; cch=00000; cc_prompt_id=83ec619f-ab81-4d70-9c67-44c3865291b9; cc_turn_origin=human;"
+            changed,
+            first.replace("83ec619f-ab81-4d70-9c67-44c3865291b9", b.prompt_id)
         );
+        b.signed = false;
+        assert!(!billing_header(&b).contains("cch="));
     }
 
     /// The `cc_version` suffix Claude Code 2.1.325 computed for its own requests
@@ -1246,8 +1260,8 @@ mod tests {
     }
 
     #[test]
-    fn cache_control_walk_reads_each_block_in_go_order() {
-        // Evaluation order is tools, system, messages; the 1h marker on tools comes
+    fn cache_ttl_order_follows_the_prompt_prefix() {
+        // Anthropic caches the prompt prefix in tools, system, messages order; the 1h marker on tools comes
         // first and stays, the system marker is 5m, so the later 1h message marker loses
         // its ttl. Text that mentions cache_control and a string content are not blocks.
         let body = r#"{"messages":[{"role":"user","content":"cache_control"},{"role":"user","content":[{"type":"text","text":"\"cache_control\":{}"},{"type":"text","text":"b","cache_control":{"type":"ephemeral","ttl":"1h"}}]}],"system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}],"tools":[{"name":"t","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#;

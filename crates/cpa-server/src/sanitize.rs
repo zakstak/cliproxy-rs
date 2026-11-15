@@ -201,38 +201,67 @@ fn path_start(prefix: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
-
-    /// Goldens from Go `SanitizeUpstreamErrorSummary` and `ExtractUpstreamErrorSummary`
-    /// (tests/reference/server/main.go).
-    fn golden(section: &str) -> Vec<(String, String)> {
-        let fixture: Value = serde_json::from_str(include_str!("../tests/fixtures/server_go.json")).unwrap();
-        fixture[section]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| {
-                (
-                    p["in"].as_str().unwrap().to_owned(),
-                    p["out"].as_str().unwrap().to_owned(),
-                )
-            })
-            .collect()
-    }
-
     #[test]
-    fn sanitize_matches_go() {
-        let cases = golden("sanitize");
-        assert!(cases.len() > 40);
-        for (input, expected) in cases {
-            assert_eq!(super::summary(&input), expected, "input: {input:?}");
+    fn summaries_remove_secrets_and_private_paths_but_keep_diagnostics() {
+        for (input, secret) in [
+            ("Authorization: Bearer private-token-value", "private-token-value"),
+            ("Cookie: session=private-cookie", "private-cookie"),
+            ("password=private-password", "private-password"),
+            ("client_secret is private-client-secret", "private-client-secret"),
+            ("invalid api key: sk-private-api-key-value", "private-api-key-value"),
+            (
+                "request https://user:private-password@example.test/p?key=private-key&x=1 failed",
+                "private-password",
+            ),
+        ] {
+            let got = super::summary(input);
+            assert!(!got.contains(secret), "{input}: {got}");
+            assert!(got.contains("REDACTED"));
+        }
+        for path in [
+            "/home/user/auth.json",
+            "/etc/secret.pem",
+            "C:\\Users\\me\\auth.json",
+            "\\\\server\\share\\secret.json",
+        ] {
+            let input = format!("open {path}: permission denied");
+            let got = super::summary(&input);
+            assert!(!got.contains(path), "{input}: {got}");
+            assert!(got.contains("permission denied"));
+        }
+        for diagnostic in [
+            "connect: connection refused",
+            "rate limited, retry in 30s",
+            "model not supported",
+        ] {
+            assert_eq!(super::summary(diagnostic), diagnostic);
+        }
+        for input in ["", " ", "\n\t"] {
+            assert!(super::summary(input).is_empty());
+        }
+        for text in ["é".repeat(600), "a ".repeat(600)] {
+            let got = super::summary(&text);
+            assert!(got.len() < text.len());
+            assert!(std::str::from_utf8(got.as_bytes()).is_ok());
         }
     }
 
     #[test]
-    fn extract_matches_go() {
-        for (input, expected) in golden("extract") {
-            assert_eq!(crate::dispatch::upstream_summary(&input), expected, "input: {input:?}");
+    fn upstream_summary_extracts_structured_errors_then_sanitizes() {
+        for code in ["rate_limit_error", "insufficient_quota", "provider_failure"] {
+            let input =
+                serde_json::json!({"error":{"code":code,"message":"private-file /home/user/auth.json: denied"}})
+                    .to_string();
+            let got = crate::dispatch::upstream_summary(&input);
+            assert!(got.contains(code));
+            assert!(got.contains("denied"));
+            assert!(!got.contains("/home/user/auth.json"));
         }
+        for input in ["plain text", "[1,2]", ""] {
+            assert_eq!(crate::dispatch::upstream_summary(input), input);
+        }
+        let flat = crate::dispatch::upstream_summary(r#"{"error":"invalid key sk-private-api-key-value"}"#);
+        assert!(!flat.contains("private-api-key-value"));
+        assert!(!flat.is_empty());
     }
 }

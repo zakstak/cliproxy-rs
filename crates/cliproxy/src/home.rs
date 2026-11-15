@@ -1306,16 +1306,6 @@ mod tests {
     #[test]
     fn optional_config_fallbacks_carry_the_in_flight_defaults() {
         use cpa_home::config::{CredentialConcurrency, CredentialInFlight};
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../cpa-home/tests/fixtures/credential_in_flight_contract.json"
-        ))
-        .unwrap();
-        let fixture =
-            serde_yaml_ng::to_value(serde_json::json!({"credentials": {"in-flight": fixture["config"]}})).unwrap();
-        assert_eq!(
-            CredentialInFlight::from_document(&fixture),
-            CredentialInFlight::default()
-        );
         let dir = std::env::temp_dir().join(format!("cpa-home-optional-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, contents) in [
@@ -1713,7 +1703,7 @@ mod tests {
     /// reaches the client; concurrency validation failures use their own code and
     /// still release the lease.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn busy_and_invalid_concurrency_replies_follow_go() {
+    async fn busy_and_invalid_concurrency_replies_preserve_retry_and_single_dispatch() {
         let busy = r#"{"error":{"type":"credential_concurrency_exceeded","message":"busy","retry_after_ms":1500}}"#;
         let mismatch = r#"{"model":"claude-up","auth_index":"other","concurrency":{"accounted":true,"credential_id":"cred-9","model":"claude-up"},"auth":{"id":"cred-9","provider":"claude"}}"#;
         let home = scripted("port: 0\n", vec![busy.into(), mismatch.into()]).await;
@@ -2221,7 +2211,7 @@ mod tests {
     /// parent (canonicalized itself); any other fallback joins the session's alias group,
     /// whose canonical ID later requests send.
     #[test]
-    fn dispatch_sessions_follow_go() {
+    fn dispatch_sessions_choose_primary_and_parent_identity() {
         let config = overlay(b"port: 0\n", None).unwrap();
         let rt = Arc::new(cpa_server::testing::runtime(
             config,
@@ -2313,7 +2303,7 @@ mod tests {
     /// `TestPickNextViaHomeNestedRequestSubagentHierarchy` send: Go's expected session and
     /// parent for each request shape. (Their LCP cases need the Merkle LCP matcher.)
     #[test]
-    fn home_session_hierarchies_follow_go() {
+    fn home_sessions_preserve_parent_child_relationships() {
         let hour = Duration::from_secs(3600);
         let pair = |a: &str, b: &str| (a.to_owned(), b.to_owned());
         type Case<'a> = (&'a [(&'a str, &'a str)], &'a str, (String, String));
@@ -5297,7 +5287,7 @@ mod tests {
     /// than the requested one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn accounted_and_legacy_picks_install_their_scopes() {
-        let fixture = include_str!("../../cpa-home/tests/fixtures/concurrency_dispatch_accounted.json");
+        let fixture = r#"{"model":"gpt","provider":"codex","auth_index":"cred-1","auth":{"id":"cred-1","provider":"codex"},"concurrency":{"accounted":true,"credential_id":"cred-1","model":"gpt"}}"#;
         let legacy = r#"{"model":"final-upstream-model","auth":{"id":"cred-1","provider":"codex"}}"#;
         for (reply, accounted) in [(fixture, true), (legacy, false)] {
             let home = sequenced("port: 0\n", vec![fake::bulk(reply)], Default::default()).await;

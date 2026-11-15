@@ -556,13 +556,24 @@ mod tests {
     }
 
     #[test]
-    fn unwrap_input_follows_encoding_json() {
+    fn patch_envelopes_preserve_text_and_reject_ambiguous_input() {
+        for text in ["", "aé", "<a>&", "*** Begin Patch\n+🙂\n*** End Patch", "q\"\n"] {
+            let wrapped = wrap_input(text.as_bytes());
+            let value: serde_json::Value = serde_json::from_slice(&wrapped).unwrap();
+            assert_eq!(value, serde_json::json!({"input": text}));
+            assert_eq!(unwrap_input(&wrapped).as_deref(), Some(text));
+            let escaped = escape_input_fragment(text.as_bytes());
+            let quoted = [b"\"".as_slice(), &escaped, b"\""].concat();
+            assert_eq!(serde_json::from_slice::<String>(&quoted).unwrap(), text);
+        }
         assert_eq!(unwrap_input(br#" {"input" : "a\u00e9"} "#).as_deref(), Some("aé"));
-        assert_eq!(unwrap_input(b"{\"input\":\"\xff\"}").as_deref(), Some("\u{fffd}"));
-        assert_eq!(unwrap_input(br#"{"input":"\ud800"}"#).as_deref(), Some("\u{fffd}"));
-        assert_eq!(unwrap_input(br#"{"input":"x","input":"y"}"#), None);
-        assert_eq!(unwrap_input(br#"{"input":5}"#), None);
-        assert_eq!(wrap_input(b"<a>&"), br#"{"input":"\u003ca\u003e\u0026"}"#.to_vec());
-        assert_eq!(escape_input_fragment(b"q\"\n"), b"q\\\"\\n".to_vec());
+        for invalid in [
+            &br#"{"input":"x","input":"y"}"#[..],
+            br#"{"input":5}"#,
+            br#"{"input":null}"#,
+            br#"{}"#,
+        ] {
+            assert_eq!(unwrap_input(invalid), None);
+        }
     }
 }

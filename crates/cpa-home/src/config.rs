@@ -323,8 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_match_go_limiter_config() {
-        // Go TestCredentialConcurrencyLimiterConfig.
+    fn limiter_defaults_define_the_home_protocol_policy() {
         let got = CredentialConcurrency::default().with_defaults();
         assert_eq!(
             (got.lifecycle_config_revision, got.observation_barrier_revision),
@@ -353,7 +352,6 @@ mod tests {
 
     #[test]
     fn explicit_zero_null_and_negative_values_are_not_defaulted() {
-        // Go TestCredentialConcurrencyConfigDefaultsOnlyMissingFields.
         let base = "  cpa-cancel-bound: 5s\n  reclaim-grace: 5s\n  cleanup-interval: 5s\n";
         for head in [
             "  lifecycle-config-revision: 0\n  cpa-heartbeat-timeout: 3s\n",
@@ -379,7 +377,6 @@ mod tests {
 
     #[test]
     fn invalid_limiter_values_are_rejected() {
-        // Go TestCredentialConcurrencyConfigRejectsInvalidLimiter.
         let ms = MILLISECOND;
         for (flush, backoff, min, max, limit) in [
             (SECOND, 500 * ms, ms, ms, 1),
@@ -452,7 +449,7 @@ mod tests {
     /// validates; with a node heartbeat timeout of 3s, or a zero CPA heartbeat under a
     /// 20s node timeout, the lifecycle invariant fails.
     #[test]
-    fn the_lifecycle_fixture_validates_like_go() {
+    fn lifecycle_configuration_accepts_valid_boundaries_and_refuses_invalid_values() {
         let fixture = |heartbeat: &str, revision: &str| {
             parse(&format!(
                 "credentials:\n concurrency:\n{revision}  cpa-heartbeat-timeout: {heartbeat}\n  cpa-cancel-bound: 5s\n  reclaim-grace: 5s\n  cleanup-interval: 5s\n  release-flush-interval: 250ms\n  release-max-backoff: 2s\n  busy-retry-min: 250ms\n  busy-retry-max: 1s\n  max-limit: 1000000\n"
@@ -486,8 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn home_port_defaults_like_go() {
-        // Go TestNormalizeHomePort.
+    fn home_port_uses_default_unless_explicitly_overridden() {
         assert_eq!(normalize_home_port(0), 8317);
         assert_eq!(normalize_home_port(8327), 8327);
         assert_eq!(normalize_home_port(9090), 9090);

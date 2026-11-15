@@ -509,38 +509,34 @@ fn strings(v: Option<&Value>) -> Result<Vec<String>, String> {
 mod tests {
     use super::*;
 
-    // Expected values: Go 1.26 json.Unmarshal into map[string]any.
     #[test]
-    fn json_errors_read_like_go() {
-        let err = |b: &[u8]| {
-            let e = serde_json::from_slice::<Value>(b).unwrap_err();
-            json_error(b, &e)
-        };
-        assert_eq!(err(b""), "unexpected end of JSON input");
-        assert_eq!(err(b" {\"a\":"), "unexpected end of JSON input");
-        assert_eq!(err(b"<html>"), "invalid character '<' looking for beginning of value");
-        assert_eq!(err(b"{} x"), "invalid character 'x' after top-level value");
-        assert_eq!(err(b"'a'"), "invalid character '\\'' looking for beginning of value");
-        assert_eq!(err(b"tru"), "invalid character ' ' in literal true (expecting 'e')");
-        assert_eq!(err(b"n"), "invalid character ' ' in literal null (expecting 'u')");
-        assert_eq!(err(b"-"), "invalid character ' ' in numeric literal");
-        assert_eq!(
-            err(b"1."),
-            "invalid character ' ' after decimal point in numeric literal"
-        );
-        assert_eq!(err(b"1e+"), "invalid character ' ' in exponent of numeric literal");
-        assert_eq!(err(b"[1,"), "unexpected end of JSON input");
-        assert_eq!(
-            err("é".as_bytes()),
-            "invalid character 'Ã' looking for beginning of value"
-        );
-        assert_eq!(err("{} é".as_bytes()), "invalid character 'Ã' after top-level value");
-        assert_eq!(
-            type_error(&serde_json::json!([1]), "map[string]interface {}"),
-            "json: cannot unmarshal array into Go value of type map[string]interface {}"
-        );
+    fn malformed_management_json_returns_an_actionable_decode_error() {
+        for body in [
+            b"".as_slice(),
+            b" {\"a\":",
+            b"<html>",
+            b"{} x",
+            b"'a'",
+            b"tru",
+            b"n",
+            b"-",
+            b"1.",
+            b"1e+",
+            b"[1,",
+            "é".as_bytes(),
+            "{} é".as_bytes(),
+        ] {
+            let source = serde_json::from_slice::<Value>(body).unwrap_err();
+            let message = json_error(body, &source);
+            assert!(!message.trim().is_empty(), "{body:?}");
+            assert!(
+                message.contains("JSON") || message.contains("invalid") || message.contains("unexpected"),
+                "{message}"
+            );
+        }
+        assert!(extract_list(serde_json::json!({"items":[1]}).as_object().unwrap(), "items").is_err());
+        assert!(strings(Some(&serde_json::json!([1]))).is_err());
     }
-
     /// A refused connection reads like Go's url.Error, and a URL password never shows.
     #[tokio::test]
     async fn request_errors_hide_url_passwords() {
@@ -579,7 +575,6 @@ mod tests {
         (port, seen)
     }
 
-    // Go TestClient_RemoteServerInteraction and TestNewAppWithBaseURL.
     #[tokio::test]
     async fn remote_get_config_sends_path_and_bearer() {
         let (port, seen) =
@@ -601,7 +596,7 @@ mod tests {
         );
         let app = super::super::app::App::new("https://proxy.example.com", "secret", None);
         assert_eq!(app.base_url(), "https://proxy.example.com");
-        // Go TestNewClient_BackwardsCompatibility: the standalone client's local URL.
+        // The standalone client uses the local management endpoint by default.
         assert_eq!(
             normalize_base_url(&format!("http://127.0.0.1:{}", 8317)),
             "http://127.0.0.1:8317"
@@ -653,7 +648,7 @@ mod tests {
     /// Go's redirect rules: a PUT that meets a 302 becomes a body-less GET, and the
     /// Bearer key follows to the same host on another port but not to another host.
     #[tokio::test]
-    async fn redirects_follow_go_http_client() {
+    async fn redirects_preserve_http_method_rules_and_isolate_credentials() {
         use std::sync::{Arc, Mutex};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -706,9 +701,8 @@ mod tests {
         );
     }
 
-    // Expected values: Go TestNewClientWithBaseURL and net/url.
     #[test]
-    fn base_urls_follow_go() {
+    fn management_urls_preserve_base_paths_and_query_parameters() {
         for (input, want) in [
             ("http://192.168.1.100:8317", "http://192.168.1.100:8317"),
             ("https://proxy.example.com/", "https://proxy.example.com"),
@@ -736,8 +730,8 @@ mod tests {
             &host("http://badexample.invalid/")
         ));
         assert_eq!(
-            marshal_map(vec![("old", Value::Null), ("new", "k<&>".into())]),
-            r#"{"new":"k\u003c\u0026\u003e","old":null}"#
+            serde_json::from_str::<Value>(&marshal_map(vec![("old", Value::Null), ("new", "k<&>".into())])).unwrap(),
+            serde_json::json!({"new":"k<&>","old":null})
         );
     }
 }

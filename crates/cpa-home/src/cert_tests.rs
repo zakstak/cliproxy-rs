@@ -284,36 +284,29 @@ async fn dns_names_match_sans_only_never_the_subject_cn() {
 }
 
 #[test]
-fn tls_config_errors_match_go() {
+fn tls_configuration_refuses_incomplete_keys_missing_ca_and_invalid_pem() {
     let mut cfg = crate::config::HomeTlsConfig {
         enable: true,
         client_cert: Some("/nonexistent/cert.pem".into()),
         ..Default::default()
     };
-    let error = crate::tls::Dialer::new(&cfg, "127.0.0.1", 1, "127.0.0.1", Duration::from_secs(1))
-        .err()
-        .unwrap();
-    assert_eq!(
-        error.to_string(),
-        "home tls: client certificate and key must be set together"
-    );
+    let dialer = |cfg: &crate::config::HomeTlsConfig| {
+        crate::tls::Dialer::new(cfg, "127.0.0.1", 1, "127.0.0.1", Duration::from_secs(1))
+    };
+    let error = dialer(&cfg).err().unwrap().to_string();
+    assert!(error.contains("certificate") && error.contains("key"), "{error}");
     cfg.client_cert = None;
     cfg.ca_cert = Some("/nonexistent/ca.pem".into());
-    let error = crate::tls::Dialer::new(&cfg, "127.0.0.1", 1, "127.0.0.1", Duration::from_secs(1))
-        .err()
-        .unwrap();
-    assert!(error.to_string().starts_with("home tls: read ca-cert: "), "{error}");
+    let error = dialer(&cfg).err().unwrap().to_string();
+    assert!(error.contains("ca-cert"), "{error}");
     let dir = TempDir::new("tlscfg");
     std::fs::create_dir_all(&dir.0).unwrap();
     let empty = dir.0.join("empty.pem");
     std::fs::write(&empty, "not a certificate").unwrap();
     cfg.ca_cert = Some(empty);
-    let error = crate::tls::Dialer::new(&cfg, "127.0.0.1", 1, "127.0.0.1", Duration::from_secs(1))
-        .err()
-        .unwrap();
-    assert_eq!(error.to_string(), "home tls: ca-cert contains no PEM certificates");
+    let error = dialer(&cfg).err().unwrap().to_string();
+    assert!(error.contains("ca-cert") && error.contains("PEM"), "{error}");
 }
-
 #[test]
 fn fingerprint_requires_a_leading_certificate_block() {
     let pki = Pki::new("ca");

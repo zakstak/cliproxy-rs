@@ -1,0 +1,255 @@
+{
+  "provenance": "Explicit schema-boundary cases independently reviewed from their inputs. These are unsupported attachments that empty a user turn, covered directly by request_pair_contract. No recorded Go error or output is consumed.",
+  "cases": [
+    {
+      "pair": "claude-codex",
+      "name": "TestConvertClaudeRequestToCodex_RefusesAnyEmptiedUserTurn:44:compat",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestConvertClaudeRequestToCodex_RefusesAnyEmptiedUserTurn:44:compat#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestConvertClaudeRequestToCodex_RefusesAnyEmptiedUserTurn:44:compat#3",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestConvertClaudeRequestToCodex_RefusesAnyEmptiedUserTurn:44:compat#4",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestConvertClaudeRequestToCodex_EmptyTextDoesNotHideAnEmptiedUserTurn:89:compat",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestConvertClaudeRequestToCodex_EmptyTextDoesNotHideAnEmptiedUserTurn:89:compat#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope#3",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope#4",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestClaudeToCodexUnrepresentableImageOnlyTurnIsRefused:116:envelope#5",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-codex",
+      "name": "TestClaudeToCodexEmptyTextDoesNotHideAnUnrepresentableImage:116:envelope",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-openai",
+      "name": "TestClaudeFileOnlyRequestSurfacesUnsupportedPart:1790:envelope",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-openai",
+      "name": "TestConvertClaudeRequestToOpenAI_RefusesAnyEmptiedUserTurn:44:compat",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-openai",
+      "name": "TestConvertClaudeRequestToOpenAI_RefusesAnyEmptiedUserTurn:44:compat#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-openai",
+      "name": "TestConvertClaudeRequestToOpenAI_RefusesAnyEmptiedUserTurn:44:compat#3",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-openai",
+      "name": "TestConvertClaudeRequestToOpenAI_RefusesAnyEmptiedUserTurn:44:compat#4",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-openai",
+      "name": "TestClaudeToOpenAIFileImageOnlyTurnIsRefused:94:envelope",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "claude-openai",
+      "name": "TestClaudeToOpenAIEmptyTextDoesNotHideAFileImage:94:envelope",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-claude",
+      "name": "TestConvertOpenAIRequestToClaude_FileParts:36:envelope",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-claude",
+      "name": "TestConvertOpenAIRequestToClaude_FileParts:36:envelope#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-claude",
+      "name": "TestConvertOpenAIRequestToClaude_FileParts:36:envelope#3",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-claude",
+      "name": "TestConvertOpenAIRequestToClaude_RefusesAnyEmptiedUserTurn:46:compat",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-claude",
+      "name": "TestConvertOpenAIRequestToClaude_RefusesAnyEmptiedUserTurn:46:compat#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-claude",
+      "name": "TestConvertOpenAIRequestToClaude_RefusesAnyEmptiedUserTurn:46:compat#3",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-claude",
+      "name": "TestConvertOpenAIRequestToClaude_RefusesAnyEmptiedUserTurn:46:compat#4",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-codex",
+      "name": "TestConvertOpenAIRequestToCodex_ExportedWrapperKeepsAJSONBody:133",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-codex",
+      "name": "TestConvertOpenAIRequestToCodex_RefusesAnyEmptiedUserTurn:58",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-codex",
+      "name": "TestConvertOpenAIRequestToCodex_RefusesAnyEmptiedUserTurn:58#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-codex",
+      "name": "TestConvertOpenAIRequestToCodex_RefusesAnyEmptiedUserTurn:58#3",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-codex",
+      "name": "TestConvertOpenAIRequestToCodex_RefusesAnyEmptiedUserTurn:58#4",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-codex",
+      "name": "TestConvertOpenAIRequestToCodex_RefusesAnyEmptiedUserTurn:58#5",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:84:compat",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:96:envelope",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:84:compat#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:96:envelope#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:84:compat#3",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:96:envelope#3",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:84:compat#4",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:96:envelope#4",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:84:compat#5",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_RefusesAnyEmptiedUserTurn:96:envelope#5",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_ExportedWrappersKeepAJSONBody:134",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-claude",
+      "name": "TestConvertOpenAIResponsesRequestToClaude_ExportedWrappersKeepAJSONBody:135:compat",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-openai",
+      "name": "TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RefusesAnyEmptiedUserTurn:74",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-openai",
+      "name": "TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RefusesAnyEmptiedUserTurn:74#2",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-openai",
+      "name": "TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RefusesAnyEmptiedUserTurn:74#3",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-openai",
+      "name": "TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RefusesAnyEmptiedUserTurn:74#4",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-openai",
+      "name": "TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RefusesAnyEmptiedUserTurn:74#5",
+      "contract": "unsupported content part:"
+    },
+    {
+      "pair": "openai-response-openai",
+      "name": "TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_ExportedWrapperKeepsAJSONBody:159",
+      "contract": "unsupported content part:"
+    }
+  ]
+}

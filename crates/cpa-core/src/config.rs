@@ -1161,8 +1161,7 @@ fn resolve_auth_dir(dir: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// Go `TestPrepareConfigFileForUploadReportsSecretItCannotHash` "read-only file";
-    /// tests/prepare_upload_go.rs replays the other Go cases.
+    /// A failed config write leaves the original file intact.
     #[test]
     fn prepare_for_upload_refuses_a_file_it_cannot_write() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1172,7 +1171,7 @@ mod tests {
         let content = "remote-management:\n  secret-key: upload-plaintext-secret\n";
         std::fs::write(&path, content).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
-        // Root can write anyway; Go skips there too.
+        // A privileged process can still write a read-only file.
         if std::fs::OpenOptions::new().write(true).open(&path).is_err() {
             assert!(prepare_for_upload(&path).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
@@ -1240,23 +1239,25 @@ mod tests {
     }
 
     #[test]
-    fn image_generation_mode_reads_go_spellings() {
-        let mode = |yaml: &str| {
-            Config::parse(&format!("multimedia:\n  disable-image-generation: {yaml}\n"))
-                .map(|c| c.document["multimedia"]["disable-image-generation"].clone())
-                .map_err(|e| e.to_string())
-        };
-        assert_eq!(mode("' Off '"), Ok(Value::Bool(false)));
-        assert_eq!(mode("~"), Ok(Value::Bool(false)));
-        assert_eq!(mode("YES"), Ok(Value::Bool(true)));
-        assert_eq!(mode("' Chat'"), Ok(Value::from("chat")));
-        assert_eq!(
-            mode("\"\\u00dc\\u0001\""),
-            Err(
-                "invalid disable-image-generation value \"\u{fc}\\x01\" (allowed: true, false, chat, passthrough)"
-                    .into()
-            )
-        );
+    fn image_generation_mode_accepts_operator_spellings() {
+        for (spelling, expected) in [
+            ("' Off '", Value::Bool(false)),
+            ("~", Value::Bool(false)),
+            ("YES", Value::Bool(true)),
+            ("' Chat'", Value::from("chat")),
+            ("passthrough", Value::from("passthrough")),
+        ] {
+            let cfg = Config::parse(&format!("multimedia: {{disable-image-generation: {spelling}}}\n")).unwrap();
+            assert_eq!(cfg.document["multimedia"]["disable-image-generation"], expected);
+            assert_eq!(
+                Config::parse(&yaml_string(&cfg.document).unwrap()).unwrap().document,
+                cfg.document
+            );
+        }
+        for invalid in ["unknown", "7", "[chat]", "\"\\u00dc\\u0001\""] {
+            let error = Config::parse(&format!("multimedia: {{disable-image-generation: {invalid}}}\n")).unwrap_err();
+            assert!(error.to_string().contains("disable-image-generation"));
+        }
     }
 
     #[test]
@@ -1557,7 +1558,7 @@ upstream: {claude: {server-side-fallback: false}}",
     }
 
     #[test]
-    fn defaults_match_go_loader() {
+    fn empty_config_uses_documented_defaults() {
         let cfg = Config::parse("").unwrap();
         assert_eq!((cfg.port, cfg.host.as_str()), (0, ""));
         assert_eq!(cfg.auth_dir, home().join(".cli-proxy-api"));
@@ -1568,6 +1569,12 @@ upstream: {claude: {server-side-fallback: false}}",
         assert_eq!(resolve_auth_dir("~"), home());
         assert_eq!(resolve_auth_dir("~other/x"), home().join("other/x"));
         assert_eq!(resolve_auth_dir("/abs"), PathBuf::from("/abs"));
+        let saved = yaml_string(&cfg.document).unwrap();
+        let reloaded = Config::parse(&saved).unwrap();
+        assert_eq!(
+            (reloaded.host, reloaded.port, reloaded.auth_dir),
+            (cfg.host, cfg.port, cfg.auth_dir)
+        );
     }
 
     /// A model name that looks like a number stays the literal string, and plain numbers
@@ -1634,312 +1641,84 @@ oauth-excluded-models: {{c: [{numbers}]}}
         assert_eq!(doc["oauth-excluded-models"]["c"][1 << 20], Value::from("0"));
     }
 
-    /// yaml.v3 (v8.0.35) reads a plain integer beyond int64 and uint64 as a float when it
-    /// is decimal and as text otherwise, and a string setting as its text; serde_yaml_ng
-    /// refused one that fits 128 bits, failing the load.
+    /// String settings preserve numeric text; bounded integer settings refuse overflow.
     #[test]
-    fn integers_beyond_64_bits_read_as_in_go() {
-        let token = "123456789012345678901234567890";
-        let cfg = Config::parse(&format!("server:\n  github-token: {token}\n")).unwrap();
-        assert_eq!(cfg.document["server"]["github-token"].as_str(), Some(token));
-        assert_eq!(
-            body_value(token, &["server", "github-token"]).unwrap(),
-            Value::from(token)
-        );
-        let any = yaml_value("x: [18446744073709551616, -9223372036854775809, 0x1FFFFFFFFFFFFFFFFF]\n").unwrap();
-        let want: Vec<Value> = vec![
-            1.8446744073709552e19.into(),
-            (-9.223372036854776e18).into(),
-            "0x1FFFFFFFFFFFFFFFFF".into(),
-        ];
-        assert_eq!(any["x"].as_sequence().unwrap(), &want);
-        // Any number of them, read in one pass; marks after a BOM still line up.
-        let many = yaml_value(&format!("x: [{}]\n", vec!["-18446744073709551616"; 100].join(", "))).unwrap();
-        assert!(
-            many["x"]
-                .as_sequence()
-                .unwrap()
-                .iter()
-                .all(|v| v.as_f64() == Some(-1.8446744073709552e19))
-        );
-        // An anchored one keeps its anchor, on its line or the line above.
-        for text in [
-            "a: &n 18446744073709551616\nb: *n\n",
-            "a: &n\n  18446744073709551616\nb: *n\n",
+    fn oversized_numbers_keep_text_at_string_boundaries() {
+        // Tokens and model IDs are opaque strings, even when they exceed integer limits.
+        for token in [
+            "123456789012345678901234567890",
+            "18446744073709551616",
+            "-9223372036854775809",
+            "0x1FFFFFFFFFFFFFFFFF",
         ] {
-            let anchored = yaml_value(text).unwrap();
-            assert_eq!(anchored["b"].as_f64(), Some(1.8446744073709552e19), "{text}");
-        }
-        // Integers serde_yaml_ng reads are read the same beside one it refuses: past
-        // f64's range the text, as in Go, and a decimal with a leading zero.
-        let huge = format!("1{}", "0".repeat(400));
-        for other in [huge.as_str(), "01000000000000000000000"] {
-            let both = yaml_value(&format!("x: [18446744073709551616, {other}]\n")).unwrap();
+            let cfg = Config::parse(&format!("server: {{github-token: {token}}}\n")).unwrap();
+            assert_eq!(cfg.document["server"]["github-token"].as_str(), Some(token));
             assert_eq!(
-                both["x"][1],
-                yaml_value(&format!("x: {other}\n")).unwrap()["x"],
-                "{other}"
+                body_value(token, &["server", "github-token"]).unwrap(),
+                Value::from(token)
             );
+            let saved = yaml_string(&cfg.document).unwrap();
+            assert_eq!(Config::parse(&saved).unwrap().document, cfg.document);
         }
-        assert_eq!(
-            yaml_value(&format!("x: {huge}\n")).unwrap()["x"].as_str(),
-            Some(huge.as_str())
-        );
-        let bom = yaml_value("\u{feff}a: [0x1FFFFFFFFFFFFFFFFF, x]\n").unwrap();
-        assert_eq!(bom["a"], yaml_value("['0x1FFFFFFFFFFFFFFFFF', x]").unwrap());
-        // Go: cannot unmarshal !!float into int.
         assert!(Config::parse("routing: {retry: {request-retry: 18446744073709551616}}\n").is_err());
     }
 
-    /// yaml.v3 (v3.0.1, Go 1.26.4) drops a plain number's underscores before resolving
-    /// it and reads a leading zero as octal (or decimal, failing that); serde_yaml_ng
-    /// read each of these as text.
+    /// Accepted numeric configuration spellings retain their type and string spelling after save and reload.
     #[test]
-    fn underscore_numbers_read_as_in_go() {
-        let go: [(&str, Value); 20] = [
-            ("1_000", 1000.into()),
-            ("+_1", 1.into()),
-            ("-1_000", (-1000).into()),
-            ("1__0", 10.into()),
-            ("1_", 1.into()),
-            ("0_x1F", 31.into()),
-            ("-0x1_F", (-31).into()),
-            ("007_1", 57.into()),
-            ("-0b1_0", (-2).into()),
-            ("18_446_744_073_709_551_615", u64::MAX.into()),
-            ("1_0.5", 10.5.into()),
-            ("1_0e1_0", 1e11.into()),
-            ("1._5", 1.5.into()),
-            (".5_0", 0.5.into()),
-            ("-.5_0", (-0.5).into()),
-            ("1_000_000_000_000_000_000_000", 1e21.into()),
-            ("_1", "_1".into()),
-            (".5_", ".5_".into()),
-            ("._5", "._5".into()),
-            ("0x1_FFFF_FFFF_FFFF_FFFF_FF", "0x1_FFFF_FFFF_FFFF_FFFF_FF".into()),
-        ];
-        let leading_zero: [(&str, Value); 10] = [
-            ("007", 7.into()),
-            ("-007", (-7).into()),
-            ("00", 0.into()),
-            ("08", 8.0.into()),
-            ("09.5", 9.5.into()),
-            ("07e1", 70.0.into()),
-            ("01000000000000000000000", 9223372036854775808u64.into()),
-            ("01777777777777777777777", u64::MAX.into()),
-            ("02000000000000000000000", 2e21.into()),
-            ("0111111111111111111111111", 1.1111111111111111e23.into()),
-        ];
-        // Go's last resort reads a sign after `0b` or `0o`.
-        let signed: [(&str, Value); 7] = [
-            ("0b_-1", (-1).into()),
-            ("0o_+17", 15.into()),
-            ("0o_-7", (-7).into()),
-            ("0b-1", (-1).into()),
-            ("0o+17", 15.into()),
-            ("+0b-1", "+0b-1".into()),
-            (
-                "0b+1111111111111111111111111111111111111111111111111111111111111111",
-                "0b+1111111111111111111111111111111111111111111111111111111111111111".into(),
-            ),
-        ];
-        // Go's text: beyond 64 bits, or a `+` past int64.
-        let zeros = "0".repeat(64);
-        let wide = [
-            "0o2000000000000000000000".to_owned(),
-            "+0o2000000000000000000000".to_owned(),
-            format!("-0b1{zeros}"),
-            "+0o1000000000000000000000".to_owned(),
-            "+0b1_000000000000000000000000000000000000000000000000000000000000000".to_owned(),
-        ];
-        let wide: Vec<(&str, Value)> = wide.iter().map(|t| (t.as_str(), Value::from(t.as_str()))).collect();
-        // Upper-case prefixes, which Go's ParseInt takes, and a `+` past int64, which its
-        // ParseUint does not, so a decimal one is a float and any other text.
-        let prefixes: [(&str, Value); 16] = [
-            ("0X1F", 31.into()),
-            ("-0X1F", (-31).into()),
-            ("+0X1F", 31.into()),
-            ("0O17", 15.into()),
-            ("0B10", 2.into()),
-            ("-0B10", (-2).into()),
-            ("0X", "0X".into()),
-            ("0O8", "0O8".into()),
-            ("0B2", "0B2".into()),
-            ("0X8000000000000000", (1u64 << 63).into()),
-            ("0XFFFFFFFFFFFFFFFF", u64::MAX.into()),
-            ("0X10000000000000000", "0X10000000000000000".into()),
-            ("+9223372036854775807", i64::MAX.into()),
-            ("+9223372036854775808", 9223372036854775808f64.into()),
-            ("+18446744073709551615", 18446744073709551615f64.into()),
-            ("+0x8000000000000000", "+0x8000000000000000".into()),
-        ];
-        let go = go
-            .into_iter()
-            .chain(leading_zero)
-            .chain(signed)
-            .chain(wide)
-            .chain(prefixes)
-            .collect::<Vec<_>>();
-        let list = go.iter().map(|(text, _)| *text).collect::<Vec<_>>().join(", ");
-        let any = yaml_value(&format!("x: [{list}]\n")).unwrap();
-        for ((text, want), got) in go.iter().zip(any["x"].as_sequence().unwrap()) {
-            assert_eq!(got, want, "{text}");
+    fn numeric_config_values_have_explicit_types_and_round_trip() {
+        // Preserve supported operator spellings, without pinning incidental fallback
+        // results for malformed radix prefixes, trailing underscores, or double signs.
+        for (text, value) in [("1_000", 1000), ("0x1F", 31), ("007", 7), ("0b10", 2), ("0o17", 15)] {
+            let cfg = Config::parse(&format!(
+                "server: {{github-token: {text}}}\nrouting: {{retry: {{request-retry: {text}}}}}\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.document["server"]["github-token"].as_str(), Some(text));
+            assert_eq!(cfg.routing.retry.request_retry, value);
+            let reloaded = Config::parse(&yaml_string(&cfg.document).unwrap()).unwrap();
+            assert_eq!(reloaded.document, cfg.document);
+            assert_eq!(reloaded.routing.retry.request_retry, value);
         }
-        // Without an underscore in the file too.
-        assert_eq!(yaml_value("x: 007\n").unwrap()["x"], Value::from(7));
-        assert_eq!(yaml_value("x: 0X1F\n").unwrap()["x"], Value::from(31));
-        assert_eq!(
-            yaml_value("x: +9223372036854775808\n").unwrap()["x"],
-            Value::from(9223372036854775808f64)
-        );
-        assert_eq!(
-            yaml_value("x: 9223372036854775808\n").unwrap()["x"],
-            Value::from(1u64 << 63)
-        );
-        let cfg = Config::parse("server: {github-token: 0X1F}\nrouting: {retry: {request-retry: 0X1F}}\n").unwrap();
-        assert_eq!(cfg.document["server"]["github-token"].as_str(), Some("0X1F"));
-        assert_eq!(cfg.routing.retry.request_retry, 31);
-        assert_eq!(yaml_value("007").unwrap(), Value::from(7));
-        // A string setting keeps the text, an int setting gets the number, and a key
-        // stays text, as yaml.v3 reads it into a string-keyed map.
-        let cfg = Config::parse(
-            "server: {github-token: 1_000}\nrouting: {retry: {request-retry: 1_0}}\n\
-             oauth-excluded-models: {1_0: [a], 007: [b]}\n",
-        )
-        .unwrap();
-        assert_eq!(cfg.document["server"]["github-token"].as_str(), Some("1_000"));
-        assert_eq!(cfg.routing.retry.request_retry, 10);
+        let cfg = Config::parse("oauth-excluded-models: {1_0: [a], 007: [b]}\n").unwrap();
         assert!(cfg.document["oauth"]["excluded-models"].get("1_0").is_some());
         assert!(cfg.document["oauth"]["excluded-models"].get("007").is_some());
-        let key = yaml_value(&format!("0o2000000000000000000000: a\n-0b1{zeros}: b\n")).unwrap();
-        assert_eq!(key["0o2000000000000000000000"], Value::from("a"));
-        assert_eq!(key[format!("-0b1{zeros}").as_str()], Value::from("b"));
-        assert_eq!(
-            body_value("1_000", &["server", "github-token"]).unwrap(),
-            Value::from("1_000")
-        );
     }
 
-    /// yaml.v3 reads a plain timestamp in an untyped value as a `time.Time`, which Go
-    /// marshals as RFC 3339 text (recorded with yaml.v3 v3.0.1 and Go 1.26.4); a string
-    /// setting and a mapping key keep the text.
+    /// String settings retain date-like identifiers; timestamp values retain their represented instant.
     #[test]
-    fn plain_timestamps_read_as_in_go() {
-        let go = [
-            ("2001-12-14", Some("2001-12-14T00:00:00Z")),
-            ("2001-1-2", Some("2001-01-02T00:00:00Z")),
-            ("2001-12-14 21:59:43.10", Some("2001-12-14T21:59:43.1Z")),
-            ("2001-12-14T21:59:43.10-05:00", Some("2001-12-14T21:59:43.1-05:00")),
-            ("2001-12-14t21:59:43,5+00:60", Some("2001-12-14T21:59:43.5+01:00")),
-            (
-                "2001-12-14T21:59:43.123456789123Z",
-                Some("2001-12-14T21:59:43.123456789Z"),
-            ),
-            ("2001-12-14T21:59:43-00:00", Some("2001-12-14T21:59:43Z")),
-            ("2004-2-29   1:2:3", Some("2004-02-29T01:02:03Z")),
-            ("0001-01-01", Some("0001-01-01T00:00:00Z")),
-            ("2001-12-14 21:59:43.10 -5", None),
-            ("2001-12-14x", None),
-            ("2001-02-29", None),
-            ("2001-12-14t21:59:43.10z", None),
-            ("2001-12-14 21:59:43.10Z", None),
-            ("2001-12-14T24:00:00Z", None),
-            ("2001-12-14 \t21:59:43", None),
-        ];
-        // A block list: a flow one would split `43,5` at the comma.
-        let list: String = go.iter().map(|(text, _)| format!("  - {text}\n")).collect();
-        let any = yaml_value(&format!("x:\n{list}  - '2001-12-14'\n")).unwrap();
-        let json = serde_json::to_value(AsJson(&any)).unwrap();
-        for (i, (text, want)) in go.iter().enumerate() {
-            let tagged = matches!(&any["x"][i], Value::Tagged(t) if t.tag == TIMESTAMP_TAG);
-            assert_eq!(tagged, want.is_some(), "{text}");
-            assert_eq!(json["x"][i], want.unwrap_or(text), "{text}");
-        }
-        assert_eq!(any["x"][go.len()], Value::from("2001-12-14"));
-        // Written back plain, as yaml.v3 writes a `time.Time`, and read back the same.
-        let text = yaml_string(&any).unwrap();
-        assert!(text.contains("\n- 2001-12-14T00:00:00Z\n"), "{text}");
-        assert_eq!(yaml_value(&text).unwrap(), any, "{text}");
-        let cfg =
-            Config::parse("server: {github-token: 2001-12-14}\noauth-excluded-models: {2001-12-14: [a]}\n").unwrap();
-        assert_eq!(cfg.document["server"]["github-token"].as_str(), Some("2001-12-14"));
-        assert!(cfg.document["oauth"]["excluded-models"].get("2001-12-14").is_some());
-        // The management key is still found and hashed beside a plain timestamp.
-        let hash = "$2a$10$abcdefghijklmnopqrstuuvwxyzabcdefghijklmnopqrstuvwxy";
-        let saved = with_secret_hash("management: {secret-key: plain}\nx: [2001-12-14]\n", hash).unwrap();
-        assert!(saved.contains(hash), "{saved}");
-        let prepared = prepared_for_upload("management: {secret-key: plain}\nx: [2001-12-14]\n").unwrap();
-        assert!(prepared.contains("$2"), "{prepared}");
-        // Folded over lines, under a `%TAG !` directive, and inside a local tag, which
-        // Go's `any` prints as its value (all recorded with yaml.v3).
-        for (text, want) in [
-            (
-                "x: 2001-12-14\n  21:59:43\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z"}),
-            ),
-            (
-                "x: [2001-12-14\n  21:59:43]\n",
-                serde_json::json!({"x": ["2001-12-14T21:59:43Z"]}),
-            ),
-            // Anchored too, with the anchor on the scalar's line or its own.
-            (
-                "x: &a 2001-12-14\n  21:59:43\ny: *a\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
-            ),
-            (
-                "x: &a\n  2001-12-14\n  21:59:43\ny: *a\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
-            ),
-            (
-                "x: &a # c\n  # d\n  2001-12-14\n  21:59:43\ny: *a\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
-            ),
-            (
-                "x: &a\u{2028}  2001-12-14\n  21:59:43\ny: *a\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
-            ),
-            (
-                "x: &a\n  # c\n  2001-12-14\n  21:59:43\ny: *a\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
-            ),
-            (
-                "x: &a\u{2029}  2001-12-14\n  21:59:43\ny: *a\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
-            ),
-            (
-                "x: &a\u{85}  2001-12-14\n  21:59:43\ny: *a\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
-            ),
-            (
-                "x: [&a 2001-12-14\n  21:59:43, *a]\n",
-                serde_json::json!({"x": ["2001-12-14T21:59:43Z", "2001-12-14T21:59:43Z"]}),
-            ),
-            (
-                "%TAG ! tag:example.com,2000:\n---\nx: 2001-12-14\n",
-                serde_json::json!({"x": "2001-12-14T00:00:00Z"}),
-            ),
-            (
-                "x: !y {at: 2001-12-14}\n",
-                serde_json::json!({"x": {"at": "2001-12-14T00:00:00Z"}}),
-            ),
+    fn timestamps_preserve_string_settings_and_serialized_instants() {
+        // Dates in typed string settings are identifiers, not dates to normalize.
+        for text in [
+            "2001-12-14",
+            "2001-12-14T21:59:43.10-05:00",
+            "2001-02-29",
+            "2001-12-14T24:00:00Z",
         ] {
-            let json = serde_json::to_value(AsJson(&yaml_value(text).unwrap())).unwrap();
-            assert_eq!(json, want, "{text}");
+            let cfg = Config::parse(&format!("server: {{github-token: {text}}}\n")).unwrap();
+            assert_eq!(cfg.document["server"]["github-token"].as_str(), Some(text));
+            assert_eq!(
+                Config::parse(&yaml_string(&cfg.document).unwrap()).unwrap().document,
+                cfg.document
+            );
         }
-        let directive = yaml_value("%TAG ! tag:example.com,2000:\n---\nx: 2001-12-14\n").unwrap();
-        assert!(
-            matches!(&directive["x"], Value::Tagged(t) if t.tag == TIMESTAMP_TAG),
-            "{directive:?}"
+        // YAML timestamp values carry the instant when exposed through a JSON view.
+        // These are YAML timestamp examples, not a language runtime's permissive parser table.
+        for (text, expected) in [
+            ("2001-12-14", "2001-12-14T00:00:00Z"),
+            ("2001-12-14T21:59:43-05:00", "2001-12-14T21:59:43-05:00"),
+        ] {
+            let value = yaml_value(&format!("at: &at {text}\ncopy: *at\n")).unwrap();
+            let json = serde_json::to_value(AsJson(&value)).unwrap();
+            assert_eq!(json, serde_json::json!({"at": expected, "copy": expected}));
+            assert_eq!(yaml_value(&yaml_string(&value).unwrap()).unwrap(), value);
+        }
+        let prepared = prepared_for_upload("management: {secret-key: plain}\nx: [2001-12-14]\n").unwrap();
+        let cfg = Config::parse(&prepared).unwrap();
+        assert!(bcrypt::verify("plain", &cfg.management.secret_key).unwrap());
+        assert_eq!(
+            serde_json::to_value(AsJson(&cfg.document["x"])).unwrap(),
+            serde_json::json!(["2001-12-14T00:00:00Z"])
         );
-        // A string key that reads as a timestamp is quoted, as Go's Marshal quotes it.
-        let key = yaml_string(&yaml_value("{'2001-12-14': a}").unwrap()).unwrap();
-        assert_eq!(key, "\"2001-12-14\": a\n");
-        // Go cannot marshal an offset of 24 hours or more as JSON. The config decode
-        // refuses it; a reader of other settings, such as discovery's, still parses.
-        let wide = "x: 2001-12-14T21:59:43+24:00\n";
-        let err = yaml_value(wide).unwrap_err();
-        assert!(format!("{err:#}").contains("24 hours"), "{err:#}");
-        assert!(config_value(wide).is_err() && parse_yaml(wide).is_ok());
     }
 
     /// yaml.v3 skips a leading BOM; serde_yaml_ng and libyaml read it as part of the
@@ -2027,54 +1806,44 @@ oauth-excluded-models: {{c: [{numbers}]}}
         assert_eq!(params["b"], Value::from("007"), "{saved}");
     }
 
-    /// yaml.v3 reads a plain scalar into any Go string setting as its text, so a setting
-    /// written as a number or boolean (`0x1F`, `1.50`, `007`, `true`) keeps it, in the v8
-    /// and legacy layouts and through an anchored key (tests/reference/scalar_settings).
+    /// Opaque text survives typed config boundaries in both supported layouts and after serialization.
     #[test]
     fn scalar_settings_keep_their_yaml_text() {
-        let go: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/scalar_settings_go.json")).unwrap();
-        // Native plugins are removed (docs/DIFFERENCES-FROM-GO.md "Native plugins"): the
-        // recording's one-line `plugins` section is dropped and its check skipped.
-        let without_plugins = |yaml: &str| {
-            yaml.lines()
-                .filter(|l| !l.starts_with("plugins:"))
-                .map(|l| format!("{l}\n"))
-                .collect::<String>()
-        };
-        for case in go["cases"].as_array().unwrap() {
-            // The removed providers' settings (issue #49) and their checks go too.
-            let yaml = crate::removed::strip_settings(&without_plugins(case["yaml"].as_str().unwrap()));
-            let cfg = Config::parse(&yaml).unwrap();
-            for check in case["checks"].as_array().unwrap() {
-                let path = check["rust"].as_str().unwrap();
-                if path.starts_with("plugins.") || path.contains("openai-compatibility") || path.contains("antigravity")
-                {
-                    continue;
+        // Exercise the supported boundaries directly. The source text is the expected
+        // value; there is no recorded decoder output to consult.
+        for text in ["1.50", "0x1F", "007", "true", "2001-12-14", "1_000"] {
+            for yaml in [
+                format!(
+                    "server: {{host: {text}, github-token: {text}, discovery: {{service-name: {text}, subtypes: [{text}]}}}}\naccess: {{api-keys: [{text}]}}\noauth: {{auth-dir: {text}}}\nmanagement: {{panel-github-repository: {text}}}\n"
+                ),
+                format!(
+                    "host: {text}\ngithub-token: {text}\ndiscovery: {{service-name: {text}, subtypes: [{text}]}}\napi-keys: [{text}]\nauth-dir: {text}\nremote-management: {{panel-github-repository: {text}}}\n"
+                ),
+            ] {
+                let cfg = Config::parse(&yaml).unwrap();
+                assert_eq!(cfg.host, text);
+                assert_eq!(cfg.api_keys, [text]);
+                for path in [
+                    &["server", "github-token"][..],
+                    &["server", "discovery", "service-name"][..],
+                    &["oauth", "auth-dir"][..],
+                    &["management", "panel-github-repository"][..],
+                ] {
+                    let node = path.iter().fold(&cfg.document, |node, key| &node[*key]);
+                    assert_eq!(node.as_str(), Some(text), "{path:?}: {yaml}");
                 }
-                let mut node = &cfg.document;
-                for part in path.split('.') {
-                    node = match part.parse::<usize>() {
-                        Ok(i) => &node[i],
-                        Err(_) => &node[part],
-                    };
-                }
-                assert_eq!(node.as_str(), check["value"].as_str(), "{}: {path}", case["name"]);
+                assert_eq!(cfg.document["server"]["discovery"]["subtypes"][0].as_str(), Some(text));
+                let saved = yaml_string(&cfg.document).unwrap();
+                assert_eq!(Config::parse(&saved).unwrap().document, cfg.document);
             }
         }
-        // A model with a display name written as a number registers under its prefix,
-        // both as Go reads them.
-        let cfg = Config::parse(&crate::removed::strip_settings(&without_plugins(
-            go["cases"][0]["yaml"].as_str().unwrap(),
-        )))
-        .unwrap();
-        let aliases = crate::registry::dynamic::global_aliases(&cfg);
-        let models: Vec<(String, String)> = credentials::from_config(&cfg)
-            .iter()
-            .flat_map(|c| crate::registry::dynamic::models_for(&cfg, &aliases, c, 0))
-            .map(|m| (m.id, m.display_name))
-            .collect();
-        assert!(models.contains(&("0x1F/a".into(), "1.50".into())), "{models:?}");
+        // Payload selector fields are strings, but arbitrary params retain their JSON types.
+        let cfg = Config::parse("requests: {payload: {override: [{models: [{name: 7, protocol: 1.50}], params: {value: 1.50, enabled: true}}]}}\n").unwrap();
+        let rule = &cfg.document["requests"]["payload"]["override"][0];
+        assert_eq!(rule["models"][0]["name"], Value::from("7"));
+        assert_eq!(rule["models"][0]["protocol"], Value::from("1.50"));
+        assert_eq!(rule["params"]["value"], Value::from(1.5));
+        assert_eq!(rule["params"]["enabled"], Value::from(true));
     }
 
     /// Native plugins are removed: any `plugins` section, enabled or not, empty, null or

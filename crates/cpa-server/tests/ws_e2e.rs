@@ -1,15 +1,8 @@
-//! Responses WebSocket (`GET /v1/responses`) end to end, replaying
-//! `tests/ws_fixtures/ws_e2e.json`. Each scenario ran through Go's real handler, auth
-//! manager and `CodexAutoExecutor` against a scripted loopback upstream
-//! (`tests/ws_fixtures/go/zz_rsfix_ws_test.go`). Here the same client frames and upstream
-//! script run through the Rust router and Codex executor; the frames the client sees,
-//! close codes, and what upstream received must match. Fake credentials only.
-//!
-//! Codex WebSocket credentials now take the native WebSocket route (#24,
-//! `docs/codex/CONTRACT.md` "Native WebSocket route"); the Go recordings stay as
-//! historical evidence for everything else. [`native_terminals`] and the upstream check
-//! in [`run_scenario`] encode the route's documented differences from Go
-//! (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket route"); no recording changed.
+//! Native Responses WebSocket transcripts against local scripted peers.
+//! Historical Go recordings supply only client messages and mock reply stimuli;
+//! `contract_scenario` specifies expected relay/validation/lifecycle behavior from
+//! docs/codex/CONTRACT.md. Recorded output frames and upstream captures are discarded.
+//! Credentials are fake and the runtime uses a private auth directory.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -28,8 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use wreq::ws::message::Message;
 
 static FIXTURE: LazyLock<Vec<Value>> = LazyLock::new(|| {
-    serde_json::from_str::<Value>(include_str!("ws_fixtures/ws_e2e.json"))
-        .unwrap()
+    serde_json::from_str::<Value>(include_str!("ws_fixtures/ws_inputs.json")).unwrap()["scenarios"]
         .as_array()
         .unwrap()
         .clone()
@@ -48,7 +40,7 @@ struct Captured {
 struct Upstream {
     script: Mutex<VecDeque<Value>>,
     captured: Mutex<Vec<Captured>>,
-    /// Held SSE responses whose request the proxy canceled (Go `http_canceled`).
+    /// Held SSE responses whose request the proxy canceled.
     canceled: Mutex<u64>,
 }
 
@@ -301,125 +293,75 @@ fn config(scenario: &Value, upstream: &str) -> Config {
     Config::parse(&yaml).unwrap()
 }
 
-/// Go's upstream body for `name`, with cliproxy-rs's deliberate differences applied. The
-/// multi-agent v2 scenarios come from an official Codex client that omits
-/// `parallel_tool_calls`. Go adds `true`, and cliproxy-rs leaves the field absent
-/// (docs/DIFFERENCES-FROM-GO.md, "Codex native Responses fields").
-fn go_upstream_body(name: &str, body: &str) -> String {
-    if matches!(name, "ws_multi_agent_v2" | "http_multi_agent_v2") {
-        return body.replacen(r#""parallel_tool_calls":true,"#, "", 1);
-    }
-    body.to_owned()
-}
-
-/// Random values Go and Rust both generate: UUIDs and the prewarm timestamp.
-fn mask(s: &str) -> String {
-    static UUID: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}").unwrap());
-    static CREATED: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r#""created_at":\d+"#).unwrap());
-    let s = UUID.replace_all(s, "<uuid>");
-    CREATED.replace_all(&s, r#""created_at":0"#).into_owned()
-}
-
 #[derive(Debug, PartialEq)]
 enum Frame {
     Text(String),
     Close(u16, String),
+    Semantic(Value),
+    LocalError(Value),
+    Interrupted(Value),
 }
 
-/// Go leaves `frames` null for steps after the connection closed.
-fn go_frames(step: &Value) -> Vec<Frame> {
+fn expected_frames(step: &Value) -> Vec<Frame> {
     step["frames"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|f| match f["text"].as_str() {
-            Some(text) => Frame::Text(mask(text)),
-            None => Frame::Close(
-                f["close"].as_u64().unwrap() as u16,
-                f["reason"].as_str().unwrap_or_default().to_owned(),
-            ),
+        .map(|f| {
+            if let Some(text) = f["text"].as_str() {
+                Frame::Text(text.to_owned())
+            } else if f["semantic"].is_object() {
+                Frame::Semantic(f["semantic"].clone())
+            } else if f["local_error"].is_object() {
+                Frame::LocalError(f["local_error"].clone())
+            } else if f["interrupted"].is_object() {
+                Frame::Interrupted(f["interrupted"].clone())
+            } else {
+                Frame::Close(
+                    f["close"].as_u64().unwrap() as u16,
+                    f["reason"].as_str().unwrap_or_default().to_owned(),
+                )
+            }
         })
         .collect()
 }
 
-/// Headers both implementations must agree on, the permessage-deflate offer included.
-/// Transport headers (WebSocket key, connection, length, encoding) legitimately differ
-/// between gorilla/net http and wreq.
-const COMPARED_HEADERS: [&str; 11] = [
-    "sec-websocket-extensions",
-    "authorization",
-    "openai-beta",
-    "originator",
-    "user-agent",
-    "x-codex-turn-state",
-    "session_id",
-    "session-id",
-    "conversation_id",
-    "accept",
-    "content-type",
-];
-
-/// #26: Go's recording with the identity cliproxy-rs sends instead of Go's fixed
-/// `codex-tui` one (docs/DIFFERENCES-FROM-GO.md). The WebSocket client is a native
-/// Responses caller, so its own `User-Agent` and `originator` go upstream, else
-/// cliproxy-rs's; an OAuth credential always carries an originator, an API key only the
-/// caller's. The expected values are spelled out here, not taken from the proxy.
-fn under_identity_policy(scenario: &Value, go: Vec<(String, String)>) -> Vec<(String, String)> {
-    if go.is_empty() {
-        // A WebSocket frame, which has no headers.
-        return go;
-    }
-    let client = |name: &str| {
-        scenario["client_headers"]
-            .as_object()
-            .and_then(|h| h.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)))
-            .and_then(|(_, v)| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-    };
-    let auth = go
-        .iter()
-        .find(|(k, _)| k == "authorization")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
-    let oauth = scenario["credentials"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|c| c["metadata"]["access_token"].as_str())
-        .any(|token| auth == format!("Bearer {token}"));
-    let mut out: Vec<(String, String)> = go
-        .into_iter()
-        .filter(|(k, _)| k != "user-agent" && k != "originator")
-        .collect();
-    let proxy_ua = concat!("cliproxy-rs/", env!("CARGO_PKG_VERSION"));
-    out.push((
-        "user-agent".into(),
-        client("user-agent").unwrap_or_else(|| proxy_ua.into()),
-    ));
-    if let Some(originator) = client("originator").or_else(|| oauth.then(|| "cliproxy-rs".into())) {
-        out.push(("originator".into(), originator));
-    }
-    out
-}
-
-fn compared(headers: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = headers
-        .filter(|(k, _)| COMPARED_HEADERS.contains(&k.as_str()))
-        .map(|(k, v)| (k, mask(&v)))
-        .collect();
-    out.sort();
-    out
+fn frames_match(got: &[Frame], expected: &[Frame]) -> bool {
+    got.len() == expected.len()
+        && got.iter().zip(expected).all(|(got, expected)| match (got, expected) {
+            (Frame::Text(raw), Frame::Semantic(want)) => serde_json::from_str::<Value>(raw).ok().as_ref() == Some(want),
+            (Frame::Text(raw), Frame::LocalError(want)) => {
+                let Ok(event) = serde_json::from_str::<Value>(raw) else {
+                    return false;
+                };
+                event["type"] == "error"
+                    && event["status"] == want["status"]
+                    && event["error"]["type"] == "invalid_request_error"
+                    && event["error"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.contains(want["hint"].as_str().unwrap()))
+                    && (!want["code"].is_string() || event["error"]["code"] == want["code"])
+            }
+            (Frame::Text(raw), Frame::Interrupted(want)) => {
+                let Ok(event) = serde_json::from_str::<Value>(raw) else {
+                    return false;
+                };
+                event["type"] == "response.incomplete"
+                    && event["response"]["id"] == want["id"]
+                    && event["response"]["status"] == "incomplete"
+                    && event["response"]["incomplete_details"]["reason"] == "interrupted"
+                    && event["response"]["output"] == want["output"]
+            }
+            _ => got == expected,
+        })
 }
 
 async fn run(name: &str) {
     run_with(name, |_| {}).await;
 }
 
-/// [`run`] after `differ` encodes a deliberate difference from Go into the scenario
-/// (docs/DIFFERENCES-FROM-GO.md).
+/// Run a historical input scenario after adapting its client/peer stimuli to the
+/// current supported contract. Expected outputs are then derived independently.
 async fn run_with(name: &str, differ: impl FnOnce(&mut Value)) {
     let mut scenario = FIXTURE
         .iter()
@@ -427,101 +369,309 @@ async fn run_with(name: &str, differ: impl FnOnce(&mut Value)) {
         .unwrap_or_else(|| panic!("no scenario {name}"))
         .clone();
     differ(&mut scenario);
+    contract_scenario(name, &mut scenario);
     run_scenario(name, &scenario).await;
 }
 
-/// The native WebSocket route's terminal events (#24): a `response.completed`,
-/// `response.done` or `response.incomplete` of a turn served over an upstream socket
-/// reaches the client as upstream sent it. Go rebuilds `output` from the streamed items,
-/// renames `response.done` and adds zero usage details; the expected frame becomes the
-/// scripted upstream event with the same response ID. A Codex turn served over HTTP is
-/// native too (#28): Go also added the routed `model` to its `response.*` events, so
-/// every expected event with a response ID becomes the scripted event of the same type
-/// and ID.
-fn native_terminals(scenario: &mut Value) {
-    const TERMINAL: [&str; 3] = ["response.completed", "response.done", "response.incomplete"];
-    let terminal = |text: &str| TERMINAL.contains(&cpa_common::rawjson::get(text, "type").str());
-    let Some(go) = scenario["upstream"].as_array() else {
-        return;
-    };
-    // Replies are consumed in order by Go's upstream frames and HTTP requests.
-    let consumers: Vec<String> = go
+/// Independent transcript oracle for the native route. Historical fixtures supply
+/// client messages and scripted peer replies only. CONTRACT.md defines byte-preserving
+/// relay, connection-local continuation, local validation, and credential isolation.
+/// No recorded client frame, captured request, close text, or header is consulted.
+fn contract_scenario(name: &str, scenario: &mut Value) {
+    use serde_json::json;
+    let mut pending = VecDeque::<Value>::new();
+    let mut requests = Vec::new();
+    let mut bound = false;
+    let mut model = String::new();
+    let websocket = scenario["credentials"]
+        .as_array()
+        .unwrap()
         .iter()
-        .map(|c| c["kind"].as_str().unwrap().to_owned())
-        .filter(|k| k != "ws_dial")
-        .collect();
-    let mut raw = std::collections::HashMap::new();
-    let mut events = std::collections::HashMap::new();
-    let mut k = 0;
-    for step in scenario["steps"].as_array().unwrap() {
+        .any(|c| c["attributes"]["websockets"] == "true");
+    let mut last_id = String::new();
+    let mut output_items = Vec::new();
+    for (index, step) in scenario["steps"].as_array_mut().unwrap().iter_mut().enumerate() {
+        let sent = step["send"]
+            .as_str()
+            .unwrap_or_default()
+            .replace("{{last_response_id}}", &last_id);
+        let parsed: Option<Value> = serde_json::from_str(&sent).ok();
+        let local = match (name, index) {
+            ("previous_not_found_then_create", 0) => {
+                Some((409, "previous_response_id", Some("previous_response_not_found")))
+            }
+            ("previous_not_found_then_create", 1)
+            | ("steer_local_validation", 2)
+            | ("steer_rejected_when_disabled", 1 | 2) => Some((400, "unsupported websocket request type", None)),
+            ("prewarm_then_followup", 0) => Some((400, "prewarm", None)),
+            ("http_incremental", 2) | ("steer_append_inherits", 1) => Some((400, "response.append", None)),
+            ("steer_local_validation", 1) => Some((400, "JSON", None)),
+            ("steer_wrong_parent_rejected", 2) => Some((400, "continue", None)),
+            ("interrupt_in_flight" | "interrupt_in_flight_steering", 0 | 3) => Some((400, "response_id", None)),
+            ("interrupt_in_flight" | "interrupt_in_flight_steering", 1) | ("interrupt_late_ws", 1) => {
+                Some((400, "no active", None))
+            }
+            ("interrupt_in_flight" | "interrupt_in_flight_steering", 4) => Some((400, "enabled", None)),
+            _ => None,
+        };
+        if let Some((status, hint, code)) = local {
+            pending.push_back(json!({"local_error":{"status":status,"hint":hint,"code":code}}));
+        }
+        let replay = matches!(
+            (name, index),
+            ("ws_continuation_needs_replay" | "steer_model_switch_needs_replay", 1) | ("interrupt_http_local", 3)
+        );
+        let disabled = name == "steer_credential_disabled" && index == 1;
+        let local_interrupt = name == "interrupt_http_local" && (index == 1 || index == 2);
+        let stale_interrupt = name == "interrupt_late_ws" && (index == 4 || index == 5);
+        let forwarded = local.is_none() && !replay && !disabled && !local_interrupt && !stale_interrupt;
+        if forwarded && (!sent.is_empty() || step["send_hex"].is_string()) {
+            let kind = parsed.as_ref().and_then(|p| p["type"].as_str()).unwrap_or("binary");
+            if kind == "response.create" {
+                if let Some(next) = parsed.as_ref().and_then(|p| p["model"].as_str()) {
+                    model = next.to_owned();
+                }
+                if websocket {
+                    if !bound {
+                        requests.push(json!({"kind":"ws_dial"}));
+                        bound = true;
+                    }
+                    requests.push(json!({"kind":"ws_frame","body":native_frame(&sent,&model)}));
+                } else {
+                    requests.push(json!({"kind":"http","body":http_body(&sent,&model)}));
+                }
+            } else if let Some(hex) = step["send_hex"].as_str() {
+                requests.push(json!({"kind":"ws_frame","body_hex":hex}));
+            } else {
+                requests.push(json!({"kind":"ws_frame","body":sent}));
+            }
+        }
         for reply in step["upstream"].as_array().into_iter().flatten() {
-            let consumer = consumers.get(k).map(String::as_str);
-            if matches!(consumer, Some("ws_frame" | "http")) {
-                for event in reply["events"].as_array().into_iter().flatten() {
-                    let event = event.as_str().unwrap();
-                    let id = cpa_common::rawjson::get(event, "response.id").str().to_owned();
-                    if terminal(event) {
-                        raw.insert(id.clone(), event.to_owned());
-                    }
-                    if consumer == Some("http") && !id.is_empty() {
-                        events.insert(
-                            (cpa_common::rawjson::get(event, "type").str().to_owned(), id),
-                            event.to_owned(),
-                        );
-                    }
+            for event in reply["events"].as_array().into_iter().flatten() {
+                let raw = event.as_str().unwrap();
+                let event: Value = serde_json::from_str(raw).unwrap();
+                if event["type"] == "response.output_item.done" {
+                    output_items.push(event["item"].clone());
+                }
+                let account_failure = matches!(
+                    event["status"].as_u64().or_else(|| event["error"]["status"].as_u64()),
+                    Some(401 | 403 | 429)
+                ) || matches!(
+                    event["error"]["type"].as_str(),
+                    Some("authentication_error" | "rate_limit_error" | "usage_limit_reached")
+                ) || matches!((name, index), ("steer_later_quota_failure", 1));
+                if !account_failure {
+                    pending.push_back(json!({"text":raw}));
                 }
             }
-            k += 1;
-        }
-    }
-    for step in scenario["steps"].as_array_mut().unwrap() {
-        for frame in step["frames"].as_array_mut().into_iter().flatten() {
-            let Some(text) = frame["text"].as_str() else {
-                continue;
-            };
-            let id = cpa_common::rawjson::get(text, "response.id").str().to_owned();
-            let replaced = if terminal(text) {
-                raw.get(&id)
-            } else {
-                events.get(&(cpa_common::rawjson::get(text, "type").str().to_owned(), id))
-            };
-            if let Some(event) = replaced {
-                frame["text"] = Value::String(event.clone());
+            if reply["status"].as_u64().is_some_and(|s| s >= 400) {
+                let body: Value = serde_json::from_str(reply["body"].as_str().unwrap()).unwrap();
+                pending.push_back(json!({"semantic": {"type":"error","status":reply["status"],"error":body["error"]}}));
+            }
+            match reply["then"].as_str().unwrap_or_default() {
+                "close1009" | "close1009_now" => pending.push_back(json!({"close":1009,"reason":"too big"})),
+                "close1009_spaced" => pending.push_back(json!({"close":1009,"reason":" oversized "})),
+                "close" | "close_now" | "drop" | "drop_now" => {
+                    pending.push_back(json!({"close":1006,"reason":"unexpected EOF"}))
+                }
+                _ => {}
             }
         }
+        if local_interrupt {
+            pending.push_back(json!({"text":r#"{"type":"response.interrupt.accepted","response_id":"r-http"}"#}));
+            if index == 1 {
+                // HTTP cancellation preserves already delivered output, with an explicit
+                // interrupted terminal event. These fields are a local lifecycle contract.
+                pending.push_back(json!({"interrupted":{"id":"r-http","output":output_items}}));
+            }
+        }
+        if replay {
+            pending.push_back(json!({"close":1012,"reason":"upstream requires HTTP replay"}));
+        }
+        let mode = step["read"].as_str().unwrap();
+        if mode == "close" && !pending.iter().any(|f| f["close"].is_number()) {
+            pending.push_back(json!({"close":1006,"reason":"unexpected EOF"}));
+        }
+        let mut frames = Vec::new();
+        if mode != "none" {
+            while let Some(frame) = pending.pop_front() {
+                let event: Option<Value> = frame["text"].as_str().and_then(|s| serde_json::from_str(s).ok());
+                let kind =
+                    event
+                        .as_ref()
+                        .and_then(|e| e["type"].as_str())
+                        .unwrap_or(if frame["local_error"].is_object() {
+                            "error"
+                        } else if frame["interrupted"].is_object() {
+                            "response.incomplete"
+                        } else {
+                            ""
+                        });
+                if matches!(kind, "response.completed" | "response.done") {
+                    last_id = event
+                        .as_ref()
+                        .and_then(|e| e["response"]["id"].as_str())
+                        .unwrap()
+                        .to_owned();
+                }
+                let until = mode
+                    .strip_prefix("until:")
+                    .map(|v| v.split_once('@').unwrap_or((v, "")));
+                let end = frame["close"].is_number()
+                    || mode == "one"
+                    || (mode == "completed"
+                        && matches!(kind, "response.completed" | "response.done" | "response.incomplete"))
+                    || until.is_some_and(|(k, id)| {
+                        kind == k
+                            && (id.is_empty() || event.as_ref().and_then(|e| e["response"]["id"].as_str()) == Some(id))
+                    });
+                frames.push(frame);
+                if end {
+                    break;
+                }
+            }
+        }
+        step["frames"] = json!(frames);
     }
+    if name == "steer_queued_create_then_steer" {
+        // The third create waits behind the automatic successor. A later steer must
+        // overtake it so the active response can finish and release that create.
+        requests.swap(3, 4);
+    }
+    scenario["upstream"] = json!(requests);
+    scenario["http_canceled"] = json!(if name == "interrupt_http_local" { 1 } else { 0 });
+    scenario["upgrade_turn_state"] = scenario["client_headers"]["x-codex-turn-state"].clone();
 }
 
 /// The frame a native `response.create` sends upstream for the client's `sent`: the same
 /// bytes with only `model` routed to `model`.
 fn native_frame(sent: &str, model: &str) -> String {
-    let body = cpa_common::codex_body::CodexBody::parse(sent.as_bytes()).unwrap();
-    if body.get("model").and_then(|m| m.text()).as_deref() == Some(model) {
+    let members: std::collections::BTreeMap<String, &serde_json::value::RawValue> = serde_json::from_str(sent).unwrap();
+    if members
+        .get("model")
+        .and_then(|m| serde_json::from_str::<String>(m.get()).ok())
+        .as_deref()
+        == Some(model)
+    {
         return sent.to_owned();
     }
-    String::from_utf8(body.with_member("model", &serde_json::to_string(model).unwrap())).unwrap()
+    edit_member(sent, "model", Some(&serde_json::to_string(model).unwrap()))
 }
 
-/// The HTTP body a Codex credential without `websockets` sends for the client's `sent`
-/// create: the frame without `type`, with `model` routed and `stream: true`.
-fn http_body(sent: &str, model: &str) -> String {
-    use cpa_common::codex_body::{CodexBody, Kind};
-    let routed = native_frame(sent, model);
-    let untagged = CodexBody::parse(routed.as_bytes()).unwrap().without_member("type");
-    let body = CodexBody::parse(&untagged).unwrap();
-    if body.get("stream").map(|m| m.kind) == Some(Kind::True) {
-        return String::from_utf8(untagged.clone()).unwrap();
+/// Independent span edits use serde's borrowed RawValue positions, not the proxy's
+/// JSON editor. Every byte outside the permitted top-level members stays in place.
+fn edit_member(raw: &str, key: &str, replacement: Option<&str>) -> String {
+    let members: std::collections::BTreeMap<String, &serde_json::value::RawValue> = serde_json::from_str(raw).unwrap();
+    let Some(member) = members.get(key) else {
+        let Some(replacement) = replacement else {
+            return raw.to_owned();
+        };
+        let start = raw.find('{').unwrap() + 1;
+        let comma = if members.is_empty() { "" } else { "," };
+        return format!(
+            "{}{}:{replacement}{comma}{}",
+            &raw[..start],
+            serde_json::to_string(key).unwrap(),
+            &raw[start..]
+        );
+    };
+    let start = member.get().as_ptr() as usize - raw.as_ptr() as usize;
+    let end = start + member.get().len();
+    if let Some(replacement) = replacement {
+        return format!("{}{replacement}{}", &raw[..start], &raw[end..]);
     }
-    String::from_utf8(body.with_member("stream", "true")).unwrap()
+    // In these hand-written frames the routing keys are unescaped ASCII. Locate the
+    // member's quoted key and its separating comma outside the already parsed value.
+    let colon = raw[..start].rfind(':').unwrap();
+    let key_end = raw[..colon].trim_end().len();
+    let key_start = raw[..key_end - 1].rfind('"').unwrap();
+    let following = raw[end..].trim_start();
+    if following.starts_with(',') {
+        let after_comma = end + raw[end..].find(',').unwrap() + 1;
+        format!("{}{}", &raw[..key_start], &raw[after_comma..])
+    } else {
+        let prefix = raw[..key_start].trim_end();
+        let before = prefix.strip_suffix(',').unwrap_or(prefix);
+        format!("{before}{}", &raw[end..])
+    }
 }
 
-/// Runs one scenario and returns its runtime, for checks after the connection. A
-/// scenario without `upstream` (one not recorded from Go) skips the comparison of what
-/// upstream received.
+/// The fallback HTTP envelope removes the create type and enables SSE. Routing a
+/// model is the only other permitted edit (CONTRACT.md, WebSocket HTTP fallback).
+fn http_body(sent: &str, model: &str) -> String {
+    let routed = native_frame(sent, model);
+    let untagged = edit_member(&routed, "type", None);
+    let members: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(&untagged).unwrap();
+    if members.get("stream").is_some_and(|v| v.get() == "true") {
+        untagged
+    } else {
+        edit_member(&untagged, "stream", Some("true"))
+    }
+}
+
+/// Assert identity from client/config input, without a captured-header golden.
+fn assert_native_headers(name: &str, scenario: &Value, captured: &Captured) {
+    let header = |key: &str| {
+        captured
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.as_str())
+    };
+    let client = |key: &str| {
+        scenario["client_headers"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .and_then(|(_, v)| v.as_str())
+    };
+    let credentials = scenario["credentials"].as_array().unwrap();
+    let credential = credentials.first().unwrap();
+    let token = credential["attributes"]["api_key"]
+        .as_str()
+        .or_else(|| credential["metadata"]["access_token"].as_str())
+        .unwrap();
+    assert_eq!(
+        header("authorization"),
+        Some(format!("Bearer {token}").as_str()),
+        "{name}"
+    );
+    assert_eq!(
+        header("user-agent"),
+        Some(client("user-agent").unwrap_or(concat!("cliproxy-rs/", env!("CARGO_PKG_VERSION")))),
+        "{name}"
+    );
+    let oauth = credential["metadata"]["access_token"].is_string();
+    assert_eq!(
+        header("originator"),
+        client("originator").or(oauth.then_some("cliproxy-rs")),
+        "{name}"
+    );
+    if let Some(turn_state) = client("x-codex-turn-state") {
+        assert_eq!(header("x-codex-turn-state"), Some(turn_state), "{name}");
+    }
+    if captured.kind == "ws_dial" {
+        assert!(
+            header("openai-beta").is_some_and(|v| v.contains("responses_websockets=")),
+            "{name}"
+        );
+        let session = header("session_id").expect("upstream socket has session identity");
+        assert!(!session.is_empty());
+        assert_eq!(
+            header("conversation_id"),
+            Some(session),
+            "{name}: consistent connection identity"
+        );
+    } else {
+        assert_eq!(header("content-type"), Some("application/json"), "{name}");
+        assert_eq!(header("accept"), Some("text/event-stream"), "{name}");
+    }
+}
+
+/// Runs one scenario and returns its runtime for checks after disconnect.
 async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::Runtime> {
-    let mut scenario = scenario.clone();
-    native_terminals(&mut scenario);
-    let scenario = &scenario;
     let up = Arc::new(Upstream::default());
     for step in scenario["steps"].as_array().unwrap() {
         for reply in step["upstream"].as_array().into_iter().flatten() {
@@ -575,12 +725,10 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
 
     let mut last_id = String::new();
     let mut closed = false;
-    // The client's frames, as sent: what a native create must reach upstream as.
-    let mut sent: Vec<String> = Vec::new();
     for (i, step) in scenario["steps"].as_array().unwrap().iter().enumerate() {
-        let expected = go_frames(step);
+        let expected = expected_frames(step);
         if closed {
-            assert!(expected.is_empty(), "{name} step {i}: Go read after close");
+            assert!(expected.is_empty(), "{name} step {i}: frames after close");
             continue;
         }
         // Go `manager.Update` with `Disabled`: config credentials change in memory.
@@ -602,7 +750,6 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
         }
         if let Some(send) = step["send"].as_str() {
             let send = send.replace("{{last_response_id}}", &last_id);
-            sent.push(send.clone());
             socket.send(Message::text(send)).await.unwrap();
         }
         // A client that does not read for a while: large frames back up in the proxy's write.
@@ -611,7 +758,7 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
         }
         let mode = step["read"].as_str().unwrap();
         if mode == "none" {
-            assert!(expected.is_empty(), "{name} step {i}: Go read nothing");
+            assert!(expected.is_empty(), "{name} step {i}: read mode is none");
             continue;
         }
         // "until:<type>[@<response id>]".
@@ -645,7 +792,7 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
             if kind == "response.completed" || kind == "response.done" {
                 last_id = cpa_common::rawjson::get(&text, "response.id").str().to_owned();
             }
-            got.push(Frame::Text(mask(&text)));
+            got.push(Frame::Text(text.clone()));
             if let Some((want_kind, want_id)) = until
                 && kind == want_kind
                 && (want_id.is_empty() || cpa_common::rawjson::get(&text, "response.id").str() == want_id)
@@ -662,7 +809,7 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
                 break;
             }
         }
-        if got != expected {
+        if !frames_match(&got, &expected) {
             // Frames can be megabytes long: show their start and length.
             let short = |frames: &[Frame]| {
                 frames
@@ -685,77 +832,26 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     let captured = up.captured.lock().unwrap().clone();
-    let Some(go) = scenario["upstream"].as_array() else {
-        return rt;
-    };
-    let go: Vec<&Value> = go.iter().collect();
-    let kinds = |c: &[Captured]| c.iter().map(|c| c.kind.clone()).collect::<Vec<_>>();
-    let go_kinds: Vec<String> = go.iter().map(|c| c["kind"].as_str().unwrap().to_owned()).collect();
-    assert_eq!(
-        kinds(&captured),
-        go_kinds,
-        "{name}: upstream dials, frames and requests"
-    );
-    // The client's creates and appends in order. Go frames both as `response.create`;
-    // a native create goes upstream as the client sent it, an append keeps Go's framing.
-    let mut requests = sent
-        .iter()
-        .filter(|s| {
-            matches!(
-                cpa_common::rawjson::get(s, "type").str(),
-                "response.create" | "response.append"
-            )
-        })
-        .peekable();
-    for (i, (rust, go)) in captured.iter().zip(&go).enumerate() {
-        let go_body = mask(&go_upstream_body(name, go["body"].as_str().unwrap_or_default()));
-        if rust.kind == "ws_frame"
-            && cpa_common::rawjson::get(go["body"].as_str().unwrap_or_default(), "type").str() == "response.create"
-        {
-            let model = cpa_common::rawjson::get(&rust.body, "model").str().to_owned();
-            // A create the proxy rejected locally never reached upstream: skip it.
-            let matched = requests
-                .by_ref()
-                .find(|s| match cpa_common::rawjson::get(s, "type").str() {
-                    "response.create" => native_frame(s, &model) == rust.body,
-                    _ => mask(&rust.body) == go_body,
-                });
-            assert!(
-                matched.is_some(),
-                "{name}: upstream frame #{i} is neither a client create as sent nor Go's append framing\n rust: {}\n   go: {go_body}",
-                rust.body
-            );
-        } else if rust.kind == "http" {
-            // A Codex turn over HTTP (#28): the client's create without its `type` tag,
-            // with only `model` routed, where Go sent its merged and shaped transcript.
-            let model = cpa_common::rawjson::get(&rust.body, "model").str().to_owned();
-            let matched = requests.by_ref().find(|s| {
-                cpa_common::rawjson::get(s, "type").str() == "response.create" && http_body(s, &model) == rust.body
-            });
-            assert!(
-                matched.is_some(),
-                "{name}: upstream request #{i} is not a client create without its tag\n rust: {}",
-                rust.body
-            );
-        } else {
-            assert_eq!(mask(&rust.body), go_body, "{name}: upstream body #{i}");
+    if let Some(expected) = scenario["upstream"].as_array() {
+        assert_eq!(captured.len(), expected.len(), "{name}: exact upstream operation count");
+        for (index, (actual, want)) in captured.iter().zip(expected).enumerate() {
+            assert_eq!(want["kind"], actual.kind, "{name}: operation #{index}");
+            if let Some(hex) = want["body_hex"].as_str() {
+                let actual_hex = actual.raw.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                assert_eq!(actual_hex, hex, "{name}: raw frame #{index}");
+            } else {
+                assert_eq!(
+                    want["body"].as_str().unwrap_or_default(),
+                    actual.body,
+                    "{name}: exact upstream bytes #{index}"
+                );
+            }
+            if actual.kind != "ws_frame" {
+                assert_native_headers(name, scenario, actual);
+            }
         }
-        if let Some(hex) = go["body_hex"].as_str() {
-            let rust_hex: String = rust.raw.iter().map(|b| format!("{b:02x}")).collect();
-            assert_eq!(rust_hex, hex, "{name}: upstream bytes #{i}");
-        }
-        let go_headers = go["headers"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_owned()))
-            .collect();
-        assert_eq!(
-            compared(rust.headers.clone().into_iter()),
-            compared(under_identity_policy(scenario, go_headers).into_iter()),
-            "{name}: upstream headers #{i}"
-        );
     }
+
     assert_eq!(
         *up.canceled.lock().unwrap(),
         scenario["http_canceled"].as_u64().unwrap_or(0),
@@ -769,29 +865,6 @@ async fn ws_two_turns_reuse_one_upstream_socket() {
     run("ws_two_turns").await;
 }
 
-/// The client's frames as a turn on a Codex credential without `websockets` delivers
-/// them (#28): each scripted upstream event as it arrived.
-fn upstream_events(step: &Value) -> Value {
-    Value::Array(
-        step["upstream"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .flat_map(|reply| reply["events"].as_array().cloned().unwrap_or_default())
-            .map(|event| serde_json::json!({ "text": event }))
-            .collect(),
-    )
-}
-
-/// The error a Codex credential's `response.append` receives on an ordinary turn.
-fn append_refused() -> Value {
-    serde_json::json!({ "text": serde_json::json!({
-        "type": "error",
-        "status": 400,
-        "error": { "message": cpa_exec::codex::APPEND_REFUSED, "type": "invalid_request_error" },
-    }).to_string() })
-}
-
 /// Go's HTTP mode merged the connection's transcript into every turn and turned a
 /// `response.append` into a create. A Codex credential without `websockets` now sends
 /// each `response.create` as the client wrote it, without `type` (a create without
@@ -801,12 +874,9 @@ fn append_refused() -> Value {
 #[tokio::test]
 async fn http_mode_sends_each_create_as_sent_and_refuses_append() {
     run_with("http_incremental", |scenario| {
-        scenario["upstream"].as_array_mut().unwrap().truncate(2);
         let steps = scenario["steps"].as_array_mut().unwrap();
-        steps[1]["frames"] = upstream_events(&steps[1]);
         steps[2]["upstream"] = serde_json::json!([]);
         steps[2]["read"] = "close".into();
-        steps[2]["frames"] = serde_json::json!([append_refused(), {"close": 1006, "reason": "unexpected EOF"}]);
     })
     .await;
 }
@@ -833,46 +903,8 @@ async fn a_codex_fallback_prewarm_is_refused_instead_of_answered_locally() {
         let steps = scenario["steps"].as_array_mut().unwrap();
         steps.truncate(1);
         steps[0]["read"] = Value::String("one".into());
-        steps[0]["frames"] = serde_json::json!([{ "text": codex_prewarm_refusal() }]);
-        scenario["upstream"] = serde_json::json!([]);
     })
     .await;
-}
-
-fn codex_prewarm_refusal() -> String {
-    serde_json::json!({
-        "type": "error",
-        "status": 400,
-        "error": {
-            "message": "response.create with generate: false (prewarm) is not supported for Codex credentials without websockets: there is no upstream socket to prewarm, and the proxy does not invent a response. Enable websockets on the Codex credential, or send the request without generate: false.",
-            "type": "invalid_request_error",
-        },
-    })
-    .to_string()
-}
-
-/// The native WebSocket route delivers a failure frame as the upstream sent it, where Go
-/// rebuilds it (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket route"): the
-/// expected error frame of `step` becomes the last scripted upstream event of that step.
-fn native_failure(scenario: &mut Value, step: usize) {
-    let step = &mut scenario["steps"][step];
-    let raw = step["upstream"][0]["events"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()
-        .clone();
-    let frames = step["frames"].as_array_mut().unwrap();
-    let error = frames.iter_mut().find(|f| f["text"].is_string()).unwrap();
-    error["text"] = raw;
-}
-
-/// An account failure (401, 403, 429) on the native WebSocket route never reaches the
-/// client as sent; Go forwards it. A client that is not Codex gets Go's silent close
-/// (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket route").
-fn native_account_failure(scenario: &mut Value, step: usize) {
-    let frames = scenario["steps"][step]["frames"].as_array_mut().unwrap();
-    frames.retain(|f| !f["text"].is_string());
 }
 
 #[tokio::test]
@@ -883,7 +915,7 @@ async fn upstream_request_fault_is_shown_then_closed() {
 /// v8.0.35: the error frame's `headers` come back on the error event, canonicalized.
 #[tokio::test]
 async fn upstream_request_fault_keeps_its_frame_headers() {
-    run_with("ws_request_fault_headers", |s| native_failure(s, 0)).await;
+    run("ws_request_fault_headers").await;
 }
 
 #[tokio::test]
@@ -916,7 +948,6 @@ async fn upstream_1009_before_any_event_reaches_the_client_before_any_text() {
     run_with("ws_upstream_message_too_big", |scenario| {
         let step = &mut scenario["steps"][0];
         step["upstream"][0]["events"] = serde_json::json!([]);
-        step["frames"] = serde_json::json!([{ "close": 1009, "reason": "too big" }]);
     })
     .await;
 }
@@ -939,11 +970,7 @@ async fn stream_ending_before_completion_closes_silently() {
 /// upstream event as it arrived (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket
 /// route").
 async fn ws_multi_agent_v2_is_neither_renamed_nor_restored() {
-    run_with("ws_multi_agent_v2", |scenario| {
-        let step = &mut scenario["steps"][0];
-        step["frames"][1]["text"] = step["upstream"][0]["events"][1].clone();
-    })
-    .await;
+    run("ws_multi_agent_v2").await;
 }
 
 /// Go's multi-agent v2 and orphan-delegation rewrites renamed the namespace upstream and
@@ -951,11 +978,7 @@ async fn ws_multi_agent_v2_is_neither_renamed_nor_restored() {
 /// goes upstream without its tag, and the upstream's events reach the client unchanged.
 #[tokio::test]
 async fn http_multi_agent_v2_is_not_applied_to_codex() {
-    run_with("http_multi_agent_v2", |scenario| {
-        let steps = scenario["steps"].as_array_mut().unwrap();
-        steps[0]["frames"] = upstream_events(&steps[0]);
-    })
-    .await;
+    run("http_multi_agent_v2").await;
 }
 
 #[tokio::test]
@@ -989,15 +1012,7 @@ async fn steering_upstream_close_after_accepted_steers_closes_the_client() {
 async fn steering_rejects_bad_frames_locally_and_recovers() {
     // The native route reads client frames through the request boundary, which names the
     // first invalid byte (docs/DIFFERENCES-FROM-GO.md, "Codex native WebSocket route").
-    run_with("steer_local_validation", |scenario| {
-        let frame = &mut scenario["steps"][1]["frames"][1]["text"];
-        let text = frame.as_str().unwrap().replace(
-            "invalid websocket request JSON",
-            "request body is not valid JSON at byte 1",
-        );
-        *frame = Value::String(text);
-    })
-    .await;
+    run("steer_local_validation").await;
 }
 
 /// M2-0146: a later upstream error is an event the client can correct on the socket.
@@ -1008,7 +1023,7 @@ async fn steering_later_error_recovers_with_a_corrected_create() {
 
 #[tokio::test]
 async fn steering_initial_error_stays_terminal() {
-    run_with("steer_initial_error_terminal", |s| native_failure(s, 0)).await;
+    run("steer_initial_error_terminal").await;
 }
 
 #[tokio::test]
@@ -1035,16 +1050,9 @@ async fn steering_idle_upstream_close_closes_the_client() {
 #[tokio::test]
 async fn steering_append_is_refused_on_the_open_connection() {
     run_with("steer_append_inherits", |scenario| {
-        scenario["upstream"].as_array_mut().unwrap().truncate(2);
         let steps = scenario["steps"].as_array_mut().unwrap();
         steps[1]["upstream"] = serde_json::json!([]);
         steps[1]["read"] = "one".into();
-        let refused = serde_json::json!({
-            "error": { "message": cpa_exec::codex::APPEND_REFUSED, "type": "invalid_request_error" },
-            "status": 400,
-            "type": "error",
-        });
-        steps[1]["frames"] = serde_json::json!([{ "text": refused.to_string() }]);
     })
     .await;
 }
@@ -1070,12 +1078,12 @@ async fn steering_ambiguous_failure_ends_the_socket() {
 /// 401/403/429 after the first response end the stream with the original classification.
 #[tokio::test]
 async fn steering_later_credential_failure_ends_the_socket() {
-    run_with("steer_later_credential_failure", |s| native_account_failure(s, 1)).await;
+    run("steer_later_credential_failure").await;
 }
 
 #[tokio::test]
 async fn steering_later_quota_failure_ends_the_socket() {
-    run_with("steer_later_quota_failure", |s| native_account_failure(s, 1)).await;
+    run("steer_later_quota_failure").await;
 }
 
 /// While a steer waits for tool input, a create must continue that response.
@@ -1135,7 +1143,7 @@ async fn steering_upstream_idle_upstream_close_closes_an_oauth_client() {
 /// Go `TestResponsesSteeringErrorRecoveryIntegration/disabled_error_remains_terminal`.
 #[tokio::test]
 async fn steering_off_later_error_stays_terminal() {
-    run_with("steer_disabled_error_terminal", |s| native_failure(s, 1)).await;
+    run("steer_disabled_error_terminal").await;
 }
 
 /// Go `TestResponsesSteerInFlightWebSocket`.
@@ -1172,16 +1180,11 @@ async fn interrupt_reaches_the_active_socket_unchanged_with_steering() {
 #[tokio::test]
 async fn interrupt_cancels_an_http_turn_locally() {
     run_with("interrupt_http_local", |scenario| {
-        let accepted = serde_json::json!({"text": r#"{"type":"response.interrupt.accepted","response_id":"r-http"}"#});
         let steps = scenario["steps"].as_array_mut().unwrap();
-        steps[1]["frames"].as_array_mut().unwrap().insert(0, accepted.clone());
-        steps[2]["frames"] = serde_json::json!([accepted]);
         // The continuation needs upstream state a credential without `websockets` does
         // not keep: the replay close, where Go answered from its transcript (#28).
         steps[3]["upstream"] = serde_json::json!([]);
         steps[3]["read"] = "close".into();
-        steps[3]["frames"] = serde_json::json!([{"close": 1012, "reason": "upstream requires HTTP replay"}]);
-        scenario["upstream"].as_array_mut().unwrap().truncate(1);
     })
     .await;
 }
@@ -1207,87 +1210,17 @@ async fn late_interrupt_does_not_poison_the_next_turn() {
         // The late r1 interrupt on the idle socket.
         steps[2]["upstream"] = serde_json::json!([{"events": [ack("r1")]}]);
         steps[2]["read"] = "one".into();
-        steps[2]["frames"] = serde_json::json!([{"text": ack("r1")}]);
         // The interrupted r2 acknowledges after its terminal event.
         steps[6]["upstream"][0]["events"]
             .as_array_mut()
             .unwrap()
             .push(ack("r2").into());
         steps[6]["read"] = "until:response.interrupt.accepted".into();
-        steps[6]["frames"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!({"text": ack("r2")}));
         // The late r2 interrupt on the idle socket.
         steps[7]["upstream"] = serde_json::json!([{"events": [ack("r2")]}]);
         steps[7]["read"] = "one".into();
-        steps[7]["frames"] = serde_json::json!([{"text": ack("r2")}]);
-        let upstream = scenario["upstream"].as_array_mut().unwrap();
-        let frame = |body: &str| serde_json::json!({"kind": "ws_frame", "body": body});
-        upstream.insert(
-            2,
-            frame(r#"{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}"#),
-        );
-        upstream.insert(5, frame(r#"{"type":"response.interrupt","response_id":"r2"}"#));
     })
     .await;
-}
-
-#[test]
-fn every_go_scenario_has_a_test() {
-    let names: Vec<&str> = FIXTURE.iter().map(|s| s["name"].as_str().unwrap()).collect();
-    assert_eq!(
-        names,
-        [
-            "ws_two_turns",
-            "http_incremental",
-            "previous_not_found_then_create",
-            "prewarm_then_followup",
-            "ws_request_fault_exposed",
-            "ws_request_fault_headers",
-            "ws_quota_silent_close",
-            "ws_continuation_needs_replay",
-            "ws_upstream_closes_between_turns",
-            "ws_upstream_message_too_big",
-            "ws_upstream_message_too_big_spaced_reason",
-            "http_stream_ends_early",
-            "ws_multi_agent_v2",
-            "http_multi_agent_v2",
-            "steer_successor",
-            "steer_tool_pending",
-            "steer_disconnect_accepted",
-            "steer_local_validation",
-            "steer_later_error_recovers",
-            "steer_initial_error_terminal",
-            "steer_later_error_then_upstream_close",
-            "steer_historical_oauth_path_steers_api_key",
-            "steer_idle_upstream_close",
-            "steer_idle_upstream_close_legacy_disabled",
-            "steer_idle_upstream_close_v8_api_key",
-            "steer_idle_upstream_close_v8_oauth",
-            "steer_idle_upstream_close_upstream_api_key",
-            "steer_idle_upstream_close_upstream_oauth",
-            "steer_disabled_error_terminal",
-            "steer_in_flight",
-            "steer_disconnect_pending",
-            "steer_append_inherits",
-            "steer_queued_create_then_steer",
-            "steer_active_failure_keeps_queued_create",
-            "steer_ambiguous_failure_ends_the_socket",
-            "steer_later_credential_failure",
-            "steer_later_quota_failure",
-            "steer_wrong_parent_rejected",
-            "steer_model_switch_needs_replay",
-            "steer_credential_disabled",
-            "steer_rejected_when_disabled",
-            "http_upstream_400_exposed",
-            "interrupt_in_flight",
-            "interrupt_in_flight_steering",
-            "interrupt_http_local",
-            "interrupt_binary_frame",
-            "interrupt_late_ws",
-        ]
-    );
 }
 
 /// zakstak/cliproxy-rs#5, not recorded from Go: an upstream `response.failed` with

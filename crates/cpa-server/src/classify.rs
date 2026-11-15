@@ -618,7 +618,8 @@ mod tests {
     /// 2bc236d2): a normal model failure on the trigger path, availability-neutral on the
     /// compact alt, and never a retry round.
     #[test]
-    fn compaction_summary_failures_follow_go() {
+    // Product policy: Retry classification is a local scheduling policy: request faults stay request-local, transient transport failures may retry, and sourced provider evidence takes precedence.
+    fn compaction_summary_errors_are_request_local() {
         for message in [
             "extract summary: no summary text found in upstream response",
             "seal compaction capsule: generate nonce: x",
@@ -636,7 +637,8 @@ mod tests {
     /// shouldRetryAfterError table): a statusless HTTP/2 closed-connection error, bare or
     /// wrapped as a `url.Error`, is a connection drop: no cooldown, and a retry round.
     #[test]
-    fn http2_closed_connections_are_transient_like_go() {
+    // Product policy: Retry classification is a local scheduling policy: request faults stay request-local, transient transport failures may retry, and sourced provider evidence takes precedence.
+    fn closed_http2_transport_connections_are_transient() {
         for message in [
             "http2: client connection force closed via ClientConn.Close",
             "http2: client conn is closed",
@@ -747,7 +749,8 @@ mod tests {
     }
 
     #[test]
-    fn request_faults_follow_go_status_and_body_rules() {
+    // Product policy: Retry classification is a local scheduling policy: request faults stay request-local, transient transport failures may retry, and sourced provider evidence takes precedence.
+    fn request_faults_are_distinguished_by_status_and_provider_body() {
         // Anthropic's invalid_request_error envelope is a request fault even on 500.
         assert!(is_request_invalid(&upstream(
             500,
@@ -844,7 +847,8 @@ mod tests {
     /// credential retry round with a cooldown, a context-labelled 5xx is a request fault,
     /// and Go's own vectors are unchanged.
     #[test]
-    fn unsourced_failures_keep_go_rules() {
+    // Product policy: Retry classification is a local scheduling policy: request faults stay request-local, transient transport failures may retry, and sourced provider evidence takes precedence.
+    fn unsourced_failures_use_the_local_fallback_policy() {
         for (status, body) in [
             (403, r#"{"error":{"code":"inference_hook_denied"}}"#),
             (403, r#"{"error":{"code":"access_program_not_enabled"}}"#),
@@ -880,7 +884,8 @@ mod tests {
     }
 
     #[test]
-    fn special_classifiers_match_go() {
+    // Product policy: Retry classification is a local scheduling policy: request faults stay request-local, transient transport failures may retry, and sourced provider evidence takes precedence.
+    fn special_provider_errors_have_explicit_categories() {
         assert!(is_model_support(404, "The model is not supported for this account"));
         assert!(!is_model_support(500, "model not supported"));
         assert!(!is_model_support(

@@ -522,23 +522,33 @@ pub fn same_authority(raw: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// `url.Parse` then `URL.String()`, recorded from Go 1.26.4 (tests/reference/go_url).
+    /// Endpoint serialization preserves authority, path and query meaning. These are
+    /// supported HTTP URLs, not an inventory of another language's URL parser.
     #[test]
-    fn string_follows_go() {
-        let cases: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/go_url_string.json")).unwrap();
-        for case in cases.as_array().unwrap() {
-            let input = case["in"].as_str().unwrap();
-            let want = &case["string"];
-            match parse(input) {
-                Ok(u) => assert_eq!(Some(string(&u).as_str()), want["out"].as_str(), "{input}"),
-                Err(e) => assert_eq!(Some(e.as_str()), want["err"].as_str(), "{input}"),
-            }
+    fn supported_endpoints_preserve_request_target() {
+        for raw in [
+            "https://auth.x.ai/oauth2/token",
+            "https://auth.x.ai:8443/t?q=one%20two",
+            "http://127.0.0.1:8317/v1/responses",
+            "https://[::1]:8443/token",
+        ] {
+            let endpoint = parse(raw).unwrap();
+            let rendered = string(&endpoint);
+            let transport = url::Url::parse(&rendered).unwrap();
+            let input = url::Url::parse(raw).unwrap();
+            assert_eq!(transport.host(), input.host(), "{raw}");
+            assert_eq!(
+                transport.port_or_known_default(),
+                input.port_or_known_default(),
+                "{raw}"
+            );
+            assert_eq!(transport.path(), input.path(), "{raw}");
+            assert_eq!(transport.query(), input.query(), "{raw}");
         }
     }
 
     #[test]
-    fn transport_must_agree_with_go_on_the_authority() {
+    fn validation_and_transport_agree_on_authority() {
         for ok in [
             "https://auth.x.ai/oauth2/token",
             "https://AUTH.X.AI:443/t",
@@ -561,21 +571,11 @@ mod tests {
         }
     }
 
-    /// Go 1.26.4 `url.Parse`: an IP literal must start the host.
     #[test]
-    fn a_bracket_inside_the_host_is_go_s_invalid_ip_literal() {
-        for (raw, want) in [
-            ("http://x[::1]", r#"parse "http://x[::1]": invalid IP-literal"#),
-            (
-                "http://x[::1]:80/p",
-                r#"parse "http://x[::1]:80/p": invalid IP-literal"#,
-            ),
-            (
-                "http://[::1]x/",
-                r#"parse "http://[::1]x/": invalid port "x" after host"#,
-            ),
-        ] {
-            assert_eq!(parse(raw).err().as_deref(), Some(want), "{raw}");
+    fn ambiguous_bracketed_hosts_are_rejected() {
+        for raw in ["http://x[::1]", "http://x[::1]:80/p", "http://[::1]x/"] {
+            assert!(parse(raw).is_err(), "{raw}");
+            assert!(!same_authority(raw), "ambiguous authority accepted: {raw}");
         }
         assert_eq!(parse("http://[::1]:80/p").map(|u| u.hostname).as_deref(), Ok("::1"));
     }

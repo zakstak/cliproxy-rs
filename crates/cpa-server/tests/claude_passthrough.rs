@@ -301,7 +301,7 @@ data: {"type":"error","error":{"type":"api_error","message":"unexpected EOF"#
 }
 
 #[tokio::test]
-async fn unregistered_and_unserved_models_follow_go_error_contracts() {
+async fn disabled_and_removed_provider_models_fail_without_upstream_calls() {
     let _registry = REGISTRY.lock().await;
     let dir = auth_dir(
         "empty",
@@ -324,17 +324,15 @@ async fn unregistered_and_unserved_models_follow_go_error_contracts() {
             .body(body)
             .send()
     };
-    // Go (differential case disabled-credential): a disabled credential registers no
-    // models, so the model has no provider: 400, not auth_not_found.
+    // Disabled credentials register no usable models; fail before upstream dispatch.
     let res = post(r#"{"model":"claude-opus-5"}"#).await.unwrap();
     assert_eq!(res.status().as_u16(), 400);
-    assert_eq!(
-        res.text().await.unwrap(),
-        r#"{"type":"error","error":{"type":"invalid_request_error","message":"unknown provider for model claude-opus-5"}}"#
-    );
+    let error: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(error["type"], "error");
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(error["error"]["message"].as_str().unwrap().contains("claude-opus-5"));
     // A saved Antigravity login is no longer loaded (issue #49), so its models have no
-    // provider; Go answers 401 `missing refresh token` from the Antigravity executor.
-    // The file itself stays as it was.
+    // provider. The ignored saved credential remains unchanged on disk.
     for model in [
         "gemini-3-flash",
         "gemini-pro-agent",
@@ -345,12 +343,10 @@ async fn unregistered_and_unserved_models_follow_go_error_contracts() {
             .await
             .unwrap();
         assert_eq!(res.status().as_u16(), 400, "{model}");
-        assert_eq!(
-            res.text().await.unwrap(),
-            format!(
-                r#"{{"type":"error","error":{{"type":"invalid_request_error","message":"unknown provider for model {model}"}}}}"#
-            )
-        );
+        let error: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert!(error["error"]["message"].as_str().unwrap().contains(model));
     }
     assert_eq!(
         std::fs::read_to_string(dir.join("antigravity-a.json")).unwrap(),

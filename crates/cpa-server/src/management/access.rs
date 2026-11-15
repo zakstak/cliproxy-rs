@@ -482,7 +482,8 @@ mod tests {
     }
 
     #[test]
-    fn go_duration_rounds_half_up_to_seconds() {
+    // Product policy: Management access preserves operator timeout rounding and supported credential-header extraction; authorization policy is tested independently of framework wording.
+    fn management_deadlines_round_half_up_to_seconds() {
         let cases = [
             (Duration::from_millis(1_799_400), "29m59s"),
             (Duration::from_millis(1_799_500), "30m0s"),
@@ -498,7 +499,8 @@ mod tests {
     }
 
     #[test]
-    fn key_extraction_matches_go_header_rules() {
+    // Product policy: Management access preserves operator timeout rounding and supported credential-header extraction; authorization policy is tested independently of framework wording.
+    fn management_keys_accept_supported_authorization_headers() {
         let get = |pairs: &[(&'static str, &str)]| {
             let mut h = HeaderMap::new();
             for (k, v) in pairs {

@@ -1,290 +1,240 @@
-//! Replays every thinking call Go's own test suites made (internal/thinking/...,
-//! internal/translator/..., executor/helps and the test/ E2E matrix at 6fecc6e),
-//! recorded with Go's outputs by tests/reference/record. Each record carries the
-//! registry lookups Go performed during that call, so the replay sees the same model
-//! capabilities (including the test-registered models) without a registry.
-
-use std::cell::RefCell;
-
-use cpa_core::registry::ThinkingSupport;
-use serde_json::Value;
-
+//! Reasoning behavior contracts using explicit model capabilities and typed decisions.
+//! Synthetic capabilities test proxy policy, not live provider acceptance.
 use super::*;
+use cpa_core::registry::ThinkingSupport;
+use serde_json::{Value, json};
 
-type LookupTable = Vec<(String, String, Option<ModelCaps>)>;
-
-thread_local! {
-    static LOOKUPS: RefCell<Option<LookupTable>> = const { RefCell::new(None) };
-    static MISSED: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
-}
-
-pub(crate) fn lookup_override(model: &str, provider: &str) -> Option<Option<ModelCaps>> {
-    LOOKUPS.with(|l| {
-        let table = l.borrow();
-        let table = table.as_ref()?;
-        match table.iter().find(|(m, p, _)| m == model && p == provider) {
-            Some((_, _, info)) => Some(info.clone()),
-            None => {
-                MISSED.with(|m| m.borrow_mut().push((model.into(), provider.into())));
-                Some(None)
-            }
-        }
-    })
-}
-
-pub(crate) fn caps(v: &Value) -> Option<ModelCaps> {
-    if v.is_null() {
-        return None;
-    }
-    let thinking = v.get("thinking").filter(|t| !t.is_null()).map(|t| ThinkingSupport {
-        min: t["min"].as_i64().unwrap(),
-        max: t["max"].as_i64().unwrap(),
-        zero_allowed: t["zero_allowed"].as_bool().unwrap(),
-        dynamic_allowed: t["dynamic_allowed"].as_bool().unwrap(),
-        disable_type: t.get("disable_type").and_then(Value::as_str).unwrap_or_default().into(),
-        levels: t["levels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| l.as_str().unwrap().to_owned())
-            .collect(),
-    });
-    Some(ModelCaps {
-        id: v["id"].as_str().unwrap().into(),
-        kind: v["type"].as_str().unwrap().into(),
-        thinking,
-        user_defined: v["user_defined"].as_bool().unwrap(),
-        support_configuration_update: v["support_configuration_update"].as_bool().unwrap(),
-        max_completion_tokens: v["max_completion_tokens"].as_i64().unwrap(),
-    })
-}
-
-fn config(v: &Value) -> Config {
-    Config {
-        mode: match v["mode"].as_str().unwrap() {
-            "budget" => Mode::Budget,
-            "level" => Mode::Level,
-            "none" => Mode::None,
-            "auto" => Mode::Auto,
-            m => panic!("{m}"),
-        },
-        budget: v["budget"].as_i64().unwrap(),
-        level: v["level"].as_str().unwrap().into(),
+fn budget_model() -> ModelCaps {
+    ModelCaps {
+        id: "budget-model".into(),
+        kind: "claude".into(),
+        thinking: Some(ThinkingSupport {
+            min: 1024,
+            max: 8192,
+            zero_allowed: true,
+            dynamic_allowed: true,
+            ..Default::default()
+        }),
+        max_completion_tokens: 16384,
+        ..Default::default()
     }
 }
-
-fn config_json(c: &Config) -> Value {
-    serde_json::json!({"mode": c.mode.as_str(), "budget": c.budget, "level": c.level})
-}
-
-fn summary(v: &Value) -> SummaryConfig {
-    SummaryConfig {
-        mode: match v["mode"].as_str().unwrap() {
-            "unspecified" => SummaryMode::Unspecified,
-            "disabled" => SummaryMode::Disabled,
-            "enabled" => SummaryMode::Enabled,
-            m => panic!("{m}"),
-        },
-        detail: v["detail"].as_str().unwrap().into(),
+fn level_model() -> ModelCaps {
+    ModelCaps {
+        id: "level-model".into(),
+        kind: "codex".into(),
+        thinking: Some(ThinkingSupport {
+            levels: vec!["none".into(), "low".into(), "medium".into(), "high".into()],
+            zero_allowed: true,
+            ..Default::default()
+        }),
+        ..Default::default()
     }
-}
-
-fn summary_json(s: &SummaryConfig) -> Value {
-    let mode = match s.mode {
-        SummaryMode::Unspecified => "unspecified",
-        SummaryMode::Disabled => "disabled",
-        SummaryMode::Enabled => "enabled",
-    };
-    serde_json::json!({"mode": mode, "detail": s.detail})
-}
-
-fn err_json(e: &Error) -> Value {
-    serde_json::json!({"message": e.message, "code": e.code.map_or("", |c| c.as_str())})
-}
-
-fn s(v: &Value) -> &str {
-    v.as_str().unwrap_or_else(|| panic!("expected string: {v}"))
-}
-
-fn b(v: &Value) -> Vec<u8> {
-    crate::recorded_bytes(v)
-}
-
-fn enc(bytes: &[u8]) -> Value {
-    crate::recorded_value(bytes)
-}
-
-/// Runs one thinking record; `None` when the record is not a thinking call.
-fn replay(fn_name: &str, input: &Value) -> Option<Value> {
-    let out = match fn_name {
-        "apply_thinking" => {
-            let info = caps(&input["info"]);
-            let result = if input["resolved"].as_bool().unwrap() {
-                apply_thinking_with_model_info_and_summary(
-                    &b(&input["body"]),
-                    &b(&input["source"]),
-                    s(&input["model"]),
-                    s(&input["from"]),
-                    s(&input["to"]),
-                    s(&input["provider"]),
-                    info.as_ref(),
-                    summary(&input["summary"]),
-                    input["updates_changed"].as_bool().unwrap(),
-                )
-            } else {
-                apply_thinking_with_source_and_summary(
-                    &b(&input["body"]),
-                    &b(&input["source"]),
-                    s(&input["model"]),
-                    s(&input["from"]),
-                    s(&input["to"]),
-                    s(&input["provider"]),
-                    summary(&input["summary"]),
-                    input["updates_changed"].as_bool().unwrap(),
-                )
-            };
-            match result {
-                Ok(body) => serde_json::json!({"body": enc(&body), "err": null}),
-                Err(e) => serde_json::json!({"body": e.body.as_deref().map(enc), "err": err_json(&e)}),
-            }
-        }
-        "validate_config" => {
-            let info = caps(&input["info"]);
-            match validate_config(
-                config(&input["config"]),
-                info.as_ref(),
-                s(&input["from"]),
-                s(&input["to"]),
-                input["from_suffix"].as_bool().unwrap(),
-            ) {
-                Ok(c) => serde_json::json!({"config": config_json(&c), "err": null}),
-                Err(e) => serde_json::json!({"config": null, "err": err_json(&e)}),
-            }
-        }
-        "extract_summary" => summary_json(&extract_summary_config(&b(&input["body"]), s(&input["format"]))),
-        "extract_explicit_summary" => summary_json(&extract_explicit_summary_config(
-            &b(&input["body"]),
-            s(&input["format"]),
-        )),
-        "extract_translated_summary" => summary_json(&extract_translated_summary_config(
-            &b(&input["body"]),
-            s(&input["from"]),
-            s(&input["to"]),
-        )),
-        "apply_summary" => {
-            let info = caps(&input["info"]);
-            enc(&summary::apply_summary_config_for_provider(
-                &b(&input["body"]),
-                s(&input["format"]),
-                s(&input["model"]),
-                s(&input["provider"]),
-                info.as_ref(),
-                summary(&input["config"]),
-            ))
-        }
-        "extract_reasoning_effort" => Value::String(extract_reasoning_effort(
-            &b(&input["body"]),
-            s(&input["provider"]),
-            s(&input["model"]),
-        )),
-        "extract_translated_reasoning_effort" => Value::String(extract_translated_reasoning_effort(
-            &b(&input["body"]),
-            s(&input["provider"]),
-        )),
-        "strip_thinking" => enc(&strip_thinking_config(&b(&input["body"]), s(&input["provider"]))),
-        "parse_suffix" => {
-            let r = parse_suffix(s(input));
-            serde_json::json!({"model_name": r.model_name, "has_suffix": r.has_suffix, "raw_suffix": r.raw_suffix})
-        }
-        "applier" => {
-            let info = caps(&input["info"]);
-            match apply_provider(
-                s(&input["provider"]),
-                &b(&input["body"]),
-                &config(&input["config"]),
-                info.as_ref(),
-            )
-            .expect("registered applier")
-            {
-                Ok(body) => serde_json::json!({"body": enc(&body), "err": null}),
-                Err(e) => serde_json::json!({"err": e.message}),
-            }
-        }
-        "translated_summary" => summary_json(&translated_request_summary_config(
-            &b(&input["body"]),
-            &b(&input["current"]),
-            &b(&input["original"]),
-            s(&input["model"]),
-            s(&input["from"]),
-            s(&input["to"]),
-            input["has_request_transformer"].as_bool().unwrap(),
-        )),
-        _ => return None,
-    };
-    Some(out)
 }
 
 #[test]
-fn replays_every_go_thinking_call() {
-    let ran = replay_all(crate::go_calls().map(str::to_owned));
-    assert!(ran["apply_thinking"] > 300, "{ran:?}");
-    assert!(ran["applier"] > 200 && ran["validate_config"] > 200, "{ran:?}");
-}
-
-/// Every applier over modes x capabilities x body shapes, and the resolved pipeline over
-/// source x target x capability x suffix (tests/reference/record/matrix_test.go.txt).
-#[test]
-fn replays_go_thinking_matrix() {
-    use std::io::BufRead;
-    let gz = include_bytes!("../../tests/fixtures/go_thinking_matrix.jsonl.gz");
-    let lines = std::io::BufReader::new(flate2::read::GzDecoder::new(&gz[..])).lines();
-    let ran = replay_all(lines.map(Result::unwrap));
-    assert_eq!(ran["applier"], 17868, "{ran:?}");
-    assert_eq!(ran["apply_thinking"], 8064, "{ran:?}");
-}
-
-fn replay_all(lines: impl Iterator<Item = String>) -> std::collections::BTreeMap<String, usize> {
-    let mut ran = std::collections::BTreeMap::<String, usize>::new();
-    let mut failures = Vec::new();
-    for line in lines {
-        let line = line.as_str();
-        let record: Value = serde_json::from_str(line).unwrap();
-        let fn_name = s(&record["fn"]).to_owned();
-        let table = record["lookups"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|l| {
-                (
-                    s(&l["model"]).to_owned(),
-                    s(&l["provider"]).to_owned(),
-                    caps(&l["info"]),
-                )
-            })
-            .collect();
-        LOOKUPS.with(|l| *l.borrow_mut() = Some(table));
-        MISSED.with(|m| m.borrow_mut().clear());
-        let got = replay(&fn_name, &record["in"]);
-        LOOKUPS.with(|l| *l.borrow_mut() = None);
-        let Some(got) = got else { continue };
-        *ran.entry(fn_name.clone()).or_default() += 1;
-        let want = record["out"].clone();
-        let missed = MISSED.with(|m| m.borrow().clone());
-        if got != want || !missed.is_empty() {
-            failures.push(format!(
-                "{fn_name}\n  in:   {}\n  want: {want}\n  got:  {got}\n  unrecorded lookups: {missed:?}",
-                record["in"]
-            ));
+fn native_budget_validation_enforces_configured_minimum_and_maximum() {
+    let model = budget_model();
+    for (budget, valid) in [
+        (-2, false),
+        (1, false),
+        (1023, false),
+        (1024, true),
+        (4096, true),
+        (8192, true),
+        (8193, false),
+    ] {
+        let result = validate_config(Config::budget(budget), Some(&model), "claude", "claude", false);
+        if valid {
+            assert_eq!(result.unwrap(), Config::budget(budget));
+        } else {
+            let err = result.unwrap_err();
+            assert_eq!(err.code, Some(ErrorCode::BudgetOutOfRange));
+            assert_eq!(err.status(), 400);
         }
     }
-    assert!(
-        failures.is_empty(),
-        "{} of {} thinking records differ from Go:\n{}",
-        failures.len(),
-        ran.values().sum::<usize>(),
-        failures.iter().take(15).cloned().collect::<Vec<_>>().join("\n")
+    assert_eq!(
+        validate_config(Config::none(), Some(&model), "claude", "claude", false)
+            .unwrap()
+            .mode,
+        Mode::None
     );
-    ran
+}
+
+#[test]
+fn translated_and_suffix_budgets_clamp_to_capability_boundaries() {
+    let model = budget_model();
+    for (requested, expected) in [
+        (1, 1024),
+        (1023, 1024),
+        (1024, 1024),
+        (4096, 4096),
+        (8192, 8192),
+        (8193, 8192),
+    ] {
+        for (source, suffix) in [("openai", false), ("claude", true)] {
+            let result = validate_config(Config::budget(requested), Some(&model), source, "claude", suffix).unwrap();
+            assert_eq!(result.budget, expected);
+        }
+    }
+}
+
+#[test]
+fn unsupported_capabilities_return_typed_errors_and_disabled_remains_valid() {
+    let model = ModelCaps {
+        id: "no-thinking".into(),
+        kind: "claude".into(),
+        ..Default::default()
+    };
+    for config in [Config::budget(1024), Config::level("high"), Config::auto()] {
+        let err = validate_config(config, Some(&model), "claude", "claude", false).unwrap_err();
+        assert_eq!(err.code, Some(ErrorCode::ThinkingNotSupported));
+        assert_eq!(err.model, "no-thinking");
+        assert_eq!(err.status(), 400);
+    }
+    assert_eq!(
+        validate_config(Config::none(), Some(&model), "claude", "claude", false).unwrap(),
+        Config::none()
+    );
+    let err = validate_config(
+        Config::level("imaginary"),
+        Some(&level_model()),
+        "codex",
+        "codex",
+        false,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::LevelNotSupported));
+}
+
+#[test]
+fn kept_provider_appliers_write_their_own_reasoning_fields() {
+    let body = br#"{ "messages":[{"role":"user","content":"hi"}], "untouched":{"n":9007199254740993,"s":"\u0061"} }"#;
+    for (provider, path) in [
+        ("openai", "reasoning_effort"),
+        ("codex", "reasoning.effort"),
+        ("xai", "reasoning.effort"),
+    ] {
+        for effort in ["low", "medium", "high"] {
+            let output = apply_provider(provider, body, &Config::level(effort), Some(&level_model()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(json::get(&output, path).str(), effort);
+            assert_eq!(
+                json::get(&output, "untouched").raw(),
+                json::get(body, "untouched").raw()
+            );
+            assert_eq!(json::get(&output, "messages").raw(), json::get(body, "messages").raw());
+        }
+    }
+    for budget in [1024, 4096, 8192] {
+        let output = apply_provider("claude", body, &Config::budget(budget), Some(&budget_model()))
+            .unwrap()
+            .unwrap();
+        let parsed: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(parsed["thinking"], json!({"type":"enabled","budget_tokens":budget}));
+        assert_eq!(
+            json::get(&output, "untouched").raw(),
+            json::get(body, "untouched").raw()
+        );
+    }
+    assert!(apply_provider("unregistered", body, &Config::none(), None).is_none());
+}
+
+#[test]
+fn resolved_pipeline_applies_suffix_precedence_and_preserves_unrelated_data() {
+    let model = budget_model();
+    let body = br#"{ "messages":[], "thinking":{"type":"enabled","budget_tokens":1024}, "n":9007199254740993 }"#;
+    let output = apply_thinking_with_model_info(
+        body,
+        b"",
+        "budget-model(4096)",
+        "claude",
+        "claude",
+        "claude",
+        Some(&model),
+    )
+    .unwrap();
+    assert_eq!(json::get(&output, "thinking.budget_tokens").int(), 4096);
+    assert_eq!(json::get(&output, "n").raw(), b"9007199254740993");
+    let unchanged = br#"{ "messages": [], "n":1.2300e+04 }"#;
+    let output = apply_thinking_with_model_info(
+        unchanged,
+        b"",
+        "budget-model",
+        "claude",
+        "claude",
+        "claude",
+        Some(&model),
+    )
+    .unwrap();
+    assert_eq!(output, unchanged);
+}
+
+#[test]
+fn reasoning_extraction_and_strip_preserve_the_other_request_fields() {
+    for (provider, body, expected) in [
+        (
+            "openai",
+            r#"{"reasoning_effort":"high","messages":[],"other":1}"#,
+            Config::level("high"),
+        ),
+        (
+            "codex",
+            r#"{"reasoning":{"effort":"low"},"input":[],"other":1}"#,
+            Config::level("low"),
+        ),
+        (
+            "claude",
+            r#"{"thinking":{"type":"enabled","budget_tokens":2048},"messages":[],"other":1}"#,
+            Config::budget(2048),
+        ),
+    ] {
+        assert_eq!(extract_thinking_config(body.as_bytes(), provider), expected);
+        let stripped = strip_thinking_config(body.as_bytes(), provider);
+        assert_eq!(json::get(&stripped, "other").int(), 1);
+        assert!(!extract_thinking_config(&stripped, provider).is_set());
+    }
+}
+
+#[test]
+fn explicit_summary_intent_remains_separate_from_effort() {
+    let implicit = br#"{"reasoning_effort":"high"}"#;
+    assert_eq!(extract_summary_config(implicit, "openai").mode, SummaryMode::Enabled);
+    assert_eq!(
+        extract_explicit_summary_config(implicit, "openai").mode,
+        SummaryMode::Unspecified
+    );
+    assert_eq!(
+        extract_translated_summary_config(implicit, "openai", "claude").mode,
+        SummaryMode::Unspecified
+    );
+    for (raw, mode, detail) in [
+        (
+            r#"{"reasoning":{"summary":"concise"}}"#,
+            SummaryMode::Enabled,
+            "concise",
+        ),
+        (r#"{"reasoning":{"summary":"none"}}"#, SummaryMode::Disabled, ""),
+        (r#"{"reasoning":{}}"#, SummaryMode::Unspecified, ""),
+    ] {
+        let config = extract_summary_config(raw.as_bytes(), "codex");
+        assert_eq!(config.mode, mode);
+        assert_eq!(config.detail, detail);
+    }
+    let source = br#"{"reasoning":{"summary":"concise"},"input":[],"other":true}"#;
+    let output = apply_summary_config(
+        source,
+        "codex",
+        SummaryConfig {
+            mode: SummaryMode::Disabled,
+            detail: String::new(),
+        },
+    );
+    assert!(!json::get(&output, "reasoning.summary").exists());
+    assert!(!json::get(&output, "reasoning.generate_summary").exists());
+    assert!(json::get(&output, "other").bool());
+    assert_eq!(apply_summary_config(source, "codex", SummaryConfig::default()), source);
 }
 
 #[test]

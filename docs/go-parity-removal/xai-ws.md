@@ -1,0 +1,17 @@
+# xAI WebSocket migration receipt
+
+Owner: codex_exec after reassignment from other_exec. Source file `crates/cpa-exec/src/xai_ws_tests.rs` only; no production behavior changes.
+
+- `turns_match_go` replaced by `session_inputs_obey_transport_identity_transcript_compaction_tool_and_usage_contracts`. All 49 historical scenario client requests and synthetic peer acts remain, with all recorded proxy output removed (`chunks`, `error`, `usage`, `frames`, `http`, `upgrades`, `pongs`) in `xai_ws_inputs.json`. Historical provenance remains explicit; these are not first-party provider evidence.
+- The independent model uses semantic serde values, its own live/last target and downstream/upstream ID map, transcript content and compacted ciphertext. It checks routing/model/create/store/stream fields, selected credential handshake, socket reuse/reconnect and refusal, unique consistent response IDs, client-ID to upstream-ID mapping, full-history replay after target change including an intervening rejected target, compaction HTTP context and trigger removal, opaque state returned and replayed, warmup completion, ping payloads, explicit quota/auth/request/read/patch/replay error policy, output text deltas, usage tokens from synthetic terminal/compact payloads and TTFT.
+- Tool contracts assert namespace and aliased web search restoration, preservation of client same-name tools alongside built-in X search, custom apply_patch restoration and Unicode survival across folded/unfolded/snapshot/sparse/late-name inputs, and reasoning-text normalization. cpa-translate independently tests exact patch/namespace schemas.
+- `capture_problems` no longer reads `turn["error"]` or calls production ws_error as an expected-value oracle. Capture requests compare with actual peer frames and HTTP calls; returned frames/compact bodies are synthetic peer stimuli; captured error text equals the actual execution error. Account metadata and event order remain checked. Header names are case-insensitive.
+- `websockets_flag_follows_go` retained its independently authored saved-config precedence matrix as `stored_websocket_flags_use_explicit_attribute_then_typed_metadata`.
+- `validate_compaction_response_follows_go` retained its independently authored typed refusal/opaque-state matrix as `compaction_requires_string_response_identity_and_opaque_compacted_state`.
+- `ws_url_follows_go` replaced by `websocket_urls_keep_the_http_resource_and_refuse_missing_or_unsupported_origins`, independently chosen HTTP/HTTPS/WS/WSS, port/query/path, malformed/missing/unsupported origin assertions. No Go URL fixture or error prose equality.
+- All existing direct tests for required sessions, handshake attempts, private caller identity, configured deadlines, full queue terminal 413, observer ordering, send retry, compacted append/warmup/reset, payload rules, ping while writer held, reload, credential replacement ID isolation and first-output TTFT remain active.
+
+Verification: final network-denied full crate run `cargo test --offline -p cpa-exec --lib` session30474: **773 passed, 0 failed, 0 ignored**. Log `/tmp/cliproxy-parity-migration/codex-xai-final2.log`. Focused xai_ws run22/22 passed before final handshake strengthening. Deleted unused `xai_ws_go.json` and `tests/reference/xai_ws/` after independent replacements passed.
+
+
+No Go code run, no provider traffic, no real credentials. No expected output generated from implementation.
