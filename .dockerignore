@@ -4,5 +4,4 @@ target
 harness
 docs
 ui/node_modules
-ui/dist-panel
 **/*.log

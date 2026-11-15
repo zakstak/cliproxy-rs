@@ -4,7 +4,7 @@
 # Nothing outside the namespace can reach servers started inside it, so start the fake
 # upstreams, the server under test and the browser in the same command.
 #
-#   scripts/isolated.sh 'server --config c.yaml & node scripts/panel-check-go.mjs ...'
+#   scripts/isolated.sh 'server --config c.yaml & node scripts/browser-check-rust.mjs ...'
 set -euo pipefail
 [[ $# -eq 1 ]] || { echo "usage: $0 '<shell command>'" >&2; exit 2; }
 exec unshare -rn bash -c \
