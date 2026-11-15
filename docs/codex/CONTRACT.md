@@ -427,7 +427,7 @@ every provider before a credential is chosen. It keeps its Go behaviour: it alre
 on trailing content and on a repeated top-level `model` or `stream`, and such a body
 never reaches the Codex boundary.
 
-### Remaining Go JSON callers on the Codex path
+### Remaining shared JSON callers on the Codex path
 
 The native HTTP and WebSocket routes use the boundary for request routing and edits;
 header observation borrows raw fields without changing the body.
@@ -435,8 +435,8 @@ header observation borrows raw fields without changing the body.
 the Sign in with ChatGPT body rules and the Codex executor's multi-agent optimization),
 so no Codex request path edits a body through the Go helpers. The callers below read,
 or rewrite only for other providers. They read through `crates/cpa-common/src/json.rs`, the
-Go-compatible port, directly or through its `&str` facade `cpa_common::rawjson`; the
-third-party Rust gjson crate and its vendored copy are removed.
+shared byte-preserving reader and editor, directly or through its `&str` facade
+`cpa_common::rawjson`; the third-party Rust gjson crate and its vendored copy are removed.
 [`rawjson.rs`](../../crates/cpa-common/src/rawjson.rs) documents and tests the reader
 semantics, including duplicate-key lookup, coercion, and raw number spelling.
 

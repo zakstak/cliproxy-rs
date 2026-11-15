@@ -318,7 +318,7 @@ pub struct XaiAuth {
     discovery_url: String,
     min_poll_interval: Option<Duration>,
     /// Test seam: requests to `https://auth.x.ai` go to this origin instead, after
-    /// validation (the Go goldens use the same rewrite in their transport).
+    /// validation.
     issuer_origin: Option<String>,
 }
 
@@ -338,9 +338,9 @@ impl XaiAuth {
     }
 
     /// Where a request for `url` goes. Fails closed when the HTTP client would contact a
-    /// different host than Go's `net/url` reads from the same string.
+    /// different host than validation read from the same string.
     // ponytail: the request target is the WHATWG form of the URL, so dot segments and
-    // backslashes in an accepted path are normalized where Go sends them as given.
+    // backslashes in an accepted path are normalized instead of sent as given.
     fn target(&self, url: &str) -> Result<String, ()> {
         if !crate::xai_url::same_authority(url) {
             return Err(());

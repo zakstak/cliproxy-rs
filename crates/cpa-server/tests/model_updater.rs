@@ -18,20 +18,45 @@ async fn serve(app: axum::Router) -> String {
     url
 }
 
-/// A model only Go's typed decode reads as intended (in the `meta` section; Go's test used
-/// the `gemini` section, removed with issue #49): nulls in a string list and a
-/// header map, HTML characters, the integer `-0` and unknown members.
+/// A model that exercises the typed catalog decode (in the `meta` section; the case
+/// first used the `gemini` section, removed with issue #49): nulls in a string list and
+/// a header map, HTML characters, the integer `-0` and unknown members.
 const TYPED_MODEL: &str = r#"{"id":"gemini-typed","inputTokenLimit":123,"supportedInputModalities":[null,"text"],"config":{"override_header":{"X-Test":null,"b":"<v>"}},"thinking":{"min":1,"levels":["low"],"disable_type":"x"},"display_name":"D","created":-0,"native_capabilities":{"web_search":true},"unknown":{"a":[1.5]}}"#;
 
-/// Go 1.26.4 `json.Marshal` of [`TYPED_MODEL`] decoded into `registry.ModelInfo`.
-const TYPED_MODEL_GO: &str = r#"{"id":"gemini-typed","object":"","created":0,"owned_by":"","type":"","display_name":"D","inputTokenLimit":123,"supportedInputModalities":["","text"],"thinking":{"min":1,"disable_type":"x","levels":["low"]},"config":{"override_header":{"X-Test":"","b":"\u003cv\u003e"}}}"#;
+/// The Management API's model definition for [`TYPED_MODEL`]. Every definition carries
+/// `id`, `object`, `created`, `owned_by` and `type`, empty or zero when the catalog
+/// omits them. A null list item or header value reads as `""`, `-0` reads as 0, and
+/// members the catalog schema does not define are dropped.
+fn typed_model_definition() -> serde_json::Value {
+    serde_json::json!({
+        "id": "gemini-typed",
+        "object": "",
+        "created": 0,
+        "owned_by": "",
+        "type": "",
+        "display_name": "D",
+        "inputTokenLimit": 123,
+        "supportedInputModalities": ["", "text"],
+        "thinking": {"min": 1, "disable_type": "x", "levels": ["low"]},
+        "config": {"override_header": {"X-Test": "", "b": "<v>"}},
+    })
+}
+
+/// The model definitions `body` lists, from a `{"channel":...,"models":[...]}` answer.
+fn listed_definitions(body: &str) -> Vec<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    assert_eq!(parsed["channel"], "meta", "{body}");
+    parsed["models"].as_array().unwrap_or_else(|| panic!("{body}")).clone()
+}
 
 /// Catalogs refused whole (docs/DIFFERENCES-FROM-GO.md, remote model catalogs), as raw
 /// text: a parsed `Value` cannot hold repeated members. Each adds one model (or a
-/// section) to the otherwise acceptable refreshed catalog. Go refuses the integer-field
-/// fractions, `"bad"` then `123` (also as a repeated header name), and the empty decoded
-/// ID; it serves `""` for a null `type` and level and merges the others differently from
-/// the decoded map.
+/// section) to the otherwise acceptable refreshed catalog. Each case is ambiguous or
+/// mistyped: an integer field spelled with a fraction or an exponent, or out of range;
+/// a member repeated (also under another letter case), where readers disagree on which
+/// value wins; a null where a string is required; a member name in the wrong case
+/// inside `thinking`; or an ID that decodes empty. A refused catalog keeps the current
+/// one instead of guessing.
 const REFUSED: [(&str, &str); 17] = [
     (
         "repeated_header_bad_first",
@@ -70,8 +95,8 @@ const REFUSED: [(&str, &str); 17] = [
     ("section_in_another_case", r#"LONE"META":[{"id":"b"}]"#),
 ];
 
-/// An accepted model with `-0` in an integer field (Go's 0, serde's `-0.0`) and a
-/// repeated header name (Go keeps the last value).
+/// An accepted model with `-0` in an integer field (read as 0) and a repeated header
+/// name (the last value wins).
 const LENIENT: &str = r#"{"id":"g-lenient","type":"gemini","owned_by":"google","context_length":4096,"thinking":{"min":-0,"max":1024},"config":{"override_header":{"X-Test":"a","X-Test":"ok","x-test":null}}}"#;
 
 /// The refreshed catalog with `case` from [`REFUSED`] added, its model ID made unique so
@@ -79,7 +104,7 @@ const LENIENT: &str = r#"{"id":"g-lenient","type":"gemini","owned_by":"google","
 fn refused(modified: &str, name: &str, case: &str) -> String {
     let case = &case.replace(r#"{"id":"g""#, &format!(r#"{{"id":"g-{name}""#));
     if let Some(section) = case.strip_prefix("SECTION") {
-        // After the last section, so Go decodes this one last.
+        // After the last section, so this one is read last.
         return format!("{},{section}}}", modified.strip_suffix('}').unwrap());
     }
     if let Some(section) = case.strip_prefix("LONE") {
@@ -117,7 +142,7 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     let root = with_extra_claude_model();
     let modified = render(&root);
     let invalid = r#"{"claude":[{"id":"a"},{"id":"a"}]}"#.to_owned();
-    // Go's typed decode refuses a fractional token limit.
+    // The typed decode refuses a fractional token limit.
     let mistyped = {
         let mut root = root.clone();
         root["meta"][0]["inputTokenLimit"] = serde_json::json!(1.5);
@@ -254,26 +279,29 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     // Management's model definitions read the refreshed catalog.
     let definitions = cpa_core::registry::dynamic::static_definitions("claude").unwrap();
     assert_eq!(definitions.last().unwrap().id, "claude-refreshed-1");
-    // ... and render a refreshed model as Go's typed decode and encode do.
+    // ... and list the refreshed typed model last, as the catalog orders it.
     let body = served(addr).await;
-    assert!(body.ends_with(&format!(",{TYPED_MODEL_GO}]}}")), "{body}");
+    assert_eq!(
+        listed_definitions(&body).last(),
+        Some(&typed_model_definition()),
+        "{body}"
+    );
     std::fs::remove_dir_all(&auth).unwrap();
-    // Go's refresh callback re-registers the credentials of changed providers.
+    // A refresh re-registers the credentials of changed providers.
     assert!(registered(&rt));
 
     // The same content again changes nothing.
     cpa_server::model_updater::refresh(&urls(&["modified"])).await;
     assert_eq!(catalog_generation(), generation + 1);
 
-    // An empty remote `meta` section keeps the current one (Go tryRefreshModels).
+    // An empty remote `meta` section keeps the current one.
     cpa_server::model_updater::refresh(&urls(&["no-meta"])).await;
     assert_eq!(catalog_generation(), generation + 1, "identical once meta is kept");
     // The refreshed `meta` section carries the typed model too.
     assert_eq!(pinned().channel("meta").len(), meta_before + 1);
 
-    // `-0` is Go's 0 in the static catalog, the Meta credential's registration, the
-    // client model list and the management rendering; the last of repeated header names
-    // wins.
+    // `-0` is 0 in the static catalog, the Meta credential's registration, the client
+    // model list and the management rendering; the last of repeated header names wins.
     cpa_server::model_updater::refresh(&urls(&["lenient"])).await;
     assert_eq!(catalog_generation(), generation + 2);
     let thinking = |min, max| {
@@ -305,8 +333,22 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
         .iter()
         .find(|m| m["id"] == "g-lenient");
     assert_eq!(listed.expect("listed")["owned_by"], "google", "{models}");
-    // Go 1.26.4 json.Marshal of LENIENT decoded into registry.ModelInfo.
-    let go = r#"{"id":"g-lenient","object":"","created":0,"owned_by":"google","type":"gemini","context_length":4096,"thinking":{"max":1024},"config":{"override_header":{"X-Test":"ok","x-test":""}}}"#;
+    // The management definition: a zero `thinking.min` is omitted like other empty
+    // optional members, and header names that differ only in case stay separate.
     let body = served(addr).await;
-    assert!(body.contains(go), "{body}");
+    let lenient = listed_definitions(&body).into_iter().find(|m| m["id"] == "g-lenient");
+    assert_eq!(
+        lenient,
+        Some(serde_json::json!({
+            "id": "g-lenient",
+            "object": "",
+            "created": 0,
+            "owned_by": "google",
+            "type": "gemini",
+            "context_length": 4096,
+            "thinking": {"max": 1024},
+            "config": {"override_header": {"X-Test": "ok", "x-test": ""}},
+        })),
+        "{body}"
+    );
 }

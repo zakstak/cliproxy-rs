@@ -1,32 +1,38 @@
 //! Translation between wire formats (internal/translator, sdk/translator).
 //!
-//! Executors call [`translate_request`] (sdk/translator's TranslateRequest: the registered
-//! pair wrapped in the summary pipeline, or the model-rewrite fallback) and [`pair`] for
-//! the response transforms of `(client format, upstream format)`. Same-format pairs may
-//! be registered for normalization (Go registers OpenAI -> OpenAI).
+//! Executors call [`translate_request`] (the registered pair wrapped in the summary
+//! pipeline, or the model-rewrite fallback) and [`pair`] for the response transforms of
+//! `(client format, upstream format)`. Same-format pairs may be registered for
+//! normalization (OpenAI -> OpenAI is).
 //!
 //! Contract for every pair:
-//! - `request` turns a client body into an upstream body (the bare Go converter; use
-//!   [`translate_request`] for the registry wrapper).
-//! - `non_stream` turns one buffered upstream body into one client body. The input may
-//!   be buffered SSE when the executor streamed upstream for a non-streaming client
-//!   (claude_executor_execute.go asks Claude for SSE whenever formats differ).
+//! - `request` turns a client body into a request the upstream API accepts with the
+//!   same meaning: the messages, tools, sampling and reasoning settings the client
+//!   sent, in the upstream's documented shape. Use [`translate_request`] for the
+//!   registry wrapper.
+//! - `non_stream` turns one buffered upstream body into one body in the client's API
+//!   shape. The input may be buffered SSE when the executor streamed upstream for a
+//!   non-streaming client (the Claude executor asks Claude for SSE whenever formats
+//!   differ).
 //! - `stream` builds request-local state that turns framed upstream events (see
 //!   [`sse::Framer`]) into zero or more client events, then flushes on `finish`. Output
-//!   bytes are framed the way the client's Go route handler writes them ([`stream::frame`]).
-//! - [`token_count`] renders an upstream token count in the client's shape (Go's
-//!   TokenCount); `count_tokens` is the older body-based form and stays unset.
+//!   bytes are complete events in the client's streaming protocol ([`stream::frame`]):
+//!   `data:` lines ending in a blank line for Chat Completions, and named SSE events for
+//!   Anthropic Messages and Responses.
+//! - [`token_count`] renders an upstream token count in the client's shape;
+//!   `count_tokens` is the older body-based form and stays unset.
 //! - Go's plugin translator hooks are not part of this registry: native plugins are
 //!   removed (docs/DIFFERENCES-FROM-GO.md "Native plugins").
 //! - Response transforms run after the executor has reversed provider rewrites (tool
 //!   aliases, cloak) and see the client's original request and the translated request
 //!   from before those rewrites.
 //!
-//! JSON is read and edited with `cpa_common::json`, a byte-exact port of the gjson/sjson
-//! behaviour Go's translators depend on, so malformed bytes, coercions and escaping
-//! match Go.
+//! JSON is read and edited with `cpa_common::json`. A field the translation does not
+//! change keeps its bytes; generated JSON is checked by its values. Coercions, escaping
+//! and the handling of malformed input are the current, deterministic behaviour of that
+//! module, not a promise to match CLIProxyAPI's output.
 
-/// One Go registration (`translator.Register`). Every transform runs on the caller's
+/// One registered pair (Go `translator.Register`). Every transform runs on the caller's
 /// thread: walkers of nested JSON keep their open containers on the heap and stop at
 /// [`cpa_common::json::WALK_DEPTH_LIMIT`] (issue #146), so no input depth needs a larger
 /// native stack.

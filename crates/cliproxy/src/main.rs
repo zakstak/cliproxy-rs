@@ -1240,7 +1240,8 @@ async fn serve(
         xai: Default::default(),
     };
     let rt = Arc::new(Runtime::new(config, credentials, executors));
-    // What each file credential was loaded from, for Go-exact management saves.
+    // What each file credential was loaded from, so a management save keeps the saved
+    // document of a credential whose file has not changed.
     rt.store().note_loaded(&read);
     rt.set_local_model(local_model);
     if let Some(cooldown) = store.as_ref().and_then(|store| store.cooldown.clone()) {

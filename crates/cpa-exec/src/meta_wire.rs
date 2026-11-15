@@ -1,11 +1,15 @@
-//! Go `encoding/json` decoding for the small, flat auth records Meta reads from auth
-//! servers: `json.Unmarshal(body, &record)` with string, int and bool fields.
+//! Decoding for the small, flat auth records (string, int and bool fields) that Meta
+//! reads from auth servers. Codex live calls share its validity check.
 //!
-//! Go semantics reproduced: syntax errors with Go's scanner messages; keys matched to
-//! field tags exactly, else case-insensitively (Go's fold, including `ſ` and the Kelvin
-//! sign); later duplicates win; `null` leaves a field unchanged; a value of the wrong
-//! type is skipped, decoding continues, and the first such error is returned. Unknown
-//! keys are ignored. Tests specify typed response fields and invalid-type refusal directly.
+//! The record contract: the body is strict JSON (RFC 8259) with at most 10000 levels of
+//! nesting. A key matches a field name exactly, else case-insensitively. A later
+//! duplicate wins, `null` leaves a field unchanged, and unknown keys are ignored. A
+//! value of the wrong type is refused, and the first such field names the error. The
+//! case-insensitive match also folds `ſ` to `S` and the Kelvin sign to `K`; that came
+//! with the port of Go's `encoding/json` and stays so that no record that decodes today
+//! stops decoding. Error text follows encoding/json's wording because it reaches login
+//! output, but it is a diagnostic, not a contract. Tests specify typed response fields
+//! and invalid-type refusal directly.
 
 use cpa_common::json::{self as gj, Kind};
 
@@ -149,7 +153,8 @@ enum State {
 
 const MAX_DEPTH: usize = 10_000;
 
-/// Go's `checkValid` (encoding/json scanner), with its error messages.
+/// Strict JSON validation with a nesting limit of [`MAX_DEPTH`], reporting the first
+/// offending byte in encoding/json's wording.
 pub(crate) fn check_valid(raw: &[u8]) -> Result<(), String> {
     let mut s = Scanner {
         state: State::BeginValue,

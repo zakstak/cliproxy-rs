@@ -1,9 +1,13 @@
-//! `server.trusted-proxies` and client-IP resolution with Go's exact semantics:
-//! config validation (internal/config/trusted_proxies.go), gin v1.10.1
-//! `SetTrustedProxies` parsing and `Context.ClientIP` (X-Forwarded-For, then X-Real-IP).
+//! `server.trusted-proxies` and client-IP resolution: config validation, entry parsing
+//! and the client IP (X-Forwarded-For, then X-Real-IP), as CLIProxyAPI's config and gin
+//! v1.10.1 define them for existing configs.
 //!
-//! Go keeps IPv4 as 4 bytes and everything else as 16 bytes when matching, and a
-//! bare IPv4-mapped IPv6 entry becomes a `/32` IPv6 prefix. Both are reproduced.
+//! A peer address is matched in its canonical form: an IPv4-mapped IPv6 peer matches
+//! IPv4 entries, and other IPv6 addresses match IPv6 entries. A bare address entry
+//! trusts exactly one host. A bare IPv4-mapped entry such as `::ffff:192.0.2.1`
+//! trusts that host in both forms, where Go v8.0.35 read it as `::/32`
+//! (docs/DIFFERENCES-FROM-GO.md "IPv4-mapped trusted proxy addresses"). CIDR entries
+//! keep their configured boundaries.
 use std::net::{IpAddr, SocketAddr};
 
 use anyhow::bail;
@@ -51,7 +55,7 @@ fn bytes16(ip: IpAddr) -> [u8; 16] {
     }
 }
 
-/// Go `IP.To4()` on the 16-byte form, falling back to the 16 bytes.
+/// The 4-byte form of an IPv4 or IPv4-mapped address, else the 16 bytes.
 fn go_bytes(ip: IpAddr) -> Vec<u8> {
     let b = bytes16(ip);
     if b[..12] == V4_IN_V6 {
@@ -61,12 +65,12 @@ fn go_bytes(ip: IpAddr) -> Vec<u8> {
     }
 }
 
-/// `net.ParseIP` (Go 1.26): no zones, no leading-zero IPv4 octets.
+/// An address literal: no zones, no leading-zero IPv4 octets.
 fn parse_ip(text: &str) -> Option<IpAddr> {
     text.parse().ok()
 }
 
-/// `net.ParseCIDR`, returning the reduced network/mask pair Go matches against.
+/// A CIDR entry as the network and mask a canonical peer is matched against.
 fn parse_cidr(text: &str) -> Option<Net> {
     let (addr, bits) = text.split_once('/')?;
     let ip: IpAddr = addr.parse().ok()?;
@@ -114,7 +118,7 @@ impl Net {
     }
 }
 
-/// Config load validation. Messages match Go's `validateTrustedProxies`.
+/// Config load validation. The messages name the entry an operator must fix.
 pub fn validate(entries: &[String]) -> anyhow::Result<()> {
     for entry in entries {
         if entry.is_empty() || entry.trim() != entry {
@@ -128,8 +132,8 @@ pub fn validate(entries: &[String]) -> anyhow::Result<()> {
 }
 
 impl TrustedProxies {
-    /// gin `SetTrustedProxies`. Invalid input disables forwarded headers entirely, as
-    /// Go's server does after logging; config validation normally rejects it first.
+    /// Parses the entries. Invalid input disables forwarded headers entirely, failing
+    /// closed; config validation normally rejects it first.
     pub fn new(entries: &[String]) -> Self {
         let mut nets = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -155,11 +159,11 @@ impl TrustedProxies {
         self.0.iter().any(|net| net.contains(ip))
     }
 
-    /// gin `Context.ClientIP`. `header` returns the raw bytes of a request header's
-    /// first value. The result is the peer's canonical text, or a validated forwarded
-    /// entry verbatim (after trimming), exactly as Go compares it against
-    /// "127.0.0.1" and "::1". A zoned peer (`fe80::1%eth0`) fails Go's `ParseIP` and
-    /// yields an empty client IP without consulting forwarded headers.
+    /// The client IP. `header` returns the raw bytes of a request header's first value.
+    /// The result is the peer's canonical text, or a validated forwarded entry verbatim
+    /// (after trimming), which callers compare against "127.0.0.1" and "::1". A zoned
+    /// peer (`fe80::1%eth0`) yields an empty client IP without consulting forwarded
+    /// headers, so it is never treated as local.
     pub fn client_ip<'a>(&self, peer: Option<SocketAddr>, header: impl Fn(&str) -> Option<&'a [u8]>) -> String {
         let peer = match peer {
             Some(SocketAddr::V6(v6)) if v6.scope_id() != 0 => return String::new(),

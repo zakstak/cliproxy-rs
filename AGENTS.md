@@ -16,7 +16,7 @@ A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI), co
 ## Layout
 
 - `crates/cpa-core`: config and credential file formats. No networking.
-- `crates/cpa-common`: provider-neutral, Go-exact helpers shared by translators and executors.
+- `crates/cpa-common`: helpers shared by translators and executors, such as JSON reading and editing that keeps untouched bytes, payload rules, thinking and signature handling, session identity and the Codex request-body boundary.
 - `crates/cpa-translate`: format translation between the Anthropic Messages, OpenAI Chat Completions and OpenAI Responses (Codex) formats.
 - `crates/cpa-exec`: one module group per upstream provider (Claude, Codex, xAI, Meta: wire format, auth headers, HTTP client profile), with shared helpers in provider-neutral modules (`helpers`, `login`, `openai_http`, `openai_payload`, `multipart`, `compaction_capsule`, `claude_input_tokens`).
 - `crates/cpa-server`: axum routes, client auth, credential selection, management API.

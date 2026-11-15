@@ -1,7 +1,9 @@
-//! Go `encoding/base64` decoding and `google.golang.org/protobuf/encoding/protowire`
-//! (v1.34.1) parsing, ported for exact accept/reject behaviour and error text.
+//! Base64 decoding (RFC 4648, CR and LF skipped) and protobuf wire-format parsing for
+//! signature envelopes. They started as ports of Go's `encoding/base64` and
+//! `google.golang.org/protobuf/encoding/protowire` v1.34.1. Acceptance follows the two
+//! formats; error text is a diagnostic.
 
-/// A base64 alphabet with Go's padding rule, and whether decoding is `Strict` (trailing
+/// A base64 alphabet, whether it is padded, and whether decoding is `Strict` (trailing
 /// padding bits must be zero).
 #[derive(Clone, Copy)]
 pub(crate) struct Encoding {
@@ -119,7 +121,7 @@ impl Encoding {
         (si, err)
     }
 
-    /// `Encoding.DecodeString`. `Err` carries Go's error text.
+    /// Decodes `src`. `Err` names the first bad input byte.
     pub(crate) fn decode(self, src: &[u8]) -> Result<Vec<u8>, String> {
         let mut out = Vec::with_capacity(src.len() / 4 * 3 + 3);
         let mut si = 0;
@@ -159,8 +161,7 @@ pub(crate) enum WireError {
 }
 
 impl WireError {
-    /// `protowire.ParseError(n).Error()`. The `proto:` prefix uses a regular space;
-    /// Go picks a regular or non-breaking space per binary.
+    /// The diagnostic for a wire-format error, worded as protowire words it.
     pub(crate) fn text(self) -> &'static str {
         match self {
             Self::Truncated => "unexpected EOF",

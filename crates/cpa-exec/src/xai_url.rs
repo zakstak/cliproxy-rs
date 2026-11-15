@@ -1,7 +1,18 @@
-//! The part of Go's `net/url.Parse` that xAI endpoint validation depends on: the same
-//! accept/reject decisions, the same `Hostname()` and the same error text. Rust's `url`
-//! crate follows WHATWG and disagrees with Go on inputs such as `https://%61uth.x.ai`,
-//! `https://auth.x.ai\@evil.com`, embedded tabs, `https:auth.x.ai` and port 99999.
+//! The URL parser behind xAI endpoint validation and WebSocket URL rewriting.
+//!
+//! Rust's `url` crate follows WHATWG, which normalizes inputs that this parser reads
+//! differently or refuses: `https://auth.x.ai\@evil.com`, `https:auth.x.ai` (an opaque
+//! URL here, a host there), embedded tabs, port 99999 and a percent-escaped ASCII byte
+//! in a host (`https://%61uth.x.ai`, which WHATWG decodes to `auth.x.ai`). Validation
+//! reads the host from this parser, and the HTTP client contacts the host its WHATWG
+//! parse yields. Before an OAuth request leaves, [`same_authority`] requires both
+//! parses to name the same scheme, host and port, so a URL the two read differently is
+//! never sent.
+//!
+//! The parser started as a port of the parts of Go's `net/url.Parse` this validation
+//! uses, so endpoints in existing configs and saved credentials parse as they did.
+//! Error text follows net/url's wording; it reaches operator logs but is a diagnostic,
+//! not a contract.
 
 use cpa_common::gostr::quote;
 
@@ -38,7 +49,7 @@ pub struct GoUrl {
     pub raw_path: String,
 }
 
-/// `url.Parse`. The error is Go's `*url.Error` text.
+/// Parses `raw`. The error names the input, in net/url's `parse "<raw>": <reason>` form.
 pub fn parse(raw: &str) -> Result<GoUrl, String> {
     let (u, frag) = raw.split_once('#').unwrap_or((raw, ""));
     let mut url = parse_inner(u).map_err(|e| format!("parse {}: {e}", quote_bytes(u.as_bytes())))?;
@@ -482,17 +493,17 @@ pub(crate) fn quote_bytes(b: &[u8]) -> String {
     out
 }
 
-/// A Go executor returns `http.NewRequest`'s and `Client.Do`'s URL errors as they are:
-/// no status (rendered 500), no retry round, and the model cools for the credential.
+/// A URL error found before the request is sent: no status (rendered 500), no retry
+/// round, and the model cools for the credential.
 pub(crate) fn statusless(message: impl Into<String>) -> cpa_core::exec::ExecError {
     cpa_core::exec::ExecError::local(0, cpa_core::exec::FailureScope::Model, message)
 }
 
 /// Whether the HTTP client, which parses URLs with WHATWG rules (`url`), would contact
-/// the same scheme, host and port that Go's `net/url` parses from `raw`, and `false` where
-/// Go refuses `raw`, as it does `https://evil.example\[::1%25.x.ai]/` (an invalid
-/// IP-literal) where WHATWG reads a host; a request must never go to a host Go would not
-/// contact.
+/// the same scheme, host and port that [`parse`] reads from `raw`. `false` when either
+/// parser refuses `raw`: [`parse`] refuses `https://evil.example\[::1%25.x.ai]/` (an
+/// invalid IP literal) where WHATWG reads a host. A request must never go to a host
+/// other than the one validation approved.
 pub fn same_authority(raw: &str) -> bool {
     let (Ok(go), Ok(wh)) = (parse(raw), url::Url::parse(raw)) else {
         return false;
@@ -566,6 +577,8 @@ mod tests {
             "https://auth.x.ai:99999/t",
             "https://%61uth.x.ai/t",
             "https:auth.x.ai/t",
+            "https://au\tth.x.ai/t",
+            "https://evil.example\t.x.ai/t",
         ] {
             assert!(!same_authority(bad), "{bad}");
         }

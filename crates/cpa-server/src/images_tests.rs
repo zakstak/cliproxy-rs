@@ -1,9 +1,11 @@
-//! Images handler tests. The routes are checked against the Go server in
-//! tests/media_go.rs; these cover the content sniffer the goldens touch only twice.
+//! Images handler tests: the content sniffer and image stream delivery. Route behaviour
+//! is covered in tests/media_contracts.rs.
 
 use super::*;
 
-/// Expectations printed by Go 1.x `http.DetectContentType` for the same bytes.
+/// Signatures from the WHATWG MIME Sniffing Standard: an HTML tag must be followed by a
+/// space or `>`, a BOM or binary byte decides text against binary, and text types carry
+/// the charset the client must decode with.
 #[test]
 // Product policy: Content types follow recognizable file signatures and text/binary classification, so image and download responses receive usable MIME metadata.
 fn content_sniffing_recognizes_file_signatures_and_binary_text_boundaries() {
