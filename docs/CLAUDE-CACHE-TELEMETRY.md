@@ -113,11 +113,9 @@ with each block's `cache_control` removed. This includes path and role strings
 and tuple JSON framing. It excludes the eight-byte length frame added to the
 hash for each tuple, model/configuration hash inputs, and provider framing.
 These are fingerprint-input byte sizes, not section byte lengths or token counts.
-Anthropic returns exact aggregate usage, not per-section lengths. Offline replay
-scales these byte positions to that returned aggregate; relative section token
-lengths remain estimates. Media lengths cannot be scaled this way, so replay
-leaves media requests unmodelled. Exact section counts would require additional
-provider calls, which this feature does not make.
+Anthropic returns exact aggregate usage, not per-section lengths. These byte
+sizes do not establish section token counts, especially for media. Exact section
+counts would require additional provider calls, which this feature does not make.
 
 Work is linear in body size, with a bounded lookback ring. Tokenization and the
 tokenizer's resident allocation are absent. The observation copy and hashing are
@@ -127,107 +125,32 @@ large bodies can delay async workers.
 
 Restarts rotate every fingerprint and identity. Do not interpret a hash change
 across a restart as a prompt change or cold-cache proof. Restart boundaries cannot
-join sessions or detect double writes; use wake-up exports from the same process
-epoch. The replay does not model reuse across epochs.
+join sessions or detect double writes. Any schedule export used to correlate
+wake-ups must use hashes from the same process epoch.
 
 The new fields contain no prompt content or credentials. Existing Go-compatible
 usage fields are unchanged and can contain client keys and account metadata. A
 collector must protect the full record or export an allowlist containing
 `execution_id`, `request_id`, `failed`, `usage_observed`, `tokens`, and `claude_cache`.
 
-## Offline replay
-
-`tools/claude-cache/replay.py` accepts JSONL, one usage record per line, and reports
-the last seven days ending at the latest attempt end. Earlier supplied records
-warm the simulation without contributing to that week's costs. Duplicate
-`execution_id` values are skipped. A short export reports its coverage rather
-than claiming to contain a week.
-
-```sh
-python3 tools/claude-cache/replay.py week.jsonl --wakeups wakeups.jsonl > comparison.json
-python3 tools/claude-cache/test_replay.py
-```
+## Collection and interpretation limits
 
 The existing usage queue retains records for 60 seconds by default, at most one
 hour. It is not a week-long archive. A collector must continuously drain the queue
 or consume the RESP channel into a protected JSONL file. This change adds no
 collector or live service. Missing collection intervals cannot be reconstructed.
 
-The report compares these policies:
-
-- `observed`: replay the TTLs actually sent, to check the model against real usage.
-- `5m`: every existing breakpoint uses five minutes.
-- `1h`: every existing breakpoint uses one hour.
-- `hybrid`: tools and system breakpoints use one hour; message breakpoints use five
-  minutes. Breakpoint positions remain unchanged.
-- `1h+bounded-pings`: simulate a matching-prefix refresh after 57 minutes without
-  matching activity, at most three pings and four hours after real activity.
-  Pings are permitted only after successful `main` attempts. Real session activity
-  cancels the old timer. Errors, compaction, helper requests, and scope or prefix
-  changes prevent that old timer from firing. An expired prefix fails the local
-  preflight and stops the chain.
-
-The simulation anchors sliding expiry at request start and makes a cold entry
-available at the first response byte. Concurrent cold starts can both write. It
-uses the longest matching live prefix within the recorded lookback, accounts for
-new tail writes, and separates account and workspace scopes. Prefix positions are
-scaled from serialized fingerprint-input bytes to each attempt's exact returned
-cache-read plus cache-write total. Media and `usage_observed: false` records remain
-unmodelled, cancel session maintenance timers, and never schedule simulated pings.
-The relative positions of mixed-TTL segments remain estimates.
-`replay_validation` compares the observed-TTL simulation with actual reads and
-writes. Large residuals indicate missing cache state, collection gaps, or model
-error; do not treat policy cost differences as measured savings in that case.
-
-Default prices are Opus 5.5 API-equivalent dollars per million tokens: $4 input,
-$5 five-minute writes, $8 one-hour writes, $0.20 cache reads, and $20 output.
-Other models and fast requests are excluded from priced totals, but retained as
-activity that cancels session timers and can flag wake-up writes. `--model`, `--input-usd`,
-`--output-usd`, and `--read-multiplier` select another pricing scenario. Pings add
-128 assumed uncached input tokens and zero output by default. Adjust
-`--ping-input-tokens` to test overhead. This is an optimistic simulation of
-successful refreshes, not evidence that OAuth prewarming works or is permitted.
-There is no subscription-quota conversion.
-
-Real input and output charges, including observed compaction and retries, stay in
-each policy. Requests without usable cache measurements are not invented: their
-observed usage remains charged, and `unmodelled_requests` identifies the gap.
-Unknown write TTLs contribute a cost range, `api_equivalent_usd_low` through
-`api_equivalent_usd_high`. Known and unknown writes are computed per attempt before
-summing, so zeroed failure aggregates cannot erase another attempt's unknown-TTL
-writes. `observed_tokens.cache_creation_tokens` retains the Go aggregate;
-`effective_cache_creation_tokens` also includes exact buckets preserved on
-failures. Replay validation compares against that effective total.
-Left-edge cold state, unobserved eviction or routing,
-incomplete exports, and the unknown return after the right edge limit conclusions.
-Pings before the right edge cost money even if the user never returns. Future
-compaction behavior, additional maintenance output, quota pressure, logout, and
-unlogged errors cannot be inferred from these records.
-
-## Scheduled wake-up flags
-
-An optional wake-up export supplies one JSON object per line:
-
-```json
-{"timestamp":"2026-10-15T08:00:00Z","session_hash":"<matching claude_cache.session_hash>"}
-```
-
-The timestamp can also be Unix milliseconds. Use the hash observed for that
-scheduled thread, not its raw thread ID or credentials. The report flags cold
-writes within two minutes after each wake-up. It distinguishes identical-prefix
-rewrites, overlap before the earlier first byte, and changed scope, model,
-thinking, effort, beta, tools, system, or history fingerprints.
-
-These are candidate events, not a double-write diagnosis. A schedule export is
-required because the proxy cannot observe the Amp scheduler. No export produces
-`wakeups_provided: false`, not an assertion that scheduled double writes did not
-happen.
+Unobserved cache eviction or routing and incomplete exports limit conclusions.
+Future compaction behavior, quota pressure, logout, and unlogged errors cannot be
+inferred from these records. A schedule export with matching `session_hash` values
+is required to correlate scheduled wake-ups because the proxy cannot observe the
+Amp scheduler. Matching hashes and nearby cache writes alone do not establish a
+double write.
 
 ## Deployment boundary
 
 Mock-upstream tests verify both response modes, privacy of the additions, final
-TTLs, and byte-identical traffic with telemetry on and off. Run the network-free
-replay fixtures locally with `python3 tools/claude-cache/test_replay.py`. A week of production telemetry is needed
-before choosing a TTL or evaluating a maintenance policy. Publishing a release
-or replacing Core's running proxy requires Vayun's explicit approval. No live
-Claude login is exercised by these tests.
+TTLs, and byte-identical traffic with telemetry on and off. A week of production
+telemetry is needed before choosing a TTL or evaluating a maintenance policy.
+Publishing a release or replacing Core's running proxy requires Vayun's explicit
+approval. No live Claude login is exercised by these tests.

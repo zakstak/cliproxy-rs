@@ -17,7 +17,6 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo test -p cpa-server --features media-relay,pprof --lib --locked
-python3 tools/claude-cache/test_replay.py
 ```
 
 This fork has no GitHub Actions workflows. Run these checks locally before opening a pull request.

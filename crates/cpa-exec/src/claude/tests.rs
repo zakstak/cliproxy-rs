@@ -1781,10 +1781,10 @@ async fn cloaked_conversation_prefix_holds_for_warm_changed_and_idle_turns() {
     // The selected content the cache is keyed on, in Anthropic's order (tools, system,
     // messages), up to and including message `upto`. The billing block (system.0)
     // carries a per-request signature, as in native Claude Code; that Anthropic leaves
-    // it out of the key is an upstream assumption, which tools/claude-cache/live.sh
-    // confirms with real cache reads. The rolling breakpoint on the last message moves
-    // on with each turn, so markers after the first two messages are left out here and
-    // checked by path below.
+    // it out of the key is an upstream assumption requiring live cache-read
+    // verification. The rolling breakpoint on the last message moves on with each
+    // turn, so markers after the first two messages are left out here and checked by
+    // path below.
     const ROLLING: &str = r#","cache_control":{"type":"ephemeral","ttl":"1h"}"#;
     let prefix = |body: &str, upto: usize| {
         assert!(rawjson::string(body, "system.0.text").starts_with(cloak::BILLING_PREFIX));
