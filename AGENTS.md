@@ -22,7 +22,7 @@ A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI), co
 - `crates/cpa-server`: axum routes, client auth, credential selection, management API.
 - `crates/cpa-store`, `crates/cpa-home`: the remote config and auth stores, and Home mode. There is no native plugin host: Go's plugin model is removed (#47, `docs/DIFFERENCES-FROM-GO.md` "Native plugins"); add a capability as a built-in Rust feature, and choose any future extension mechanism separately.
 - `crates/cliproxy`: the binary. Go-style single-dash flags are accepted.
-- `ui/` is the dashboard. `tools/claude-cache/` holds the manual live prompt-cache check and the offline cache replay. Retired Go comparisons and benchmark results are available in Git history.
+- `ui/` is the dashboard. Retired Go comparisons and benchmark results are available in Git history.
 
 ## Rules
 
@@ -36,7 +36,7 @@ A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI), co
 - Tests check behaviour, not speed or memory use. Do not add wall-clock speed bounds, allocation counts, RSS limits or benchmark scores as test assertions or CI gates. Tests of a configured timeout, cancellation or deadline, and of a resource limit that protects the server (a body, line or decompression cap), are behaviour and stay. A generous timeout that only stops a broken test from hanging is fine.
 - Tests use local mock upstreams and never send traffic to real provider accounts. Give every test a private `auth-dir`: without one, credential loading falls back to `~/.cli-proxy-api`, where real logins live. Build test runtimes with `cpa_server::testing::runtime`.
 - Mark deliberate simplifications with a `ponytail:` comment naming the ceiling and the upgrade path.
-- Prompt-cache changes must keep request semantics and stable prefixes, and show cache-read and cache-write usage for warm, changed-context and idle continuations before merge. Never add inference keepalive pings. `tools/claude-cache/live.sh` runs that check against a live Claude login, by hand.
+- Prompt-cache changes must keep request semantics and stable prefixes, and show cache-read and cache-write usage for warm, changed-context and idle continuations before merge. Run that check manually against a live Claude login. Never add inference keepalive pings.
 
 ## Fork release versioning
 
@@ -69,4 +69,4 @@ requests to a live login for telemetry-only deployment checks. This rule does no
 replace the required live cache-read/cache-write check above for changes to cache
 semantics. The usage queue holds at most one hour, so a week-long
 study needs a continuous collector and a separate hashed schedule export. See
-[Claude cache telemetry](docs/CLAUDE-CACHE-TELEMETRY.md) for replay and limitations.
+[Claude cache telemetry](docs/CLAUDE-CACHE-TELEMETRY.md) for collection and limitations.

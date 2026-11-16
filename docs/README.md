@@ -9,7 +9,7 @@
 - [Several accounts](MULTI-ACCOUNT.md): routing, affinity, cooldowns, quotas, and remote access.
 - [Moving from Go CLIProxyAPI](MIGRATING-FROM-GO.md): migration, credential safety, and switching back.
 - [Differences from Go](DIFFERENCES-FROM-GO.md): operator-visible changes and limitations.
-- [Claude cache telemetry](CLAUDE-CACHE-TELEMETRY.md): collection, privacy, and offline replay.
+- [Claude cache telemetry](CLAUDE-CACHE-TELEMETRY.md): collection, privacy, and interpretation limits.
 
 ## Develop the fork
 

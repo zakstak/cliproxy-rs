@@ -10,7 +10,7 @@ setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all env ... COMMAND
 ```
 
 - `cargo test --offline -p cpa-server --features media-relay --lib`: **651 passed, 0 failed, 0 ignored** (103.53s). `CPA_TEST_NO_SKIP=1`, `CPA_TEST_PG_BIN=/tmp/cliproxy-parity-migration/pg/usr/bin`, `LD_LIBRARY_PATH=/tmp/cliproxy-parity-migration/pg/usr/lib`, actual CMake 4.5.0 executable, `CARGO_BUILD_JOBS=2 nice -n19`. Log: `media-relay-final.log`.
-- `python3 tools/claude-cache/test_replay.py`: **9 passed**. Log: `cache-replay-final.log`.
+- Offline cache replay checks (since removed): **9 passed**. Log: `cache-replay-final.log`.
 - `CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 nice -n19 bash .github/scripts/check-unsupported-targets.sh`: **passed**; Windows MSVC and Apple Darwin both stop with the intended Linux-only build error. Log: `unsupported-targets-final.log`.
 - PostgreSQL binary preflight: `postgres (PostgreSQL) 18.6` using the extracted library directory above.
 
