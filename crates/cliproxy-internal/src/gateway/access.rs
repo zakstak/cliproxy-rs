@@ -6,6 +6,7 @@
 //! bytes, like Go strings. With no keys configured the provider is unregistered and
 //! access is open.
 
+use crate::protocol::json_output::Object;
 use std::sync::Arc;
 
 use crate::execution::Caller;
@@ -47,7 +48,7 @@ pub async fn require_client_key(State(rt): State<Arc<Runtime>>, mut req: Request
         },
         // gin `AbortWithStatusJSON(status, gin.H{"error": msg})`.
         Err(message) => {
-            let body = crate::gateway::gojson::Obj::new().str("error", message).finish();
+            let body = Object::new().str("error", message).finish_string();
             return crate::gateway::respond::gin_json(401, body);
         }
     };

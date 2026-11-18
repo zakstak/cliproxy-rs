@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::home::Client;
-use crate::home::gojson::Object;
+use crate::protocol::json_output::Object;
 
 /// Go `defaultHomeAppLogQueueSize`.
 const DEFAULT_QUEUE_SIZE: usize = 1024;

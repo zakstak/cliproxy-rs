@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use git::{GitPersister, GitStore};
-pub use object::{ObjectConfig, ObjectPersister, ObjectStore};
-pub use postgres::{PgCooldown, PostgresConfig, PostgresPersister, PostgresStore};
+pub use object::{ObjectConfig, ObjectStore};
+pub use postgres::{PgCooldown, PostgresConfig, PostgresStore};
 
 use crate::persistence::StorePersister;
 use crate::persistence::cooldown::Backend as CooldownBackend;
@@ -175,7 +175,7 @@ pub async fn bootstrap(selection: Selection, wd: &Path) -> Result<Store, String>
                     "postgres-backed token store enabled, workspace path: {}",
                     store.work_dir().display()
                 ),
-                persister: Arc::new(PostgresPersister(store)),
+                persister: store,
             })
         }
         Selection::Object {
@@ -204,7 +204,7 @@ pub async fn bootstrap(selection: Selection, wd: &Path) -> Result<Store, String>
                 auth_dir: store.auth_dir(),
                 cooldown: None,
                 enabled: format!("object-backed token store enabled, bucket: {bucket}"),
-                persister: Arc::new(ObjectPersister(store)),
+                persister: store,
             })
         }
         Selection::Git {

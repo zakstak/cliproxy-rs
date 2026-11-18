@@ -1,6 +1,7 @@
 //! Model listing routes: unified `GET /v1/models` and the Gemini catalog
 //! (internal/api/server_routes.go, internal/registry/model_registry.go).
 
+use crate::protocol::json_output::Object;
 use std::sync::Arc;
 
 use crate::text::GoStr;
@@ -219,10 +220,7 @@ pub fn grok_list<'a>(models: impl Iterator<Item = &'a Spec>) -> String {
             } else {
                 &m.display_name
             };
-            let mut entry = gojson::Obj::new()
-                .str("id", &m.id)
-                .str("model", &m.id)
-                .str("name", name);
+            let mut entry = Object::new().str("id", &m.id).str("model", &m.id).str("name", name);
             if m.context_length > 0 {
                 entry = entry.raw("context_window", &m.context_length.to_string());
             }
@@ -233,18 +231,18 @@ pub fn grok_list<'a>(models: impl Iterator<Item = &'a Spec>) -> String {
                 .flat_map(|t| &t.levels)
                 .map(|level| level.trim())
                 .filter(|level| !level.is_empty())
-                .map(|level| gojson::Obj::new().str("value", level).finish())
+                .map(|level| Object::new().str("value", level).finish_string())
                 .collect();
             if !efforts.is_empty() {
                 entry = entry.raw("reasoning_efforts", &format!("[{}]", efforts.join(",")));
             }
-            entry.finish()
+            entry.finish_string()
         })
         .collect();
-    gojson::Obj::new()
+    Object::new()
         .str("object", "list")
         .raw("data", &format!("[{}]", data.join(",")))
-        .finish()
+        .finish_string()
 }
 
 /// Go `convertModelToMap(model, "claude")` plus `claudemodels.BuildResponse`.

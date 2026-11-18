@@ -1,5 +1,5 @@
 //! Server-side helpers for the bodies CLIProxyAPI builds itself (error envelopes, model
-//! lists): Go struct-ordered objects ([`Obj`]), status texts and durations. Go's JSON
+//! lists): string encoding, status texts and durations. Go's JSON
 //! encoding itself comes from `crate::protocol::json`.
 
 use serde_json::Value;
@@ -38,38 +38,6 @@ pub fn sorted(v: &Value) -> String {
         }
     }
     String::from_utf8(go(v).marshal()).expect("valid UTF-8 in, valid UTF-8 out")
-}
-
-/// An ordered object, for Go structs: fields render in insertion order.
-#[derive(Default)]
-pub struct Obj(String);
-
-impl Obj {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// A field whose value is already JSON.
-    pub fn raw(mut self, key: &str, json: &str) -> Self {
-        self.0.push(if self.0.is_empty() { '{' } else { ',' });
-        self.0.push_str(&string(key));
-        self.0.push(':');
-        self.0.push_str(json);
-        self
-    }
-
-    pub fn str(self, key: &str, value: &str) -> Self {
-        let value = string(value);
-        self.raw(key, &value)
-    }
-
-    pub fn finish(mut self) -> String {
-        if self.0.is_empty() {
-            self.0.push('{');
-        }
-        self.0.push('}');
-        self.0
-    }
 }
 
 /// gjson `Result.String()` for a decoded value: strings verbatim, other scalars as
@@ -147,6 +115,7 @@ fn fraction(value: u128, div: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::json_output::Object;
     use std::time::Duration;
 
     #[test]
@@ -160,7 +129,7 @@ mod tests {
         }
         let value = serde_json::json!({"z": 1, "a": {"y": [true, null], "b": "x"}});
         assert_eq!(serde_json::from_str::<Value>(&sorted(&value)).unwrap(), value);
-        let encoded = Obj::new().str("message", "m<&>").str("type", "t").finish();
+        let encoded = Object::new().str("message", "m<&>").str("type", "t").finish_string();
         assert_eq!(
             serde_json::from_str::<Value>(&encoded).unwrap(),
             serde_json::json!({"message":"m<&>","type":"t"})

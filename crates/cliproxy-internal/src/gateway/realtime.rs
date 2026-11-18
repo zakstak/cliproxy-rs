@@ -41,6 +41,7 @@ mod socket;
 #[cfg(feature = "media-relay")]
 mod tunnel;
 
+use crate::protocol::json_output::Object;
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -184,7 +185,7 @@ async fn authenticate(
                 secret: None,
             },
             Err(message) if matches!(mode, Mode::Ordinary) => {
-                let body = crate::gateway::gojson::Obj::new().str("error", message).finish();
+                let body = Object::new().str("error", message).finish_string();
                 return crate::gateway::respond::gin_json(401, body);
             }
             Err(message) => {
@@ -201,25 +202,19 @@ async fn authenticate(
 
 /// `writeRealtimeError`: gin.H marshals with sorted keys.
 fn realtime_error(status: u16, message: &str, kind: &str, code: &str) -> Response {
-    let detail = crate::gateway::gojson::Obj::new()
+    let detail = Object::new()
         .str("code", code)
         .str("message", message)
         .raw("param", "null")
         .str("type", kind)
-        .finish();
-    crate::gateway::respond::gin_json(
-        status,
-        crate::gateway::gojson::Obj::new().raw("error", &detail).finish(),
-    )
+        .finish_string();
+    crate::gateway::respond::gin_json(status, Object::new().raw("error", &detail).finish_string())
 }
 
 /// `writeLiveError`: the OpenAI envelope under `/v1/realtime`, else `{"error": msg}`.
 fn live_error(realtime: bool, status: u16, message: &str) -> Response {
     if !realtime {
-        return crate::gateway::respond::gin_json(
-            status,
-            crate::gateway::gojson::Obj::new().str("error", message).finish(),
-        );
+        return crate::gateway::respond::gin_json(status, Object::new().str("error", message).finish_string());
     }
     let kind = match status {
         401 => "authentication_error",

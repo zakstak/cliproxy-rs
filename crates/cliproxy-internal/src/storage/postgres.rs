@@ -610,24 +610,22 @@ impl crate::persistence::cooldown::Backend for PgCooldown {
     }
 }
 
-pub struct PostgresPersister(pub Arc<PostgresStore>);
-
-impl crate::persistence::StorePersister for PostgresPersister {
+impl crate::persistence::StorePersister for PostgresStore {
     fn persist_config(&self) -> BoxFuture<'_, Result<()>> {
-        Box::pin(self.0.persist_config())
+        Box::pin(PostgresStore::persist_config(self))
     }
 
     fn persist_auth_files(&self, _message: String, paths: Vec<PathBuf>) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move { self.0.persist_auth_files(&paths).await })
+        Box::pin(async move { PostgresStore::persist_auth_files(self, &paths).await })
     }
 
     fn delete_auth(&self, path: PathBuf) -> Result<()> {
         // The request runs on the runtime's reactor; this thread only waits for it.
-        tokio::runtime::Handle::current().block_on(self.0.delete(&path))
+        tokio::runtime::Handle::current().block_on(PostgresStore::delete(self, &path))
     }
 
     fn auth_dir(&self) -> PathBuf {
-        self.0.auth_dir()
+        PostgresStore::auth_dir(self)
     }
 }
 

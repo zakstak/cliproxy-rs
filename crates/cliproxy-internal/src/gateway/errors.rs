@@ -6,7 +6,8 @@ use axum::response::Response;
 use serde_json::Value;
 
 use crate::gateway::dispatch::Failure;
-use crate::gateway::gojson::{self, Obj};
+use crate::gateway::gojson;
+use crate::protocol::json_output::Object;
 
 /// Go `WriteErrorResponse`'s text: the error text trimmed, else the status text.
 fn text_for(status: u16, text: &str) -> String {
@@ -64,11 +65,11 @@ pub fn openai_body(status: u16, text: &str) -> String {
         500.. => ("server_error", "internal_server_error"),
         _ => ("invalid_request_error", ""),
     };
-    let mut detail = Obj::new().str("message", text).str("type", kind);
+    let mut detail = Object::new().str("message", text).str("type", kind);
     if !code.is_empty() {
         detail = detail.str("code", code);
     }
-    Obj::new().raw("error", &detail.finish()).finish()
+    Object::new().raw("error", &detail.finish_string()).finish_string()
 }
 
 /// Go `claudeErrorTypeFromStatus`.
@@ -121,11 +122,14 @@ fn claude_body_with(status: u16, text: &str, suffix: &str) -> String {
         }
     }
     message.push_str(suffix);
-    let mut detail = Obj::new().str("type", &kind).str("message", &message);
+    let mut detail = Object::new().str("type", &kind).str("message", &message);
     if thread_not_found {
         detail = detail.raw("details", r#"{"error_code":"thread_not_found"}"#);
     }
-    Obj::new().str("type", "error").raw("error", &detail.finish()).finish()
+    Object::new()
+        .str("type", "error")
+        .raw("error", &detail.finish_string())
+        .finish_string()
 }
 
 /// Writes a failure with the route's body shape.

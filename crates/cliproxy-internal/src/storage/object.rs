@@ -5,7 +5,6 @@
 
 use crate::text::GoStr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -626,24 +625,22 @@ impl ObjectStore {
     }
 }
 
-pub struct ObjectPersister(pub Arc<ObjectStore>);
-
-impl crate::persistence::StorePersister for ObjectPersister {
+impl crate::persistence::StorePersister for ObjectStore {
     fn persist_config(&self) -> BoxFuture<'_, Result<()>> {
-        Box::pin(self.0.persist_config())
+        Box::pin(ObjectStore::persist_config(self))
     }
 
     fn persist_auth_files(&self, _message: String, paths: Vec<PathBuf>) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move { self.0.persist_auth_files(&paths).await })
+        Box::pin(async move { ObjectStore::persist_auth_files(self, &paths).await })
     }
 
     fn delete_auth(&self, path: PathBuf) -> Result<()> {
         // The request runs on the runtime's reactor; this thread only waits for it.
-        tokio::runtime::Handle::current().block_on(self.0.delete(&path))
+        tokio::runtime::Handle::current().block_on(ObjectStore::delete(self, &path))
     }
 
     fn auth_dir(&self) -> PathBuf {
-        self.0.auth_dir()
+        ObjectStore::auth_dir(self)
     }
 }
 
@@ -845,12 +842,17 @@ mod tests {
         store.bootstrap(Path::new("")).await.unwrap();
         // An empty seeded config is not uploaded.
         assert!(s3.object("tokens", "config/config.yaml").is_none());
+        let config = store.config_path();
+        let store: std::sync::Arc<dyn crate::persistence::StorePersister> = std::sync::Arc::new(store);
         let auth = store.auth_dir();
         std::fs::write(auth.join("a.json"), b"{\"a\":1}").unwrap();
         std::fs::create_dir_all(auth.join("team")).unwrap();
         std::fs::write(auth.join("team/b.json"), b"{\"b\":1}").unwrap();
         store
-            .persist_auth_files(&[auth.join("a.json"), PathBuf::from("team/b.json")])
+            .persist_auth_files(
+                "Sync auth".into(),
+                vec![auth.join("a.json"), PathBuf::from("team/b.json")],
+            )
             .await
             .unwrap();
         assert_eq!(s3.object("tokens", "auths/a.json").unwrap(), b"{\"a\":1}");
@@ -859,28 +861,41 @@ mod tests {
         std::fs::write(auth.join("a.json"), b"").unwrap();
         std::fs::remove_file(auth.join("team/b.json")).unwrap();
         store
-            .persist_auth_files(&[auth.join("a.json"), auth.join("team/b.json")])
+            .persist_auth_files("Sync auth".into(), vec![auth.join("a.json"), auth.join("team/b.json")])
             .await
             .unwrap();
         assert!(s3.object("tokens", "auths/a.json").is_none());
         assert!(s3.object("tokens", "auths/team/b.json").is_none());
         // Explicit delete removes both copies.
         std::fs::write(auth.join("c.json"), b"{}").unwrap();
-        store.persist_auth_files(&[auth.join("c.json")]).await.unwrap();
-        store.delete(&auth.join("c.json")).await.unwrap();
+        store
+            .persist_auth_files("Sync auth".into(), vec![auth.join("c.json")])
+            .await
+            .unwrap();
+        let deleting = store.clone();
+        let path = auth.join("c.json");
+        tokio::task::spawn_blocking(move || deleting.delete_auth(path))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!auth.join("c.json").exists());
         assert!(s3.object("tokens", "auths/c.json").is_none());
         // Config follows the file, including its removal.
-        std::fs::write(store.config_path(), b"port: 1\n").unwrap();
+        std::fs::write(config.clone(), b"port: 1\n").unwrap();
         store.persist_config().await.unwrap();
         assert_eq!(s3.object("tokens", "config/config.yaml").unwrap(), b"port: 1\n");
-        std::fs::remove_file(store.config_path()).unwrap();
+        std::fs::remove_file(config.clone()).unwrap();
         store.persist_config().await.unwrap();
         assert!(s3.object("tokens", "config/config.yaml").is_none());
         // Paths outside the mirror are refused.
         let outside = dir.join("outside.json");
         std::fs::write(&outside, b"{}").unwrap();
-        assert!(store.persist_auth_files(&[outside]).await.is_err());
+        assert!(
+            store
+                .persist_auth_files("Sync auth".into(), vec![outside])
+                .await
+                .is_err()
+        );
     }
 
     /// minio-go maps the legacy `EU` location to eu-west-1 for signing.

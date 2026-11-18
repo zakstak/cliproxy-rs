@@ -18,8 +18,8 @@ use crate::home::config::{
     IN_FLIGHT_MAX_REVISION_BYTES, IN_FLIGHT_MAX_STRING_BYTES,
 };
 use crate::home::dispatch::valid_concurrency_model_key;
-use crate::home::gojson::string_into;
 use crate::home::registry::{Freeze, Observation, Registry};
+use crate::protocol::json_output::string_into;
 
 /// Go `HomeInFlightPublisherConfig`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

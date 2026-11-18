@@ -17,8 +17,9 @@ use serde_json::Value;
 use crate::gateway::claude::{alt, peek, read_failed};
 use crate::gateway::dispatch::{self, Call, Done};
 use crate::gateway::errors;
-use crate::gateway::gojson::{self, Obj};
+use crate::gateway::gojson;
 use crate::gateway::respond::{self, Writer};
+use crate::protocol::json_output::Object;
 use crate::runtime::Runtime;
 
 struct Request {
@@ -283,11 +284,11 @@ fn completions_to_chat(root: &Value) -> String {
         prompt = "Complete this:".into();
     }
     let model = gojson::gjson_string(root.get("model"));
-    let message = Obj::new()
+    let message = Object::new()
         .str("role", "user")
         .raw("content", &gojson::sjson_string(&prompt))
-        .finish();
-    let mut out = Obj::new()
+        .finish_string();
+    let mut out = Object::new()
         .raw("model", &gojson::sjson_string(&model))
         .raw("messages", &format!("[{message}]"));
     let get = |k: &str| root.get(k);
@@ -313,11 +314,11 @@ fn completions_to_chat(root: &Value) -> String {
     if let Some(v) = get("echo") {
         out = out.raw("echo", &truthy(v).to_string());
     }
-    out.finish()
+    out.finish_string()
 }
 
-fn completion_head(root: &Value) -> Obj {
-    Obj::new()
+fn completion_head(root: &Value) -> Object {
+    Object::new()
         .raw("id", &gojson::sjson_string(&gojson::gjson_string(root.get("id"))))
         .str("object", "text_completion")
         .raw("created", &root.get("created").map_or(0, go_int).to_string())
@@ -351,7 +352,7 @@ fn chat_to_completions(root: &Value) -> String {
     if let Some(usage) = root.get("usage") {
         out = out.raw("usage", &usage.to_string());
     }
-    out.finish()
+    out.finish_string()
 }
 
 /// Go `convertChatCompletionsStreamChunkToCompletions`; `None` drops the chunk.
@@ -399,7 +400,7 @@ fn chat_chunk_to_completions(root: &Value) -> Option<String> {
     if let Some(usage) = root.get("usage") {
         out = out.raw("usage", &usage.to_string());
     }
-    Some(out.finish())
+    Some(out.finish_string())
 }
 
 /// Chat Completions SSE: `data:` frames, an error frame, then `data: [DONE]`.
@@ -796,19 +797,22 @@ fn stream_error_frame(codex: bool, status: u16, text: &str, seq: i64, lead: bool
     let detail = gojson::sorted(&stream_error_detail(status, text));
     let lead = if lead { "\n" } else { "" };
     if codex {
-        let response = Obj::new().str("status", "failed").raw("error", &detail).finish();
-        let chunk = Obj::new()
+        let response = Object::new()
+            .str("status", "failed")
+            .raw("error", &detail)
+            .finish_string();
+        let chunk = Object::new()
             .str("type", "response.failed")
             .raw("sequence_number", &seq.to_string())
             .raw("response", &response)
-            .finish();
+            .finish_string();
         Bytes::from(format!("{lead}event: response.failed\ndata: {chunk}\n\n"))
     } else {
-        let chunk = Obj::new()
+        let chunk = Object::new()
             .str("type", "error")
             .raw("error", &detail)
             .raw("sequence_number", &seq.to_string())
-            .finish();
+            .finish_string();
         Bytes::from(format!("{lead}event: error\ndata: {chunk}\n\n"))
     }
 }

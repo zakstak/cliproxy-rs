@@ -1,6 +1,7 @@
 //! Response plumbing shared by the inference routes: JSON bodies, SSE headers and the
 //! stream forwarder (sdk/api/handlers/stream_forwarder.go).
 
+use crate::protocol::json_output::Object;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -30,14 +31,8 @@ pub fn gin_json(status: u16, body: String) -> Response {
 
 /// gin `c.JSON(status, ErrorResponse{Error: ErrorDetail{Message, Type}})`.
 pub fn error_detail(status: u16, message: &str, kind: &str) -> Response {
-    let detail = crate::gateway::gojson::Obj::new()
-        .str("message", message)
-        .str("type", kind)
-        .finish();
-    gin_json(
-        status,
-        crate::gateway::gojson::Obj::new().raw("error", &detail).finish(),
-    )
+    let detail = Object::new().str("message", message).str("type", kind).finish_string();
+    gin_json(status, Object::new().raw("error", &detail).finish_string())
 }
 
 /// The headers every Go SSE handler sets before the first event.

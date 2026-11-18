@@ -47,8 +47,13 @@ Put a trait beside the code that consumes it, or beside its shared data contract
 Implement it directly on the owning type. For example, `runtime::quota::QuotaSource`
 lets scheduling read passive quota evidence from Claude and Codex without accessing
 their concrete executor fields. `persistence::StorePersister` describes persistence
-without belonging to the HTTP gateway. Use concrete functions for fixed operations
-that need no interchangeable implementation.
+without belonging to the HTTP gateway. `PostgresStore` and `ObjectStore` implement
+that trait directly. `GitPersister` moves blocking Git work onto the blocking pool.
+Use concrete functions for fixed operations that need no interchangeable implementation.
+
+`protocol/json_output.rs` builds generated JSON objects for HTTP envelopes and Home
+messages. String fields use the shared JSON encoder; raw fields retain their JSON
+spelling and whitespace. Both consumers use the same object builder.
 
 Prefer `pub(crate)` for interfaces used only inside the library. Public items support
 the executable, integration tests and the local login harness; they are not a

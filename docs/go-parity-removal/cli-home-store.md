@@ -32,7 +32,7 @@ Replacement: `tls_configuration_refuses_incomplete_keys_missing_ca_and_invalid_p
 
 ## `crates/cliproxy-internal/src/home/gojson.rs::matches_go_marshal`
 
-Replacement: `object_writer_preserves_json_values_and_omits_empty_options`. Independent serde Value checks preserve string, number, array, null and omitted optional fields without key order/HTML escape requirements.
+Replacement: `object_writer_preserves_json_values_and_omits_empty_options` in the shared [JSON output builder](../../crates/cliproxy-internal/src/protocol/json_output.rs). Independent serde Value checks preserve string, number, array, null and omitted optional fields without key order/HTML escape requirements.
 
 ## `crates/cliproxy-internal/src/home/inflight.rs::rfc3339_nano_trims_like_go`
 

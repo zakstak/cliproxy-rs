@@ -15,8 +15,8 @@ use std::time::SystemTime;
 use crate::credential::Credential;
 use crate::execution::ExecError;
 
-use crate::gateway::gojson::Obj;
 use crate::persistence::cooldown::Record;
+use crate::protocol::json_output::Object;
 
 fn time(t: SystemTime) -> String {
     crate::gateway::gojson::string(&crate::gateway::usage_record::go_timestamp(&chrono::DateTime::<
@@ -30,7 +30,7 @@ fn quota(record: &Record, reason: &str) -> Option<String> {
     if !q.exceeded && reason.is_empty() && q.next_recover_at.is_none() && q.backoff_level == 0 {
         return None;
     }
-    let mut o = Obj::new().raw("exceeded", if q.exceeded { "true" } else { "false" });
+    let mut o = Object::new().raw("exceeded", if q.exceeded { "true" } else { "false" });
     if !reason.is_empty() {
         o = o.str("reason", reason);
     }
@@ -40,7 +40,7 @@ fn quota(record: &Record, reason: &str) -> Option<String> {
     if q.backoff_level != 0 {
         o = o.raw("backoff_level", &q.backoff_level.to_string());
     }
-    Some(o.finish())
+    Some(o.finish_string())
 }
 
 /// The payload for a failure of `c` on `model`, given its live cooldown `records`.
@@ -66,7 +66,7 @@ pub(crate) fn payload(c: &Credential, model: &str, error: &ExecError, records: &
                 .unwrap_or_default()
         }
     };
-    let mut auth_status = Obj::new();
+    let mut auth_status = Object::new();
     match credential_record.or(model_record) {
         Some(auth_record) => {
             let message = message(model_record.unwrap_or(auth_record));
@@ -93,7 +93,7 @@ pub(crate) fn payload(c: &Credential, model: &str, error: &ExecError, records: &
                     "credential_quota" => "quota",
                     reason => reason,
                 };
-                let mut model_status = Obj::new().str("name", model.trim()).str("status", "error");
+                let mut model_status = Object::new().str("name", model.trim()).str("status", "error");
                 if !message.is_empty() {
                     model_status = model_status.str("status_message", &message);
                 }
@@ -104,7 +104,7 @@ pub(crate) fn payload(c: &Credential, model: &str, error: &ExecError, records: &
                 if let Some(q) = quota(r, model_reason) {
                     model_status = model_status.raw("quota", &q);
                 }
-                auth_status = auth_status.raw("model", &model_status.finish());
+                auth_status = auth_status.raw("model", &model_status.finish_string());
             }
         }
         None => {
@@ -114,7 +114,7 @@ pub(crate) fn payload(c: &Credential, model: &str, error: &ExecError, records: &
                 .raw("unavailable", "false");
         }
     }
-    let mut event = Obj::new().raw(
+    let mut event = Object::new().raw(
         "timestamp",
         &crate::gateway::gojson::string(&crate::gateway::usage_record::go_timestamp(&chrono::Local::now())),
     );
@@ -132,8 +132,8 @@ pub(crate) fn payload(c: &Credential, model: &str, error: &ExecError, records: &
         .str("auth_index", crate::config::credentials::auth_index(c).trim())
         .raw("status_code", &status_code.to_string())
         .str("body", if body.is_empty() { "request failed" } else { body })
-        .raw("auth_status", &auth_status.finish());
-    event.finish().into_bytes()
+        .raw("auth_status", &auth_status.finish_string());
+    event.finish()
 }
 
 #[cfg(test)]

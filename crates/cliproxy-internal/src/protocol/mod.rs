@@ -10,6 +10,7 @@ pub mod idle;
 pub mod json;
 #[cfg(test)]
 mod json_edit_tests;
+pub(crate) mod json_output;
 pub mod payload;
 pub mod rawjson;
 pub mod schema;

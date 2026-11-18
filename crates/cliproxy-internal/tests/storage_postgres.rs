@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 use cliproxy_internal::persistence::StorePersister;
 use cliproxy_internal::persistence::cooldown::{Backend, Record};
-use cliproxy_internal::storage::{PostgresConfig, PostgresPersister, PostgresStore};
+use cliproxy_internal::storage::{PostgresConfig, PostgresStore};
 
 fn scratch(name: &str) -> PathBuf {
     // Parallel tests can read the same clock value: the counter keeps their clusters apart.
@@ -204,7 +204,7 @@ async fn postgres_store_round_trips_config_auth_and_cooldowns() {
     std::fs::create_dir_all(auth.join("team")).unwrap();
     std::fs::write(auth.join("team/b.json"), r#"{"type":"codex"}"#).unwrap();
     std::fs::write(auth.join("c.json"), r#"{"c":true}"#).unwrap();
-    let persister = PostgresPersister(Arc::new(first));
+    let persister: Arc<dyn StorePersister> = Arc::new(first);
     persister
         .persist_auth_files(
             "Sync auth".into(),
