@@ -2067,6 +2067,58 @@ mod tests {
         assert!(xai.iter().any(|m| m.id == "grok-imagine-video-1.5-lite"), "X4 (#87)");
     }
 
+    /// GPT-6.2 metadata: openai/codex@6c0cee502d21 models-manager/models.json and
+    /// developers.openai.com/api/docs/models/gpt-6.2-{sol,astra}, read 2026-11-17.
+    /// Paid-plan availability follows learn.chatgpt.com/docs/pricing.
+    #[test]
+    fn gpt_6_2_models_follow_plan_and_operator_rules() {
+        let cfg = Config::default();
+        let models = [("gpt-6.2-sol", 500_000), ("gpt-6.2-astra", 272_000)];
+        for plan in ["free", "plus", "team", "business", "pro", ""] {
+            let credential = file(
+                "codex.json",
+                serde_json::json!({"type":"codex"}),
+                &[("plan_type", plan)],
+            );
+            let registry = Registry::build(&cfg, &[credential]);
+            for (id, context) in models {
+                if plan == "free" {
+                    assert!(registry.providers(id).is_empty(), "{plan}: {id}");
+                    continue;
+                }
+                assert_eq!(registry.providers(id), ["codex"], "{plan}: {id}");
+                let info = registry.info(id, Some("codex")).unwrap();
+                assert_eq!(info.context_length, context, "{plan}: {id}");
+                // The first-party catalog gives no ChatGPT maximum output limit.
+                assert_eq!(info.max_completion_tokens, 0, "{plan}: {id}");
+                assert_eq!(
+                    info.thinking.as_ref().unwrap().levels,
+                    ["low", "medium", "high", "xhigh", "max", "ultra"],
+                    "{plan}: {id}"
+                );
+                assert_eq!(info.native_web_search, Some(true), "{plan}: {id}");
+                assert!(info.support_configuration_update, "{plan}: {id}");
+            }
+            assert_eq!(registry.providers("gpt-5.5"), ["codex"]);
+        }
+        let key = config("codex", "key", serde_json::json!({}), &[("api_key", "sk-fake")]);
+        let registry = Registry::build(&cfg, &[key]);
+        for (id, _) in models {
+            assert_eq!(registry.providers(id), ["codex"]);
+            assert!(!registry.info(id, Some("codex")).unwrap().support_configuration_update);
+        }
+        let excluded = file(
+            "excluded.json",
+            serde_json::json!({"type":"codex"}),
+            &[("plan_type", "plus"), ("excluded_models", "gpt-6.2-*")],
+        );
+        let registry = Registry::build(&cfg, &[excluded]);
+        for (id, _) in models {
+            assert!(registry.providers(id).is_empty());
+        }
+        assert_eq!(registry.providers("gpt-6.1-sol"), ["codex"]);
+    }
+
     /// K1 (#68): the additions register like their siblings and stay subject to the
     /// operator's rules: plan tiers, API-key defaults, exclusions, aliases, prefixes and
     /// configured model lists. Existing entries keep registering.

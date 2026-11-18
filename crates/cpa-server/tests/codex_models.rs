@@ -38,6 +38,56 @@ async fn get(path: &str, cfg: &str) -> (u16, String, Value) {
 
 const CONFIG: &str = "codex-api-key:\n  - api-key: sk-FAKE-codex\n    base-url: http://127.0.0.1:1\n    models:\n      - name: gpt-5.5\nclaude-api-key:\n  - api-key: sk-FAKE-claude\n    models:\n      - name: claude-sonnet-4-6\n        alias: sonnet-long\n        max-context-length: 150000\nclient:\n  codex:\n    optimize-multi-agent-v2: true\n";
 
+/// First-party metadata from openai/codex@6c0cee502d21,
+/// codex-rs/models-manager/models.json, read 2026-11-17. Fake API-key defaults
+/// must advertise both routing IDs and their own templates, not a synthesized GPT-5.5.
+#[tokio::test]
+async fn gpt_6_2_models_are_listed_with_first_party_client_templates() {
+    let config = "codex-api-key:\n  - api-key: sk-FAKE-catalog\n    base-url: http://127.0.0.1:1\n";
+    let (status, _, list) = get("/v1/models", config).await;
+    assert_eq!(status, 200);
+    for id in ["gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-5.5"] {
+        assert!(list["data"].as_array().unwrap().iter().any(|m| m["id"] == id), "{id}");
+    }
+    let (status, _, catalog) = get("/v1/models?client_version=0.166.0", config).await;
+    assert_eq!(status, 200);
+    for (id, context, priority) in [("gpt-6.2-sol", 500_000, 1), ("gpt-6.2-astra", 272_000, 2)] {
+        let model = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["slug"] == id)
+            .unwrap();
+        assert_eq!(model["context_window"], context);
+        assert_eq!(model["max_context_window"], 872_000);
+        assert_eq!(model["priority"], priority);
+        assert_eq!(model["minimal_client_version"], "0.166.0");
+        assert_eq!(model["input_modalities"], serde_json::json!(["text", "image"]));
+        let efforts = model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["effort"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(efforts, ["low", "medium", "high", "xhigh", "max", "ultra"]);
+        assert_eq!(model["prefer_websockets"], true);
+        assert_eq!(model["use_responses_lite"], true);
+        assert_eq!(model["supports_reasoning_effort_updates"], true);
+        assert_eq!(model["default_service_tier"], Value::Null);
+        assert_eq!(
+            model["service_tiers"],
+            serde_json::json!([{"id":"priority","name":"Fast","description":"2x speed, increased usage"}])
+        );
+        assert!(model["base_instructions"].as_str().unwrap().len() > 1000);
+        // First-party serialize_model_infos_with_legacy_base mirrors the canonical
+        // literal instructions for clients that still read the deprecated field.
+        assert_eq!(
+            model["base_instructions"],
+            model["model_messages"]["instructions_template"]
+        );
+    }
+}
+
 #[tokio::test]
 async fn client_version_selects_the_codex_catalog() {
     let (status, content_type, body) = get("/v1/models?client_version=0.150.0", CONFIG).await;

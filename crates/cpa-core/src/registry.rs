@@ -1,6 +1,8 @@
 //! Pinned static model catalog: `internal/registry/models/models.json` from CLIProxyAPI
-//! v8.0.35, byte for byte except that the sections of the providers this fork removed
-//! (Gemini, Vertex, Gemini CLI, AI Studio, Kimi and Antigravity; issue #49) are cut out.
+//! v8.0.35, with removed provider sections cut out (issue #49) and sourced additions.
+//! GPT-6.2 defaults and reasoning levels follow openai/codex@6c0cee502d21,
+//! `codex-rs/models-manager/models.json`. Unknown ChatGPT output limits stay unset.
+//! See `docs/DIFFERENCES-FROM-GO.md` for catalog sources and endpoint distinctions.
 //!
 //! This is the static layer only. Go overlays a dynamic registry (per-credential
 //! registrations, config model definitions, remote catalog refresh) and consults it before
