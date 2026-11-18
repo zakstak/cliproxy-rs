@@ -13,6 +13,39 @@ becomes a name in its unsupported-type diagnostic; it is still refused locally.
 Other providers keep their Go readers.
 The remaining readers use `cpa_common::json` or `cpa_common::rawjson`; the native request boundary is defined in the [Codex contract](codex/CONTRACT.md#request-boundary).
 
+## GPT-6.2 model catalogs
+
+The embedded catalogs include `gpt-6.2-sol` and `gpt-6.2-astra` for Codex API
+keys and the Plus, Team, and Pro credential tiers. Free credentials keep their
+existing catalog. OpenAI's [release announcement](https://openai.com/index/introducing-gpt-6-2-astra-sol/)
+and [plan availability](https://learn.chatgpt.com/docs/pricing) list the paid plans.
+These models are absent from Go v8.0.35's embedded catalog.
+
+The two Codex client templates are copied from
+[`openai/codex@6c0cee502d21`](https://github.com/openai/codex/blob/6c0cee502d215e5df2dd9a303cf2e252229c9e12/codex-rs/models-manager/models.json),
+read on 2026-11-17. Their `base_instructions` mirrors the canonical
+`model_messages.instructions_template`, following that revision's
+`serialize_model_infos_with_legacy_base` in `codex-rs/protocol/src/openai_models.rs`,
+so older clients still receive instructions. They advertise default windows of 500,000
+tokens for Sol and 272,000 for Astra, maximum windows of 872,000, and reasoning
+efforts from `low` through `ultra`. The general catalog uses those default
+windows and leaves output limits unset because the first-party catalog gives none.
+OpenAI's [Sol](https://developers.openai.com/api/docs/models/gpt-6.2-sol) and
+[Astra](https://developers.openai.com/api/docs/models/gpt-6.2-astra) API model pages
+list 1,050,000 total context and 128,000 output tokens. Those
+API limits are distinct from Codex client defaults and do not establish ChatGPT
+backend limits.
+Existing model entries and operator-selected catalog sources keep their behavior.
+Remote refreshes can replace the embedded catalogs. Use `--local-model` or set
+both `models.catalog` and `models.codex-catalog` to `embed` to retain them.
+
+Source review at [`openai/codex@3dbc6f86570e`](https://github.com/openai/codex/tree/3dbc6f86570ec10aaf1df2b1011912d47274622b/codex-rs)
+found no GPT-6.2-specific OpenAI transport or authentication branch. Both models
+use the existing Responses builder, catalog-selected Responses Lite, reasoning
+updates, and service tiers. The proxy preserves those flags and native request
+bytes. The release's model-specific cloud adapter changes cover Bedrock and
+Vertex, which this fork does not support.
+
 ## xAI OAuth expiry limits
 
 Unrepresentable xAI token lifetimes now leave the saved expiry unknown instead of

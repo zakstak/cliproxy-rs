@@ -1058,6 +1058,9 @@ mod tests {
                 ids(tier)
             );
             assert!(!has(tier, "gpt-6-chat-thinking"), "{tier}");
+            for id in ["gpt-6.2-sol", "gpt-6.2-astra"] {
+                assert_eq!(has(tier, id), tier != "codex-free", "{tier}: {id}");
+            }
         }
         assert_eq!(ids("meta").first().map(String::as_str), Some("muse-ember-1.0"));
         // X4 (#87): Grok Imagine Video 1.5 Lite is an xAI built-in, not an embedded

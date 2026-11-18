@@ -31,6 +31,11 @@ const MESSAGE_TOOLS: [&str; 3] = ["spawn_agent", "send_message", "followup_task"
 
 /// The embedded Codex client model catalog (Go embeds `models/codex_client_models.json`);
 /// [`crate::codex_catalog`] serves it until a remote refresh replaces it.
+/// GPT-6.2 templates come from openai/codex@6c0cee502d215e5df2dd9a303cf2e252229c9e12,
+/// `codex-rs/models-manager/models.json`. Their legacy `base_instructions` mirrors
+/// `model_messages.instructions_template`, as `serialize_model_infos_with_legacy_base`
+/// does in `codex-rs/protocol/src/openai_models.rs:1009-1042` at that revision.
+/// Older templates retain their existing provenance.
 pub static CLIENT_MODELS_JSON: &str = include_str!("codex_client_models.json");
 
 /// The two settings these rewrites read from one config snapshot.

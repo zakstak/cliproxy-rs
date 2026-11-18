@@ -126,35 +126,52 @@ const REQUESTS: [&str; 5] = [
 async fn streaming_requests_and_events_pass_unchanged() {
     let mock = Mock::start().await;
     let cfg = Config::default();
-    for kind in [Kind::OAuth, Kind::Key] {
-        let credential = credential(kind, &mock.url);
-        for name in REQUESTS {
-            mock.script("/responses", vec![sse("sse-completed")]);
-            let body = fixture(name).bytes();
-            let response = executor()
-                .execute(&credential, request(body.clone(), "gpt-test", true, None), &cfg)
-                .await
-                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
-            let (out, error) = drain(response).await;
-            assert!(error.is_none(), "{name}: {error:?}");
-            assert_eq!(
-                text(&out),
-                text(&fixture("sse-completed").bytes()),
-                "{name}: client events"
-            );
-            let [sent] = mock.take().try_into().unwrap();
-            assert_eq!(sent.path, "/responses");
-            assert_eq!(text(&sent.body), text(&body), "{name}: upstream body");
-            assert_eq!(
-                sent.header("authorization"),
-                "Bearer at-FAKE".replace(
-                    "at-FAKE",
-                    match kind {
-                        Kind::Key => "key-FAKE",
-                        _ => "at-FAKE",
-                    }
-                )
-            );
+    // Source refresh: openai/codex@3dbc6f86570e uses the same Responses builder
+    // for GPT-6.2 (core/src/client.rs:1188-1338). Exercise real model IDs against
+    // the existing contract inputs without changing any other request bytes.
+    for model in ["gpt-test", "gpt-6.2-sol", "gpt-6.2-astra"] {
+        for kind in [Kind::OAuth, Kind::Key] {
+            let credential = credential(kind, &mock.url);
+            for name in REQUESTS {
+                mock.script("/responses", vec![sse("sse-completed")]);
+                let body = Bytes::from(text(&fixture(name).bytes()).replacen(
+                    r#""model":"gpt-test""#,
+                    &format!(r#""model":"{model}""#),
+                    1,
+                ));
+                let mut req = request(body.clone(), model, true, None);
+                if name == "http-request-lite" {
+                    req.headers
+                        .insert("x-openai-internal-codex-responses-lite", "true".parse().unwrap());
+                }
+                let response = executor()
+                    .execute(&credential, req, &cfg)
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+                let (out, error) = drain(response).await;
+                assert!(error.is_none(), "{name}: {error:?}");
+                assert_eq!(
+                    text(&out),
+                    text(&fixture("sse-completed").bytes()),
+                    "{name}: client events"
+                );
+                let [sent] = mock.take().try_into().unwrap();
+                assert_eq!(sent.path, "/responses");
+                assert_eq!(text(&sent.body), text(&body), "{name}: upstream body");
+                if name == "http-request-lite" {
+                    assert_eq!(sent.header("x-openai-internal-codex-responses-lite"), "true");
+                }
+                assert_eq!(
+                    sent.header("authorization"),
+                    "Bearer at-FAKE".replace(
+                        "at-FAKE",
+                        match kind {
+                            Kind::Key => "key-FAKE",
+                            _ => "at-FAKE",
+                        }
+                    )
+                );
+            }
         }
     }
 }
