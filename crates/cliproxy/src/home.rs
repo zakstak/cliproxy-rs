@@ -2,25 +2,25 @@
 //! concurrency leases released back (Go cmd/server/main.go's Home branch,
 //! sdk/cliproxy/service_home.go and auth/conductor_home.go). The protocol lives in
 //! `cpa-home`; this module wires it to the runtime through
-//! [`cpa_server::remote::RemoteDispatch`].
+//! [`cliproxy_internal::gateway::remote::RemoteDispatch`].
 
-use cpa_core::gostr::GoStr;
+use cliproxy_internal::text::GoStr;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
-use cpa_core::config::Config;
-use cpa_core::credential::{Credential, Source};
-use cpa_core::exec::{ExecError, FailureScope};
-use cpa_home::dispatch::{DispatchResponse, decode_concurrency, decode_error, verify_identity};
-use cpa_home::registry::{Registry, ScopeSpec};
-use cpa_home::release::ReleaseFlusher;
-use cpa_home::{Client, CredentialConcurrency, DispatchRequest, HomeConfig};
-use cpa_server::Runtime;
-use cpa_server::remote::{
+use cliproxy_internal::config::Config;
+use cliproxy_internal::credential::{Credential, Source};
+use cliproxy_internal::execution::{ExecError, FailureScope};
+use cliproxy_internal::gateway::remote::{
     EndLease, ModelsError, RemoteDispatch, RemoteError, RemoteErrorKind, RemoteGrant, RemoteRequest,
 };
+use cliproxy_internal::home::dispatch::{DispatchResponse, decode_concurrency, decode_error, verify_identity};
+use cliproxy_internal::home::registry::{Registry, ScopeSpec};
+use cliproxy_internal::home::release::ReleaseFlusher;
+use cliproxy_internal::home::{Client, CredentialConcurrency, DispatchRequest, HomeConfig};
+use cliproxy_internal::runtime::Runtime;
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value};
 use serde_yaml_ng::{Mapping, Value as Yaml};
@@ -112,7 +112,9 @@ pub fn overlay(raw: &[u8], base: Option<&Config>) -> anyhow::Result<Config> {
         None => set(
             &mut doc,
             &["server", "port"],
-            Some(Yaml::Number(cpa_home::normalize_home_port(parsed.port).into())),
+            Some(Yaml::Number(
+                cliproxy_internal::home::normalize_home_port(parsed.port).into(),
+            )),
         ),
     }
     set(&mut doc, &["access", "api-keys"], None);
@@ -137,17 +139,17 @@ pub fn overlay(raw: &[u8], base: Option<&Config>) -> anyhow::Result<Config> {
         &["management", "disable-control-panel"],
         Some(Yaml::Bool(true)),
     );
-    Config::parse(&cpa_core::config::yaml_string(&doc)?)
+    Config::parse(&cliproxy_internal::config::yaml_string(&doc)?)
 }
 
 /// Go main's Home bootstrap: Home's config. Go also syncs and reports Home-managed
 /// plugins here; native plugins are removed, and a Home config with a `plugins` section
-/// is refused (`cpa_core::config::PLUGINS_REMOVED`). The error is the line Go logs
+/// is refused (`cliproxy_internal::config::PLUGINS_REMOVED`). The error is the line Go logs
 /// before exiting.
 pub async fn bootstrap(jwt: &str, disable_discovery: bool) -> Result<(HomeConfig, Config), String> {
-    let mut home = tokio::time::timeout(BOOTSTRAP_TIMEOUT, cpa_home::cert::config_from_jwt(jwt))
+    let mut home = tokio::time::timeout(BOOTSTRAP_TIMEOUT, cliproxy_internal::home::cert::config_from_jwt(jwt))
         .await
-        .unwrap_or(Err(cpa_home::Error::Timeout))
+        .unwrap_or(Err(cliproxy_internal::home::Error::Timeout))
         .map_err(|e| format!("invalid -home-jwt: {e}"))?;
     if disable_discovery {
         home.disable_cluster_discovery = true;
@@ -155,7 +157,7 @@ pub async fn bootstrap(jwt: &str, disable_discovery: bool) -> Result<(HomeConfig
     let client = Client::new(home.clone());
     let raw = tokio::time::timeout(BOOTSTRAP_TIMEOUT, client.get_config())
         .await
-        .unwrap_or(Err(cpa_home::Error::Timeout));
+        .unwrap_or(Err(cliproxy_internal::home::Error::Timeout));
     let parsed = raw
         .map_err(|e| format!("failed to fetch config from home: {e}"))
         .and_then(|raw| overlay(&raw, None).map_err(|e| format!("failed to parse config payload from home: {e:#}")));
@@ -177,7 +179,7 @@ pub struct Dispatcher {
     /// For `Executors::supports` (Go `m.Executor(key)`); weak, the runtime owns this.
     rt: std::sync::Weak<Runtime>,
     /// Go `Manager.homeSessionAliases`.
-    sessions: cpa_home::session_alias::SessionAliases,
+    sessions: cliproxy_internal::home::session_alias::SessionAliases,
 }
 
 fn fail(status: u16, code: &str, message: impl std::fmt::Display) -> ExecError {
@@ -214,14 +216,14 @@ impl Dispatcher {
     /// session's parent is sent as the parent; any other fallback names the same
     /// conversation, so both join one alias group whose canonical ID is sent.
     fn dispatch_sessions(&self, primary: &str, fallback: &str, ttl: Duration) -> (String, String) {
-        use cpa_common::session::bound_session_identity as bound;
+        use cliproxy_internal::protocol::session::bound_session_identity as bound;
         let (primary, fallback) = (primary.trim(), fallback.trim());
         if primary.is_empty() {
             return (String::new(), String::new());
         }
         let (mut parent, mut alias) = ("", "");
         if !fallback.is_empty() && fallback != primary {
-            if cpa_home::session_alias::is_hierarchy_parent(primary, fallback) {
+            if cliproxy_internal::home::session_alias::is_hierarchy_parent(primary, fallback) {
                 parent = fallback;
             } else {
                 alias = fallback;
@@ -290,9 +292,12 @@ impl Dispatcher {
         excluded.dedup();
         // ponytail: no Merkle LCP session matching; Go consults it when no session
         // identifier was sent.
-        let ttl = self.rt.upgrade().map_or(cpa_home::session_alias::DEFAULT_TTL, |rt| {
-            rt.policy().session_affinity_ttl
-        });
+        let ttl = self
+            .rt
+            .upgrade()
+            .map_or(cliproxy_internal::home::session_alias::DEFAULT_TTL, |rt| {
+                rt.policy().session_affinity_ttl
+            });
         let (session_id, parent_session_id) =
             self.dispatch_sessions(&request.session_id, &request.parent_session_id, ttl);
         let dispatch = DispatchRequest {
@@ -312,7 +317,7 @@ impl Dispatcher {
             Err(error) => {
                 drop(pending);
                 return Err(match error {
-                    cpa_home::Error::AuthNotFound => reject(503, "auth_not_found", &error),
+                    cliproxy_internal::home::Error::AuthNotFound => reject(503, "auth_not_found", &error),
                     _ => reject(503, "home_unavailable", &error),
                 });
             }
@@ -335,7 +340,7 @@ impl Dispatcher {
             accounted,
         };
         // Go `homeConcurrencyInstallError` for a registry that refuses the scope.
-        let install_failed = |error: cpa_home::registry::RegistryError| {
+        let install_failed = |error: cliproxy_internal::home::registry::RegistryError| {
             client.abort_ambiguous_dispatch();
             reject(
                 503,
@@ -357,7 +362,7 @@ impl Dispatcher {
             ),
             None => None,
         };
-        let end_scope = |scope: &Option<cpa_home::registry::Scope>| {
+        let end_scope = |scope: &Option<cliproxy_internal::home::registry::Scope>| {
             if let Some(scope) = scope {
                 scope.end();
             }
@@ -374,15 +379,15 @@ impl Dispatcher {
             // retried and exposes its safe `Retry-After`.
             let header = error.retry_after_header();
             let kind = match error.kind {
-                cpa_home::dispatch::HomeErrorKind::Plain => RemoteErrorKind::Plain,
-                cpa_home::dispatch::HomeErrorKind::Cooldown {
+                cliproxy_internal::home::dispatch::HomeErrorKind::Plain => RemoteErrorKind::Plain,
+                cliproxy_internal::home::dispatch::HomeErrorKind::Cooldown {
                     retry_after,
                     request_retry,
                 } => RemoteErrorKind::Cooldown {
                     retry_after,
                     request_retry,
                 },
-                cpa_home::dispatch::HomeErrorKind::Busy { .. } => RemoteErrorKind::Busy { header },
+                cliproxy_internal::home::dispatch::HomeErrorKind::Busy { .. } => RemoteErrorKind::Busy { header },
             };
             let mut failure = fail(error.status, &error.code, &error.message);
             if let RemoteErrorKind::Cooldown { retry_after, .. } = &kind {
@@ -408,7 +413,8 @@ impl Dispatcher {
         };
         let observed = response.observed_model(&model).to_owned();
         if let Some(tuple) = &tuple
-            && cpa_home::dispatch::valid_concurrency_model_key(&observed).as_deref() != Some(tuple.model.as_str())
+            && cliproxy_internal::home::dispatch::valid_concurrency_model_key(&observed).as_deref()
+                != Some(tuple.model.as_str())
         {
             client.abort_ambiguous_dispatch();
             end_scope(&scope);
@@ -444,11 +450,12 @@ impl Dispatcher {
         };
         // Go `selection.CanonicalSessionID` / `ParentSessionID`: what this pick sent.
         if !dispatch.session_id.is_empty() {
-            credential
-                .attributes
-                .insert(cpa_server::remote::SESSION.into(), dispatch.session_id.clone());
             credential.attributes.insert(
-                cpa_server::remote::PARENT_SESSION.into(),
+                cliproxy_internal::gateway::remote::SESSION.into(),
+                dispatch.session_id.clone(),
+            );
+            credential.attributes.insert(
+                cliproxy_internal::gateway::remote::PARENT_SESSION.into(),
                 dispatch.parent_session_id.clone(),
             );
         }
@@ -489,7 +496,7 @@ impl Dispatcher {
         });
         // Go: Home's request-retry limit applies unless the request is pinned.
         let request_retry = response.request_retry.filter(|r| *r >= 0 && pinned.is_empty());
-        let private = cpa_server::remote::Private {
+        let private = cliproxy_internal::gateway::remote::Private {
             availability: Arc::new(availability),
             attributes: dispatcher_attributes(&response.auth, &credential),
         };
@@ -538,7 +545,7 @@ impl RemoteDispatch for Dispatcher {
                 return Err(ModelsError::Unavailable);
             };
             let lower = |pairs: &[(String, String)]| {
-                cpa_home::client::lower_map(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                cliproxy_internal::home::client::lower_map(pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             };
             bundle
                 .client
@@ -559,12 +566,14 @@ fn executor_key(provider: &str) -> String {
 /// Go's typed decoding of the dispatched auth's runtime state, on the reply as written:
 /// the nested `auth` first (Go's first `json.Unmarshal`), then, when it has no ID and Go
 /// decodes the whole reply as the auth (older Homes), the reply itself.
-fn auth_availability(raw: &[u8]) -> Result<cpa_server::remote::Availability, &'static str> {
+fn auth_availability(raw: &[u8]) -> Result<cliproxy_internal::gateway::remote::Availability, &'static str> {
     use serde_json::value::RawValue;
     const INVALID: &str = "home returned invalid auth payload";
     let reply: std::collections::HashMap<String, &RawValue> = serde_json::from_slice(raw).map_err(|_| INVALID)?;
     let nested = reply.get("auth").map(|auth| auth.get()).filter(|auth| *auth != "null");
-    let decoded = nested.map(cpa_server::remote::Availability::decode).transpose()?;
+    let decoded = nested
+        .map(cliproxy_internal::gateway::remote::Availability::decode)
+        .transpose()?;
     // The same rule `DispatchResponse::parse` applies.
     let nested_id = nested
         .and_then(|auth| serde_json::from_str::<Map<String, Value>>(auth).ok())
@@ -572,7 +581,7 @@ fn auth_availability(raw: &[u8]) -> Result<cpa_server::remote::Availability, &'s
         .unwrap_or(false);
     match decoded {
         Some(decoded) if nested_id => Ok(decoded),
-        _ => cpa_server::remote::Availability::decode(std::str::from_utf8(raw).map_err(|_| INVALID)?),
+        _ => cliproxy_internal::gateway::remote::Availability::decode(std::str::from_utf8(raw).map_err(|_| INVALID)?),
     }
 }
 
@@ -584,12 +593,12 @@ fn auth_availability(raw: &[u8]) -> Result<cpa_server::remote::Availability, &'s
 fn dispatcher_attributes(auth: &Map<String, Value>, credential: &Credential) -> Vec<String> {
     let sent = auth.get("attributes").and_then(Value::as_object);
     [
-        cpa_server::remote::PROVIDER,
-        cpa_core::config::credentials::HOME_AUTH_INDEX,
-        cpa_server::remote::MODEL_INFO,
-        cpa_core::config::credentials::HOME_MODEL_OPTIONS,
-        cpa_server::remote::SESSION,
-        cpa_server::remote::PARENT_SESSION,
+        cliproxy_internal::gateway::remote::PROVIDER,
+        cliproxy_internal::config::credentials::HOME_AUTH_INDEX,
+        cliproxy_internal::gateway::remote::MODEL_INFO,
+        cliproxy_internal::config::credentials::HOME_MODEL_OPTIONS,
+        cliproxy_internal::gateway::remote::SESSION,
+        cliproxy_internal::gateway::remote::PARENT_SESSION,
     ]
     .into_iter()
     .filter(|key| {
@@ -627,15 +636,15 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    cpa_core::config::credentials::validate_metadata(&metadata).map_err(|e| reject(502, "invalid_auth", e))?;
+    cliproxy_internal::config::credentials::validate_metadata(&metadata).map_err(|e| reject(502, "invalid_auth", e))?;
     let provider = text("provider").go_lower();
     let label = text("label");
     let key = executor_key(&provider);
     if provider.is_empty() || key.is_empty() {
         return Err(reject(502, "invalid_auth", "home returned auth without provider"));
     }
-    attributes.insert(cpa_server::remote::PROVIDER.into(), text("provider"));
-    let prefix = cpa_core::config::credentials::normalize_prefix(&text("prefix"));
+    attributes.insert(cliproxy_internal::gateway::remote::PROVIDER.into(), text("provider"));
+    let prefix = cliproxy_internal::config::credentials::normalize_prefix(&text("prefix"));
     if !prefix.is_empty() {
         attributes.insert("prefix".into(), prefix);
     }
@@ -645,19 +654,19 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
     // Go `auth.Index = homeAuthIndex`.
     if !response.auth_index.trim().is_empty() {
         attributes.insert(
-            cpa_core::config::credentials::HOME_AUTH_INDEX.into(),
+            cliproxy_internal::config::credentials::HOME_AUTH_INDEX.into(),
             response.auth_index.trim().to_owned(),
         );
     }
     if !response.model.trim().is_empty() {
         attributes.insert(
-            cpa_server::remote::UPSTREAM_MODEL.into(),
+            cliproxy_internal::gateway::remote::UPSTREAM_MODEL.into(),
             response.model.trim().to_owned(),
         );
     }
     // Go `homeForceMappingAliasResult`: the mapping applies when the alias Home mapped
     // from is the requested model (prefix removed, recognized suffixes ignored).
-    let canonical = cpa_home::dispatch::canonical_concurrency_model_key;
+    let canonical = cliproxy_internal::home::dispatch::canonical_concurrency_model_key;
     let raw_prefix = text("prefix");
     let unprefixed = match requested.strip_prefix(&format!("{raw_prefix}/")) {
         Some(rest) if !raw_prefix.is_empty() => rest,
@@ -665,9 +674,9 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
     };
     let original = canonical(&response.original_alias);
     if response.force_mapping && !original.is_empty() && original == canonical(unprefixed) {
-        attributes.insert(cpa_server::remote::FORCE_MAPPING.into(), "true".into());
+        attributes.insert(cliproxy_internal::gateway::remote::FORCE_MAPPING.into(), "true".into());
         attributes.insert(
-            cpa_server::remote::ORIGINAL_ALIAS.into(),
+            cliproxy_internal::gateway::remote::ORIGINAL_ALIAS.into(),
             response.original_alias.trim().to_owned(),
         );
     }
@@ -708,8 +717,8 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
     // entry for the dispatched upstream model reached through the route model. Only the
     // dispatcher sets these attributes.
     for key in [
-        cpa_server::remote::MODEL_INFO,
-        cpa_core::config::credentials::HOME_MODEL_OPTIONS,
+        cliproxy_internal::gateway::remote::MODEL_INFO,
+        cliproxy_internal::config::credentials::HOME_MODEL_OPTIONS,
     ] {
         credential.attributes.remove(key);
     }
@@ -721,7 +730,7 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
     if let Some(info) = info {
         credential
             .attributes
-            .insert(cpa_server::remote::MODEL_INFO.into(), info.to_string());
+            .insert(cliproxy_internal::gateway::remote::MODEL_INFO.into(), info.to_string());
     }
     // ponytail: without a dispatched model or model info Go uses the attempt's model;
     // a Home pick without either is the route model, which this uses.
@@ -733,9 +742,10 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
         ("", None) => requested,
         (model, _) => model,
     };
-    if let Some(options) = cpa_home::dispatch::credential_model_options(&credential, upstream, requested) {
+    if let Some(options) = cliproxy_internal::home::dispatch::credential_model_options(&credential, upstream, requested)
+    {
         credential.attributes.insert(
-            cpa_core::config::credentials::HOME_MODEL_OPTIONS.into(),
+            cliproxy_internal::config::credentials::HOME_MODEL_OPTIONS.into(),
             Value::Object(options).to_string(),
         );
     }
@@ -796,13 +806,15 @@ pub fn spawn_subscriber(
     tokio::spawn(async move {
         // Go `StartHomeAppLogForwarder` (process-wide logrus hook): bound to each
         // published lifetime, stopped with the subscriber.
-        let app_log = cpa_home::applog::Forwarder::start(0);
-        let hook = cpa_server::logging::add_hook({
+        let app_log = cliproxy_internal::home::applog::Forwarder::start(0);
+        let hook = cliproxy_internal::gateway::logging::add_hook({
             let app_log = app_log.clone();
-            Arc::new(move |e: &cpa_server::logging::Entry<'_>| app_log.fire(e.line, e.level, e.time, e.request_id))
+            Arc::new(move |e: &cliproxy_internal::gateway::logging::Entry<'_>| {
+                app_log.fire(e.line, e.level, e.time, e.request_id)
+            })
         });
         run_lifetimes(home, rt, dispatcher, shutdown, app_log.clone()).await;
-        cpa_server::logging::remove_hook(hook);
+        cliproxy_internal::gateway::logging::remove_hook(hook);
         app_log.stop().await;
     })
 }
@@ -812,7 +824,7 @@ async fn run_lifetimes(
     rt: Arc<Runtime>,
     dispatcher: Arc<Dispatcher>,
     shutdown: CancellationToken,
-    app_log: Arc<cpa_home::applog::Forwarder>,
+    app_log: Arc<cliproxy_internal::home::applog::Forwarder>,
 ) {
     let mut registry = Registry::new();
     let mut flusher = ReleaseFlusher::new();
@@ -820,7 +832,7 @@ async fn run_lifetimes(
     let mut previous: Option<Client> = None;
     let bound = || CredentialConcurrency::default().with_defaults().cancel_bound();
     // Go keeps the publisher settings on the auth manager, across lifetimes.
-    let publisher = cpa_home::inflight::PublisherSettings::default();
+    let publisher = cliproxy_internal::home::inflight::PublisherSettings::default();
     let mut backoff = ReconnectBackoff::default();
     while !shutdown.is_cancelled() {
         let client = match &previous {
@@ -887,10 +899,10 @@ async fn run_lifetimes(
                             // The KV client goes first: an attempt that receives a Home
                             // credential must also see Home KV for its identities and
                             // caches.
-                            cpa_home::set_current(Some(client.clone()));
+                            cliproxy_internal::home::set_current(Some(client.clone()));
                             dispatcher.install(client.clone(), registry.clone());
                             app_log.bind(&client);
-                            helpers.push(tokio::spawn(cpa_home::inflight::run_publisher(
+                            helpers.push(tokio::spawn(cliproxy_internal::home::inflight::run_publisher(
                                 client.clone(),
                                 registry.clone(),
                                 publisher.clone(),
@@ -922,8 +934,8 @@ async fn run_lifetimes(
                         .map_err(|e| e.to_string())
                         .and_then(|c| client.set_lifecycle_config(c).map_err(|e| e.to_string()))
                         .inspect_err(|e| tracing::warn!("failed to apply Home lifecycle config: {e}"))?;
-                    let in_flight = cpa_home::CredentialInFlight::from_document(&parsed.document);
-                    let settings = cpa_home::inflight::PublisherConfig::from_config(&in_flight)
+                    let in_flight = cliproxy_internal::home::CredentialInFlight::from_document(&parsed.document);
+                    let settings = cliproxy_internal::home::inflight::PublisherConfig::from_config(&in_flight)
                         .map_err(|e| e.to_string())
                         .inspect_err(|e| tracing::warn!("failed to apply Home in-flight publisher config: {e}"))?;
                     publisher.apply(settings);
@@ -945,7 +957,7 @@ async fn run_lifetimes(
             }
         }
         dispatcher.clear(&client);
-        cpa_home::clear_current_if(&client);
+        cliproxy_internal::home::clear_current_if(&client);
         app_log.deactivate(&client);
         let bound = client.limiter_config().cancel_bound().max(bound());
         let retry = run.is_err() && !shutdown.is_cancelled();
@@ -1023,17 +1035,17 @@ async fn run_lifetimes(
 /// removed from Home's config is dropped with its models (docs/DIFFERENCES-FROM-GO.md).
 /// The rest of the store (relay sessions) is kept.
 fn config_api_keys(cfg: &Config) -> Vec<Credential> {
-    cpa_core::config::credentials::from_config(cfg)
+    cliproxy_internal::config::credentials::from_config(cfg)
         .into_iter()
         // `IsConfigAPIKeyAuth`: a keyless OpenAI-compatibility entry is not one.
-        .filter(cpa_core::registry::dynamic::is_api_key)
+        .filter(cliproxy_internal::catalog::dynamic::is_api_key)
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cpa_home::fake::{self, FakeHome, Reply};
+    use cliproxy_internal::home::fake::{self, FakeHome, Reply};
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
@@ -1216,10 +1228,10 @@ mod tests {
     /// [`node`] with this Codex executor.
     async fn node_with(
         home: &FakeHome,
-        codex: cpa_exec::codex::CodexExecutor,
+        codex: cliproxy_internal::providers::codex::CodexExecutor,
     ) -> (String, Arc<Runtime>, CancellationToken, tokio::task::JoinHandle<()>) {
-        let executors = cpa_exec::Executors {
-            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+        let executors = cliproxy_internal::providers::Executors {
+            claude: cliproxy_internal::providers::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
             codex,
             meta: Default::default(),
             xai: Default::default(),
@@ -1234,11 +1246,15 @@ mod tests {
     /// [`node`] with these executors and local credentials in the runtime's store.
     async fn node_full(
         home: &FakeHome,
-        executors: cpa_exec::Executors,
+        executors: cliproxy_internal::providers::Executors,
         local: Vec<Credential>,
     ) -> (String, Arc<Runtime>, CancellationToken, tokio::task::JoinHandle<()>) {
         let config = overlay(b"port: 0\n", None).unwrap();
-        node_on(home, Arc::new(cpa_server::testing::runtime(config, local, executors))).await
+        node_on(
+            home,
+            Arc::new(cliproxy_internal::gateway::testing::runtime(config, local, executors)),
+        )
+        .await
     }
 
     /// [`node_full`] on a runtime the caller built.
@@ -1255,12 +1271,12 @@ mod tests {
             let _guard = guard;
             subscriber.await.unwrap();
         });
-        let app = cpa_server::router(rt.clone()).layer(axum::middleware::from_fn_with_state(
+        let app = cliproxy_internal::gateway::router(rt.clone()).layer(axum::middleware::from_fn_with_state(
             rt.clone(),
-            cpa_server::remote::gate,
+            cliproxy_internal::gateway::remote::gate,
         ));
         // main.rs: the request identity middleware wraps the served app.
-        let app = cpa_server::observability::router(&rt, app);
+        let app = cliproxy_internal::gateway::observability::router(&rt, app);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
@@ -1305,7 +1321,7 @@ mod tests {
     /// concurrency settings.
     #[test]
     fn optional_config_fallbacks_carry_the_in_flight_defaults() {
-        use cpa_home::config::{CredentialConcurrency, CredentialInFlight};
+        use cliproxy_internal::home::config::{CredentialConcurrency, CredentialInFlight};
         let dir = std::env::temp_dir().join(format!("cpa-home-optional-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, contents) in [
@@ -1321,7 +1337,7 @@ mod tests {
             let cfg = crate::load_config(&path, true).unwrap();
             let in_flight = CredentialInFlight::from_document(&cfg.document);
             assert_eq!(in_flight, CredentialInFlight::default(), "{name}");
-            cpa_home::inflight::PublisherConfig::from_config(&in_flight).unwrap();
+            cliproxy_internal::home::inflight::PublisherConfig::from_config(&in_flight).unwrap();
             let concurrency = CredentialConcurrency::from_document(&cfg.document).unwrap();
             assert_eq!(concurrency, CredentialConcurrency::default(), "{name}");
         }
@@ -1340,9 +1356,9 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert_eq!(error.to_string(), cpa_core::config::PLUGINS_REMOVED);
+        assert_eq!(error.to_string(), cliproxy_internal::config::PLUGINS_REMOVED);
         let error = overlay(b"port: 0\nplugins: {enabled: false}\n", None).unwrap_err();
-        assert_eq!(error.to_string(), cpa_core::config::PLUGINS_REMOVED);
+        assert_eq!(error.to_string(), cliproxy_internal::config::PLUGINS_REMOVED);
     }
 
     #[test]
@@ -1384,14 +1400,23 @@ mod tests {
         assert_eq!(c.provider, "codex", "Go executorKeyFromAuth");
         assert_eq!(c.attributes["prefix"], "team");
         assert_eq!(c.attributes["proxy_url"], "socks5://p");
-        assert_eq!(c.attributes[cpa_server::remote::UPSTREAM_MODEL], "gpt-up");
-        assert_eq!(c.attributes[cpa_server::remote::ORIGINAL_ALIAS], "pretty");
-        assert_eq!(c.attributes[cpa_server::remote::PROVIDER], "Codex");
+        assert_eq!(
+            c.attributes[cliproxy_internal::gateway::remote::UPSTREAM_MODEL],
+            "gpt-up"
+        );
+        assert_eq!(
+            c.attributes[cliproxy_internal::gateway::remote::ORIGINAL_ALIAS],
+            "pretty"
+        );
+        assert_eq!(c.attributes[cliproxy_internal::gateway::remote::PROVIDER], "Codex");
         assert!(matches!(c.source, Source::Config { .. }));
         assert_eq!(c.label, "Acme");
         // Go `homeForceMappingAliasResult`: only recognized suffixes are ignored.
         let c = credential(&response, "pretty(custom)").unwrap();
-        assert!(!c.attributes.contains_key(cpa_server::remote::FORCE_MAPPING));
+        assert!(
+            !c.attributes
+                .contains_key(cliproxy_internal::gateway::remote::FORCE_MAPPING)
+        );
         let oauth =
             DispatchResponse::parse(br#"{"id":"a.json","provider":"Claude","metadata":{"email":"e@x"}}"#).unwrap();
         let c = credential(&oauth, "m").unwrap();
@@ -1433,9 +1458,18 @@ mod tests {
         };
         let mapped = |force: bool, requested: &str| {
             let c = credential(&reply(force), requested).unwrap();
-            assert_eq!(c.attributes[cpa_server::remote::UPSTREAM_MODEL], "grok-4.5");
-            let flag = c.attributes.get(cpa_server::remote::FORCE_MAPPING).map(String::as_str);
-            let alias = c.attributes.get(cpa_server::remote::ORIGINAL_ALIAS).map(String::as_str);
+            assert_eq!(
+                c.attributes[cliproxy_internal::gateway::remote::UPSTREAM_MODEL],
+                "grok-4.5"
+            );
+            let flag = c
+                .attributes
+                .get(cliproxy_internal::gateway::remote::FORCE_MAPPING)
+                .map(String::as_str);
+            let alias = c
+                .attributes
+                .get(cliproxy_internal::gateway::remote::ORIGINAL_ALIAS)
+                .map(String::as_str);
             assert_eq!(flag.is_some(), alias.is_some(), "{requested}");
             alias.map(str::to_owned)
         };
@@ -2070,11 +2104,11 @@ mod tests {
         let client = home.client();
         fake::set_heartbeat(&client, true);
         let config = overlay(b"port: 0\n", None).unwrap();
-        let rt = Arc::new(cpa_server::testing::runtime(
+        let rt = Arc::new(cliproxy_internal::gateway::testing::runtime(
             config.clone(),
             vec![],
-            cpa_exec::Executors {
-                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+            cliproxy_internal::providers::Executors {
+                claude: cliproxy_internal::providers::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
                 meta: Default::default(),
                 xai: Default::default(),
@@ -2134,7 +2168,7 @@ mod tests {
         let device = "e".repeat(64);
         let pool_key = format!(
             "cpa:claude:credential-device-pool:{}",
-            cpa_home::kv::hash_key_part("idx-oauth")
+            cliproxy_internal::home::kv::hash_key_part("idx-oauth")
         );
         let oauth = format!(
             r#"{{"model":"claude-up","auth_index":"idx-oauth","auth":{{"id":"cred-oauth","provider":"claude","attributes":{{"base_url":"{upstream}"}},"metadata":{{"type":"claude","access_token":"sk-ant-oat01-FAKE","account_uuid":"8f14e45f-ceea-467f-a8a1-0c3b9e1f3a77","email":"fake@example.invalid"}}}}}}"#
@@ -2172,7 +2206,10 @@ mod tests {
         assert_eq!(status, 200, "{body}");
         // Go `CachedSessionIDRequired` twice: the cloaked body's fake user ID misses
         // (GET, SETNX for an hour, GET), then the headers hit and renew (GET, EXPIRE).
-        let session_key = format!("cpa:claude:session-id:{}", cpa_home::kv::hash_key_part("sk-fake-key"));
+        let session_key = format!(
+            "cpa:claude:session-id:{}",
+            cliproxy_internal::home::kv::hash_key_part("sk-fake-key")
+        );
         let calls: Vec<Vec<String>> = home
             .commands()
             .into_iter()
@@ -2201,7 +2238,10 @@ mod tests {
         let (status, body) = ask(&base, "claude-x").await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(rpops(&home).len(), 3);
-        let plain_key = format!("cpa:claude:session-id:{}", cpa_home::kv::hash_key_part("sk-fake-plain"));
+        let plain_key = format!(
+            "cpa:claude:session-id:{}",
+            cliproxy_internal::home::kv::hash_key_part("sk-fake-plain")
+        );
         assert!(!home.commands().iter().any(|c| c.get(1) == Some(&plain_key)));
         shutdown.cancel();
         task.await.unwrap();
@@ -2213,11 +2253,11 @@ mod tests {
     #[test]
     fn dispatch_sessions_choose_primary_and_parent_identity() {
         let config = overlay(b"port: 0\n", None).unwrap();
-        let rt = Arc::new(cpa_server::testing::runtime(
+        let rt = Arc::new(cliproxy_internal::gateway::testing::runtime(
             config,
             vec![],
-            cpa_exec::Executors {
-                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+            cliproxy_internal::providers::Executors {
+                claude: cliproxy_internal::providers::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
                 meta: Default::default(),
                 xai: Default::default(),
@@ -2249,7 +2289,10 @@ mod tests {
         // Long identifiers are bounded after canonicalization.
         let long = "s".repeat(300);
         let (bounded, _) = ids(&long, "");
-        assert_eq!(bounded, cpa_common::session::bound_session_identity(&long));
+        assert_eq!(
+            bounded,
+            cliproxy_internal::protocol::session::bound_session_identity(&long)
+        );
         assert!(bounded.len() < 256);
     }
 
@@ -2268,23 +2311,24 @@ mod tests {
                 value.parse().unwrap(),
             );
         }
-        let meta = cpa_common::session::Meta {
+        let meta = cliproxy_internal::protocol::session::Meta {
             execution_session: None,
             derived: None,
         };
-        let (mut primary, mut fallback, _) = cpa_common::session::explicit_session_ids(&map, body.as_bytes(), &meta);
+        let (mut primary, mut fallback, _) =
+            cliproxy_internal::protocol::session::explicit_session_ids(&map, body.as_bytes(), &meta);
         if primary.is_empty() {
-            (primary, fallback) = cpa_common::session::session_ids(&map, body.as_bytes(), &meta);
+            (primary, fallback) = cliproxy_internal::protocol::session::session_ids(&map, body.as_bytes(), &meta);
         }
         dispatcher.dispatch_sessions(&primary, &fallback, ttl)
     }
 
     fn test_runtime() -> Arc<Runtime> {
-        Arc::new(cpa_server::testing::runtime(
+        Arc::new(cliproxy_internal::gateway::testing::runtime(
             overlay(b"port: 0\n", None).unwrap(),
             vec![],
-            cpa_exec::Executors {
-                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+            cliproxy_internal::providers::Executors {
+                claude: cliproxy_internal::providers::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
                 meta: Default::default(),
                 xai: Default::default(),
@@ -2600,13 +2644,13 @@ mod tests {
     /// the next credential's success records nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn count_tokens_401s_reach_home_as_home_results() {
-        use cpa_exec::test_support::{COUNT_DENIED as DENIED, CountTokensUpstream};
+        use cliproxy_internal::providers::test_support::{COUNT_DENIED as DENIED, CountTokensUpstream};
         let upstream = CountTokensUpstream::start().await;
         let dir = std::env::temp_dir().join(format!("home-count-tokens-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let pick = |id: &str, token: &str| {
             let metadata = serde_json::json!({"type":"claude", "access_token":token});
-            let c = cpa_server::testing::local(
+            let c = cliproxy_internal::gateway::testing::local(
                 Credential::from_file(&dir, &dir.join(id), metadata.as_object().unwrap().clone()).unwrap(),
             );
             serde_json::json!({"model":"claude-up", "auth_index":format!("idx-{id}"), "user_api_key":"home-client",
@@ -2624,7 +2668,7 @@ mod tests {
         .await;
         let (base, rt, shutdown, task) = node_full(
             &home,
-            cpa_exec::Executors {
+            cliproxy_internal::providers::Executors {
                 claude: upstream.executor(),
                 codex: Default::default(),
                 meta: Default::default(),
@@ -2682,7 +2726,7 @@ mod tests {
         assert!(record.get("access_provider").is_none(), "{record}");
         assert_eq!(
             record["session_id"],
-            cpa_common::session::normalize_to_canonical_uuid(&sent_session)
+            cliproxy_internal::protocol::session::normalize_to_canonical_uuid(&sent_session)
         );
         assert_eq!(record["failed"], true);
         assert_eq!(record["generate"], false);
@@ -2757,7 +2801,7 @@ mod tests {
         assert!(record.get("access_provider").is_none(), "{record}");
         assert_eq!(
             record["session_id"],
-            cpa_common::session::normalize_to_canonical_uuid("search-1")
+            cliproxy_internal::protocol::session::normalize_to_canonical_uuid("search-1")
         );
         assert!(!record["request_id"].as_str().unwrap().is_empty(), "{record}");
         assert_eq!(
@@ -2882,7 +2926,7 @@ mod tests {
     /// A Codex live upstream on loopback: the calls endpoint answers 201 with a call ID
     /// (401 for the token ending `denied`), hangups 200, and the direct Realtime
     /// WebSocket's handshake 401. Records `METHOD path authorization`.
-    async fn live_upstream(seen: Arc<Mutex<Vec<String>>>) -> cpa_exec::codex::CodexExecutor {
+    async fn live_upstream(seen: Arc<Mutex<Vec<String>>>) -> cliproxy_internal::providers::codex::CodexExecutor {
         use axum::response::IntoResponse;
         let app = axum::Router::new().fallback(
             move |method: axum::http::Method, uri: axum::http::Uri, headers: axum::http::HeaderMap| {
@@ -2919,9 +2963,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        cpa_exec::codex::CodexExecutor::with_client(
+        cliproxy_internal::providers::codex::CodexExecutor::with_client(
             wreq::Client::new(),
-            cpa_exec::codex_oauth::CodexOAuth::new(wreq::Client::new()),
+            cliproxy_internal::providers::codex_oauth::CodexOAuth::new(wreq::Client::new()),
         )
         .with_live_endpoints(
             format!("{base}/backend-api/codex/realtime/calls"),
@@ -3088,9 +3132,9 @@ mod tests {
 
     /// A Home node with Codex upstream support and no local credentials.
     async fn codex_ws_node(home: &FakeHome) -> (String, Arc<Runtime>, CancellationToken, tokio::task::JoinHandle<()>) {
-        let executors = cpa_exec::Executors {
-            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
-            codex: cpa_exec::codex::CodexExecutor::new().unwrap(),
+        let executors = cliproxy_internal::providers::Executors {
+            claude: cliproxy_internal::providers::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+            codex: cliproxy_internal::providers::codex::CodexExecutor::new().unwrap(),
             meta: Default::default(),
             xai: Default::default(),
         };
@@ -3315,7 +3359,10 @@ mod tests {
     /// A Codex live upstream that stalls: the calls endpoint sends its headers and then
     /// never finishes the body, and the WebSocket endpoint accepts TCP but never answers
     /// the handshake. Counts requests that reached it.
-    async fn stalled_live_upstream() -> (cpa_exec::codex::CodexExecutor, Arc<std::sync::atomic::AtomicUsize>) {
+    async fn stalled_live_upstream() -> (
+        cliproxy_internal::providers::codex::CodexExecutor,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let reached: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
         let app = axum::Router::new().fallback({
             let reached = reached.clone();
@@ -3349,9 +3396,9 @@ mod tests {
                 }
             }
         });
-        let codex = cpa_exec::codex::CodexExecutor::with_client(
+        let codex = cliproxy_internal::providers::codex::CodexExecutor::with_client(
             wreq::Client::new(),
-            cpa_exec::codex_oauth::CodexOAuth::new(wreq::Client::new()),
+            cliproxy_internal::providers::codex_oauth::CodexOAuth::new(wreq::Client::new()),
         )
         .with_live_endpoints(format!("{base}/backend-api/codex/realtime/calls"), ws_base);
         (codex, reached)
@@ -4002,9 +4049,10 @@ mod tests {
             }
         }))
         .await;
-        let executors = cpa_exec::Executors {
-            claude: cpa_exec::claude::ClaudeExecutor::new(&upstream.base).unwrap(),
-            meta: cpa_exec::meta::MetaExecutor::default().with_mint_url("http://127.0.0.1:9/must-not-mint"),
+        let executors = cliproxy_internal::providers::Executors {
+            claude: cliproxy_internal::providers::claude::ClaudeExecutor::new(&upstream.base).unwrap(),
+            meta: cliproxy_internal::providers::meta::MetaExecutor::default()
+                .with_mint_url("http://127.0.0.1:9/must-not-mint"),
             codex: Default::default(),
             xai: Default::default(),
         };
@@ -4545,14 +4593,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let oauth = cpa_exec::oauth::OAuth::with_endpoints(
+        let oauth = cliproxy_internal::providers::oauth::OAuth::with_endpoints(
             wreq::Client::new(),
             &format!("{upstream}/token"),
             &format!("{upstream}/profile"),
             &format!("{upstream}/roles"),
         );
-        let executors = cpa_exec::Executors {
-            claude: cpa_exec::claude::ClaudeExecutor::new(&upstream)
+        let executors = cliproxy_internal::providers::Executors {
+            claude: cliproxy_internal::providers::claude::ClaudeExecutor::new(&upstream)
                 .unwrap()
                 .with_oauth(oauth),
             codex: Default::default(),
@@ -4623,10 +4671,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let executors = |upstream: &str| cpa_exec::Executors {
-            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+        let executors = |upstream: &str| cliproxy_internal::providers::Executors {
+            claude: cliproxy_internal::providers::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
             codex: Default::default(),
-            meta: cpa_exec::meta::MetaExecutor::default().with_mint_url(&format!("{upstream}/mint")),
+            meta: cliproxy_internal::providers::meta::MetaExecutor::default()
+                .with_mint_url(&format!("{upstream}/mint")),
             xai: Default::default(),
         };
         let pick = serde_json::json!({"model": "muse-up", "auth_index": "idx-meta",
@@ -4706,7 +4755,7 @@ mod tests {
     /// from the credential's options.
     #[test]
     fn home_model_info_becomes_the_resolved_model() {
-        use cpa_core::exec::ResolvedSource;
+        use cliproxy_internal::execution::ResolvedSource;
         let thinking = serde_json::json!({"levels": ["high", "none"], "zero_allowed": true});
         let cases = [
             (
@@ -4731,7 +4780,7 @@ mod tests {
                 auth["metadata"] = serde_json::json!({"credential_options": {"models": [{"name": "upstream", "alias": "alias", "is-compat": true}]}});
             }
             let c = home_credential(serde_json::json!({"model_info": info, "auth": auth}), "alias");
-            let bound = cpa_server::capabilities::bind_home(&c, None).unwrap();
+            let bound = cliproxy_internal::runtime::capabilities::bind_home(&c, None).unwrap();
             assert_eq!(
                 (bound.source, bound.info.id.as_str()),
                 (ResolvedSource::Home, "upstream")
@@ -4763,7 +4812,7 @@ mod tests {
                 serde_json::json!({"model_info": info, "auth": {"id": "c1", "provider": "codex"}}),
                 "alias",
             );
-            let bound = cpa_server::capabilities::bind_home(&c, None).unwrap();
+            let bound = cliproxy_internal::runtime::capabilities::bind_home(&c, None).unwrap();
             let web_search = bound
                 .info
                 .raw
@@ -4783,7 +4832,7 @@ mod tests {
         });
         let auth = serde_json::json!({"id": "c1", "provider": "codex", "metadata": {"credential_options": {"models": [{"name": "upstream", "alias": "alias", "is-compat": true}]}}});
         let c = home_credential(serde_json::json!({"model_info": info, "auth": auth}), "alias");
-        let bound = cpa_server::capabilities::bind_home(&c, None).expect("Home's definition binds");
+        let bound = cliproxy_internal::runtime::capabilities::bind_home(&c, None).expect("Home's definition binds");
         let thinking = bound.info.thinking.as_ref().unwrap();
         assert_eq!(
             (thinking.levels.clone(), thinking.max, thinking.zero_allowed),
@@ -4798,7 +4847,10 @@ mod tests {
                 serde_json::json!({"model_info": info, "auth": {"id": "c1", "provider": "codex"}}),
                 "alias",
             );
-            assert!(cpa_server::capabilities::bind_home(&c, None).is_none(), "{info}");
+            assert!(
+                cliproxy_internal::runtime::capabilities::bind_home(&c, None).is_none(),
+                "{info}"
+            );
         }
         // Go decodes `model_info` into its typed struct: a mistyped field fails the reply.
         for info in [
@@ -4881,19 +4933,19 @@ mod tests {
             }
             let reply = serde_json::json!({"model": upstream, "model_info": {"id": "model"}, "auth": auth});
             let c = home_credential(reply, route);
-            let mut local = cpa_core::registry::ModelInfo {
+            let mut local = cliproxy_internal::catalog::ModelInfo {
                 id: if local_model.is_empty() { "model" } else { local_model }.into(),
                 kind: String::new(),
                 thinking: None,
                 raw: Map::new(),
             };
             local.raw.insert("is_compat".into(), true.into());
-            let local = cpa_core::exec::ResolvedModel {
+            let local = cliproxy_internal::execution::ResolvedModel {
                 info: local,
-                source: cpa_core::exec::ResolvedSource::ApiKey,
+                source: cliproxy_internal::execution::ResolvedSource::ApiKey,
             };
             for local in [Some(&local), None] {
-                let bound = cpa_server::capabilities::bind_home(&c, local).unwrap();
+                let bound = cliproxy_internal::runtime::capabilities::bind_home(&c, local).unwrap();
                 assert_eq!(
                     bound.is_compat(),
                     want,
@@ -4926,7 +4978,7 @@ mod tests {
             ("", false, false, MODEL, false),
         ];
         for (flag, local_support, oauth, info_id, want) in cases {
-            let cfg = cpa_core::config::Config::parse(if local_support { &local_config } else { "" }).unwrap();
+            let cfg = cliproxy_internal::config::Config::parse(if local_support { &local_config } else { "" }).unwrap();
             let auth = if oauth {
                 serde_json::json!({"id": "c1", "provider": "codex", "prefix": "tenant",
                     "attributes": {"auth_kind": "oauth", "plan_type": "free"}, "metadata": {"access_token": "fake-token"}})
@@ -4944,16 +4996,16 @@ mod tests {
                 serde_json::json!({"model": MODEL, "model_info": info, "auth": auth}),
                 &route,
             );
-            let local = cpa_server::capabilities::resolve(&cfg, &c, &route, MODEL);
-            let support = |bound: cpa_core::exec::ResolvedModel| {
-                cpa_common::thinking::ModelCaps::from(&bound.info).support_configuration_update
+            let local = cliproxy_internal::runtime::capabilities::resolve(&cfg, &c, &route, MODEL);
+            let support = |bound: cliproxy_internal::execution::ResolvedModel| {
+                cliproxy_internal::protocol::thinking::ModelCaps::from(&bound.info).support_configuration_update
             };
-            let execute = support(cpa_server::capabilities::bind_home(&c, local.as_ref()).unwrap());
+            let execute = support(cliproxy_internal::runtime::capabilities::bind_home(&c, local.as_ref()).unwrap());
             assert_eq!(
                 execute, want,
                 "flag {flag:?}, local {local_support}, oauth {oauth}, id {info_id}"
             );
-            let stream = support(cpa_server::capabilities::bind_home(&c, None).unwrap());
+            let stream = support(cliproxy_internal::runtime::capabilities::bind_home(&c, None).unwrap());
             assert_eq!(stream, want && !flag.is_empty(), "stream: flag {flag:?}");
         }
     }
@@ -4975,13 +5027,13 @@ mod tests {
                              "attributes": {"api_key": "fixture-key", "base_url": "http://127.0.0.1:9"},
                              "metadata": {"credential_options": options}}});
                 let c = home_credential(reply, "tenant/alias(high)");
-                let bound = cpa_server::capabilities::bind_home(&c, None).unwrap();
+                let bound = cliproxy_internal::runtime::capabilities::bind_home(&c, None).unwrap();
                 assert_eq!(bound.is_compat(), enabled, "{provider}");
             }
         }
         // The local binding comes from a Claude key: a `codex-api-key` model can no longer
         // set `is-compat` (#28), and the rule is the same for every provider.
-        let cfg = cpa_core::config::Config::parse(
+        let cfg = cliproxy_internal::config::Config::parse(
             "claude-api-key:\n  - api-key: fixture-key\n    base-url: http://127.0.0.1:9\n    prefix: tenant\n    models:\n      - name: upstream\n        alias: alias\n        is-compat: true\n",
         )
         .unwrap();
@@ -4997,12 +5049,13 @@ mod tests {
             }
             let reply = serde_json::json!({"model": "upstream(high)", "model_info": {"id": "upstream"}, "auth": auth});
             let c = home_credential(reply, "tenant/alias(high)");
-            let local = cpa_server::capabilities::resolve(&cfg, &c, "tenant/alias(high)", "upstream(high)");
+            let local =
+                cliproxy_internal::runtime::capabilities::resolve(&cfg, &c, "tenant/alias(high)", "upstream(high)");
             assert!(
                 local.as_ref().is_some_and(|l| l.is_compat()),
                 "the fixture binds local is-compat"
             );
-            let bound = cpa_server::capabilities::bind_home(&c, local.as_ref()).unwrap();
+            let bound = cliproxy_internal::runtime::capabilities::bind_home(&c, local.as_ref()).unwrap();
             assert!(!bound.is_compat(), "{options:?}");
         }
     }
@@ -5022,14 +5075,14 @@ mod tests {
 
     impl Picker {
         async fn new(home: &FakeHome) -> Self {
-            let executors = cpa_exec::Executors {
-                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+            let executors = cliproxy_internal::providers::Executors {
+                claude: cliproxy_internal::providers::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
                 codex: Default::default(),
                 meta: Default::default(),
                 xai: Default::default(),
             };
             let config = overlay(b"port: 0\n", None).unwrap();
-            let rt = Arc::new(cpa_server::testing::runtime(config, vec![], executors));
+            let rt = Arc::new(cliproxy_internal::gateway::testing::runtime(config, vec![], executors));
             let dispatcher = Dispatcher::new(&rt);
             let client = Client::new(home.config());
             fake::set_heartbeat(&client, true);
@@ -5037,7 +5090,7 @@ mod tests {
             let releases: Arc<Mutex<Vec<(String, i64)>>> = Arc::default();
             let sink = releases.clone();
             registry.set_release_sink(Some(Arc::new(
-                move |group: cpa_home::registry::ReleaseGroup, sequence| {
+                move |group: cliproxy_internal::home::registry::ReleaseGroup, sequence| {
                     let group = format!("{}/{}", group.credential_id, group.model);
                     sink.lock().unwrap().push((group, sequence));
                     None
@@ -5234,12 +5287,15 @@ mod tests {
         let home = sequenced("port: 0\n", vec![fake::bulk(reply)], Default::default()).await;
         let picker = Picker::new(&home).await;
         let grant = picker.pick().await.unwrap();
-        assert_eq!(grant.credential.attributes[cpa_server::remote::SESSION], "plugin-owned");
+        assert_eq!(
+            grant.credential.attributes[cliproxy_internal::gateway::remote::SESSION],
+            "plugin-owned"
+        );
         assert_eq!(
             grant.private.attributes,
             [
-                cpa_server::remote::PROVIDER,
-                cpa_core::config::credentials::HOME_AUTH_INDEX
+                cliproxy_internal::gateway::remote::PROVIDER,
+                cliproxy_internal::config::credentials::HOME_AUTH_INDEX
             ]
         );
         (grant.end)();
@@ -5298,7 +5354,7 @@ mod tests {
                 ("cred-1", "codex")
             );
             if accounted {
-                let index = &grant.credential.attributes[cpa_core::config::credentials::HOME_AUTH_INDEX];
+                let index = &grant.credential.attributes[cliproxy_internal::config::credentials::HOME_AUTH_INDEX];
                 assert_eq!(index, "cred-1");
             }
             let executions = picker.registry.freeze().executions;
@@ -5552,7 +5608,7 @@ mod tests {
         // An undecodable stored pool: Go's preparation fails reading it back.
         let pool_key = format!(
             "cpa:claude:credential-device-pool:{}",
-            cpa_home::kv::hash_key_part("idx-broken")
+            cliproxy_internal::home::kv::hash_key_part("idx-broken")
         );
         let home = scripted_with_kv(
             "port: 0\n",
@@ -5628,7 +5684,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn process_log_lines_reach_home_while_published() {
         // The real process logger (Go's format on stdout); idempotent across tests.
-        cpa_server::logging::init();
+        cliproxy_internal::gateway::logging::init();
         let home = scripted("port: 0\n", vec![]).await;
         let (_base, rt, shutdown, task) = node(&home).await;
         eventually("dispatch published", || {
@@ -5822,12 +5878,12 @@ mod tests {
         let home = LifetimeHome::start().await;
         let node = Bare::start(&home.home).await;
         let first = node.published().await;
-        assert!(cpa_home::current().is_some_and(|c| c.ptr_eq(&first.client)));
+        assert!(cliproxy_internal::home::current().is_some_and(|c| c.ptr_eq(&first.client)));
 
         home.beating.store(false, Ordering::SeqCst);
         eventually("the replacement subscription", || home.subscriptions() >= 2).await;
         assert!(
-            node.dispatcher.current().is_none() && cpa_home::current().is_none(),
+            node.dispatcher.current().is_none() && cliproxy_internal::home::current().is_none(),
             "the old lifetime stayed published before the replacement ACK"
         );
 
@@ -5839,7 +5895,7 @@ mod tests {
             "heartbeat failover replaced the execution registry"
         );
         assert!(!second.client.ptr_eq(&first.client));
-        assert!(cpa_home::current().is_some_and(|c| c.ptr_eq(&second.client)));
+        assert!(cliproxy_internal::home::current().is_some_and(|c| c.ptr_eq(&second.client)));
         node.stop().await;
     }
 
@@ -5858,7 +5914,7 @@ mod tests {
             .install(
                 pending,
                 // Go's `ScopeSpec{}`.
-                cpa_home::registry::ScopeSpec {
+                cliproxy_internal::home::registry::ScopeSpec {
                     request_id: String::new(),
                     credential_id: String::new(),
                     model: String::new(),
@@ -6030,7 +6086,7 @@ mod tests {
         let scope = registry
             .install(
                 pending,
-                cpa_home::registry::ScopeSpec {
+                cliproxy_internal::home::registry::ScopeSpec {
                     request_id: String::new(),
                     credential_id: String::new(),
                     model: String::new(),

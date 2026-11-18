@@ -22,19 +22,19 @@ Replacement: `malformed_management_json_returns_an_actionable_decode_error`. Mal
 
 Replacement: `integer_input_accepts_decimal_signs_and_refuses_overflow`. Retained explicit decimal integer grammar and overflow table. This was already a direct behavior test.
 
-## `crates/cpa-home/src/applog.rs::unsupported_matches_go`
+## `crates/cliproxy-internal/src/home/applog.rs::unsupported_matches_go`
 
 Replacement: `protocol_capability_errors_disable_forwarding_but_operational_errors_do_not`. Five directly constructed log events check semantic JSON, level, instant/offset, app-log destination, and optional request ID; capability positive/negative table owns disable policy.
 
-## `crates/cpa-home/src/cert_tests.rs::tls_config_errors_match_go`
+## `crates/cliproxy-internal/src/home/cert_tests.rs::tls_config_errors_match_go`
 
 Replacement: `tls_configuration_refuses_incomplete_keys_missing_ca_and_invalid_pem`. Same incomplete key pair, missing CA, and invalid PEM cases still refuse; category/actionable context replaces exact diagnostic prose.
 
-## `crates/cpa-home/src/gojson.rs::matches_go_marshal`
+## `crates/cliproxy-internal/src/home/gojson.rs::matches_go_marshal`
 
 Replacement: `object_writer_preserves_json_values_and_omits_empty_options`. Independent serde Value checks preserve string, number, array, null and omitted optional fields without key order/HTML escape requirements.
 
-## `crates/cpa-home/src/inflight.rs::rfc3339_nano_trims_like_go`
+## `crates/cliproxy-internal/src/home/inflight.rs::rfc3339_nano_trims_like_go`
 
 Replacement: `published_timestamps_round_trip_the_instant_at_nanosecond_precision`. 22 historical scenario inputs retain no recorded frames. Independent aggregate counts, whole-group partitioning, multipart/detail/revision/string caps, execution-backed safe details, deterministic encoding and truncation metadata. Additional directly typed snapshot and timestamp instant checks.
 
@@ -126,151 +126,151 @@ Replacement: `text_input_preserves_cursor_unicode_and_secret_masking`. Retained 
 
 Replacement: `a_failing_store_reports_the_failure_redacts_credentials_and_starts_nothing`. Private startup process must report postgres failure, redact password, create only its private spool, and open no listener. Go log sentence and successful exit requirement removed.
 
-## `crates/cpa-home/src/applog.rs::payloads_match_go`
+## `crates/cliproxy-internal/src/home/applog.rs::payloads_match_go`
 
 Replacement: `app_log_payloads_preserve_line_level_instant_and_optional_request_id`. Five directly constructed log events check semantic JSON, level, instant/offset, app-log destination, and optional request ID; capability positive/negative table owns disable policy.
 
-## `crates/cpa-home/src/client_tests.rs::dispatch_request_json_matches_go_bytes`
+## `crates/cliproxy-internal/src/home/client_tests.rs::dispatch_request_json_matches_go_bytes`
 
 Replacement: `dispatch_requests_preserve_required_fields_and_optional_distinctions`. Typed dispatch cases cover omissions/defaults/exclusions/retry/headers; direct Redis options and JWT claims; direct cluster tuples; all 16 subscription recovery combinations; handwritten 30-operation RESP table retains argument order, semantic JSON, missing/error replies, CAS latching, membership and deadlines.
 
-## `crates/cpa-home/src/client_tests.rs::kv_set_args_match_go`
+## `crates/cliproxy-internal/src/home/client_tests.rs::kv_set_args_match_go`
 
 Replacement: `redis_set_arguments_preserve_options_and_round_expiry_up`. Typed dispatch cases cover omissions/defaults/exclusions/retry/headers; direct Redis options and JWT claims; direct cluster tuples; all 16 subscription recovery combinations; handwritten 30-operation RESP table retains argument order, semantic JSON, missing/error replies, CAS latching, membership and deadlines.
 
-## `crates/cpa-home/src/client_tests.rs::jwt_claims_match_go`
+## `crates/cliproxy-internal/src/home/client_tests.rs::jwt_claims_match_go`
 
 Replacement: `enrollment_jwt_validates_required_claims_and_accepts_base64url_padding`. Typed dispatch cases cover omissions/defaults/exclusions/retry/headers; direct Redis options and JWT claims; direct cluster tuples; all 16 subscription recovery combinations; handwritten 30-operation RESP table retains argument order, semantic JSON, missing/error replies, CAS latching, membership and deadlines.
 
-## `crates/cpa-home/src/client_tests.rs::cluster_nodes_sort_like_go`
+## `crates/cliproxy-internal/src/home/client_tests.rs::cluster_nodes_sort_like_go`
 
 Replacement: `cluster_nodes_ignore_unusable_addresses_and_sort_by_load_then_address`. Typed dispatch cases cover omissions/defaults/exclusions/retry/headers; direct Redis options and JWT claims; direct cluster tuples; all 16 subscription recovery combinations; handwritten 30-operation RESP table retains argument order, semantic JSON, missing/error replies, CAS latching, membership and deadlines.
 
-## `crates/cpa-home/src/client_tests.rs::subscription_parameters_match_go_per_recovery_state`
+## `crates/cliproxy-internal/src/home/client_tests.rs::subscription_parameters_match_go_per_recovery_state`
 
 Replacement: `subscription_arguments_follow_revision_membership_and_recovery_state`. Typed dispatch cases cover omissions/defaults/exclusions/retry/headers; direct Redis options and JWT claims; direct cluster tuples; all 16 subscription recovery combinations; handwritten 30-operation RESP table retains argument order, semantic JSON, missing/error replies, CAS latching, membership and deadlines.
 
-## `crates/cpa-home/src/client_tests.rs::every_command_matches_go_on_the_wire`
+## `crates/cliproxy-internal/src/home/client_tests.rs::every_command_matches_go_on_the_wire`
 
 Replacement: `home_commands_preserve_resp_arguments_and_decode_reply_variants`. Typed dispatch cases cover omissions/defaults/exclusions/retry/headers; direct Redis options and JWT claims; direct cluster tuples; all 16 subscription recovery combinations; handwritten 30-operation RESP table retains argument order, semantic JSON, missing/error replies, CAS latching, membership and deadlines.
 
-## `crates/cpa-home/src/client_tests.rs::membership_args_and_takeover_eligibility_follow_go`
+## `crates/cliproxy-internal/src/home/client_tests.rs::membership_args_and_takeover_eligibility_follow_go`
 
 Replacement: `subscription_arguments_follow_revision_membership_and_recovery_state`. Typed dispatch cases cover omissions/defaults/exclusions/retry/headers; direct Redis options and JWT claims; direct cluster tuples; all 16 subscription recovery combinations; handwritten 30-operation RESP table retains argument order, semantic JSON, missing/error replies, CAS latching, membership and deadlines.
 
-## `crates/cpa-home/src/client_tests.rs::membership_errors_classify_like_go`
+## `crates/cliproxy-internal/src/home/client_tests.rs::membership_errors_classify_like_go`
 
 Replacement: `membership_errors_distinguish_takeover_refusal_from_legacy_arity`. Typed dispatch cases cover omissions/defaults/exclusions/retry/headers; direct Redis options and JWT claims; direct cluster tuples; all 16 subscription recovery combinations; handwritten 30-operation RESP table retains argument order, semantic JSON, missing/error replies, CAS latching, membership and deadlines.
 
-## `crates/cpa-home/src/client_tests.rs::production_timeouts_match_go`
+## `crates/cliproxy-internal/src/home/client_tests.rs::production_timeouts_match_go`
 
 Replacement: `production_operations_and_subscription_have_configured_deadlines`. Typed dispatch cases cover omissions/defaults/exclusions/retry/headers; direct Redis options and JWT claims; direct cluster tuples; all 16 subscription recovery combinations; handwritten 30-operation RESP table retains argument order, semantic JSON, missing/error replies, CAS latching, membership and deadlines.
 
-## `crates/cpa-home/src/config.rs::defaults_match_go_limiter_config`
+## `crates/cliproxy-internal/src/home/config.rs::defaults_match_go_limiter_config`
 
 Replacement: `limiter_defaults_define_the_home_protocol_policy`. Retained direct typed defaults, accepted lifecycle boundaries, invalid-value refusal, and explicit/default port policy. No output fixtures were involved.
 
-## `crates/cpa-home/src/config.rs::the_lifecycle_fixture_validates_like_go`
+## `crates/cliproxy-internal/src/home/config.rs::the_lifecycle_fixture_validates_like_go`
 
 Replacement: `lifecycle_configuration_accepts_valid_boundaries_and_refuses_invalid_values`. Retained direct typed defaults, accepted lifecycle boundaries, invalid-value refusal, and explicit/default port policy. No output fixtures were involved.
 
-## `crates/cpa-home/src/config.rs::home_port_defaults_like_go`
+## `crates/cliproxy-internal/src/home/config.rs::home_port_defaults_like_go`
 
 Replacement: `home_port_uses_default_unless_explicitly_overridden`. Retained direct typed defaults, accepted lifecycle boundaries, invalid-value refusal, and explicit/default port policy. No output fixtures were involved.
 
-## `crates/cpa-home/src/dispatch.rs::concurrency_fixture_round_trips`
+## `crates/cliproxy-internal/src/home/dispatch.rs::concurrency_fixture_round_trips`
 
 Replacement: `accounted_concurrency_tuple_requires_matching_credential_identity`. Direct accounted/busy tuples; identity refusal; error code/status/scope/message/retry table; malformed/absent/type-fallback variants; normalized model boundary/idempotence and typed optional envelope distinctions.
 
-## `crates/cpa-home/src/dispatch.rs::busy_fixture_maps_to_429_with_retry_after`
+## `crates/cliproxy-internal/src/home/dispatch.rs::busy_fixture_maps_to_429_with_retry_after`
 
 Replacement: `concurrency_busy_errors_preserve_retry_hints_and_round_up_public_seconds`. Direct accounted/busy tuples; identity refusal; error code/status/scope/message/retry table; malformed/absent/type-fallback variants; normalized model boundary/idempotence and typed optional envelope distinctions.
 
-## `crates/cpa-home/src/dispatch.rs::error_codes_map_to_go_statuses`
+## `crates/cliproxy-internal/src/home/dispatch.rs::error_codes_map_to_go_statuses`
 
 Replacement: `dispatch_error_codes_define_public_status_and_retry_policy`. Direct accounted/busy tuples; identity refusal; error code/status/scope/message/retry table; malformed/absent/type-fallback variants; normalized model boundary/idempotence and typed optional envelope distinctions.
 
-## `crates/cpa-home/src/dispatch.rs::dispatch_errors_match_go`
+## `crates/cliproxy-internal/src/home/dispatch.rs::dispatch_errors_match_go`
 
 Replacement: `dispatch_errors_preserve_scope_message_and_retry_metadata`. Direct accounted/busy tuples; identity refusal; error code/status/scope/message/retry table; malformed/absent/type-fallback variants; normalized model boundary/idempotence and typed optional envelope distinctions.
 
-## `crates/cpa-home/src/dispatch.rs::model_keys_match_go`
+## `crates/cliproxy-internal/src/home/dispatch.rs::model_keys_match_go`
 
 Replacement: `model_keys_normalize_recognized_suffixes_and_bound_shared_identity`. Direct accounted/busy tuples; identity refusal; error code/status/scope/message/retry table; malformed/absent/type-fallback variants; normalized model boundary/idempotence and typed optional envelope distinctions.
 
-## `crates/cpa-home/src/dispatch.rs::envelopes_match_go`
+## `crates/cliproxy-internal/src/home/dispatch.rs::envelopes_match_go`
 
 Replacement: `concurrency_envelopes_distinguish_absent_invalid_and_accounted_tuples`. Direct accounted/busy tuples; identity refusal; error code/status/scope/message/retry table; malformed/absent/type-fallback variants; normalized model boundary/idempotence and typed optional envelope distinctions.
 
-## `crates/cpa-home/src/error.rs::classifiers_match_go_message_checks`
+## `crates/cliproxy-internal/src/home/error.rs::classifiers_match_go_message_checks`
 
 Replacement: `server_error_classification_recognizes_protocol_capabilities`. Positive/negative protocol capability classifiers remain direct. Timeout and ambiguity use typed classifications rather than Go display equality.
 
-## `crates/cpa-home/src/inflight.rs::frames_match_go_bytes`
+## `crates/cliproxy-internal/src/home/inflight.rs::frames_match_go_bytes`
 
 Replacement: `snapshot_scenarios_preserve_complete_aggregates_with_bounded_safe_details`. 22 historical scenario inputs retain no recorded frames. Independent aggregate counts, whole-group partitioning, multipart/detail/revision/string caps, execution-backed safe details, deterministic encoding and truncation metadata. Additional directly typed snapshot and timestamp instant checks.
 
-## `crates/cpa-home/src/inflight.rs::fixture_frames_decode_into_the_contract`
+## `crates/cliproxy-internal/src/home/inflight.rs::fixture_frames_decode_into_the_contract`
 
 Replacement: `snapshot_counts_shared_credentials_and_preserves_each_request_instant`. 22 historical scenario inputs retain no recorded frames. Independent aggregate counts, whole-group partitioning, multipart/detail/revision/string caps, execution-backed safe details, deterministic encoding and truncation metadata. Additional directly typed snapshot and timestamp instant checks.
 
-## `crates/cpa-home/src/kv.rs::hash_and_log_prefix_match_go`
+## `crates/cliproxy-internal/src/home/kv.rs::hash_and_log_prefix_match_go`
 
 Replacement: `shared_key_namespace_hashes_are_stable_and_logs_hide_the_input`. Retained fixed shared-key hash and log-prefix assertions because stored Home key interoperability and input redaction require exact values.
 
-## `crates/cpa-home/src/refresh.rs::error_codes_map_to_go_statuses`
+## `crates/cliproxy-internal/src/home/refresh.rs::error_codes_map_to_go_statuses`
 
 Replacement: `refresh_errors_map_to_public_statuses`. Retained direct error-code to public-status table and malformed error-envelope behavior as Home protocol policy.
 
-## `crates/cpa-home/src/release.rs::frame_matches_go_fixture`
+## `crates/cliproxy-internal/src/home/release.rs::frame_matches_go_fixture`
 
 Replacement: `release_frame_carries_identity_model_and_cumulative_sequence`. Direct identity/model/cumulative release sequence cases 1, 3 and i64::MAX compare semantic payload fields.
 
-## `crates/cpa-home/src/resp.rs::encodes_like_go_encode_resp_array`
+## `crates/cliproxy-internal/src/home/resp.rs::encodes_like_go_encode_resp_array`
 
 Replacement: `resp_arrays_count_bytes_and_preserve_argument_order`. Retained exact RESP lengths and order as protocol bytes; added empty argument and multibyte UTF-8 example.
 
-## `crates/cpa-home/src/session_alias.rs::aliases_match_go`
+## `crates/cliproxy-internal/src/home/session_alias.rs::aliases_match_go`
 
 Replacement: `alias_groups_join_merge_expire_and_keep_hierarchy_separate`. Independent fixed-clock joining, shared prompt, expiry, solo-group join, prompt rotation, merge, blank/default TTL and hierarchy operations replace recorded aliases.
 
-## `crates/cpa-home/src/subscriber.rs::decodes_go_redis_pubsub_shapes`
+## `crates/cliproxy-internal/src/home/subscriber.rs::decodes_go_redis_pubsub_shapes`
 
 Replacement: `resp_pubsub_decodes_subscription_and_message_variants`. Retained directly authored RESP subscription/message variants as Redis protocol behavior.
 
-## `crates/cpa-store/src/lib.rs::selection_follows_go_main`
+## `crates/cliproxy-internal/src/storage/mod.rs::selection_follows_go_main`
 
 Replacement: `store_selection_respects_explicit_operator_precedence`. Retained direct environment/operator store-selection precedence assertions.
 
-## `crates/cpa-store/src/object.rs::endpoints_parse_like_go_main`
+## `crates/cliproxy-internal/src/storage/object.rs::endpoints_parse_like_go_main`
 
 Replacement: `s3_endpoints_accept_documented_operator_forms`. Retained supported endpoint/operator forms with unsupported-scheme category checks; local S3 error peers still supply location regions.
 
-## `crates/cpa-store/src/object.rs::regions_come_from_location_errors_like_minio`
+## `crates/cliproxy-internal/src/storage/object.rs::regions_come_from_location_errors_like_minio`
 
 Replacement: `s3_location_errors_supply_the_bucket_region`. Retained supported endpoint/operator forms with unsupported-scheme category checks; local S3 error peers still supply location regions.
 
-## `crates/cpa-store/src/pgconn.rs::sslmode_maps_to_pgx_verification`
+## `crates/cliproxy-internal/src/storage/pgconn.rs::sslmode_maps_to_pgx_verification`
 
 Replacement: `postgres_sslmode_enforces_certificate_and_hostname_policy`. Retained PostgreSQL sslmode certificate/hostname security policy and connection runtime parameter assertions.
 
-## `crates/cpa-store/src/pgconn.rs::other_keys_travel_as_runtime_parameters_like_pgx`
+## `crates/cliproxy-internal/src/storage/pgconn.rs::other_keys_travel_as_runtime_parameters_like_pgx`
 
 Replacement: `postgres_connection_parameters_preserve_application_settings`. Retained PostgreSQL sslmode certificate/hostname security policy and connection runtime parameter assertions.
 
-## `crates/cpa-store/src/postgres.rs::identifiers_and_paths_follow_go`
+## `crates/cliproxy-internal/src/storage/postgres.rs::identifiers_and_paths_follow_go`
 
 Replacement: `sql_identifiers_are_quoted_and_spool_paths_are_resolved`. Retained direct SQL quote escaping and supported Linux spool path resolution examples.
 
-## `crates/cpa-store/src/sigv4.rs::signatures_match_minio_go`
+## `crates/cliproxy-internal/src/storage/sigv4.rs::signatures_match_minio_go`
 
 Replacement: `s3_signatures_match_independent_aws_canonical_request_vectors`. Six independently signed AWS canonical request cases use Python stdlib hashlib/hmac and public placeholder keys. Explicit canonical URI/query/headers plus header case/order/whitespace metamorphic checks replace MinIO Go outputs.
 
-## `crates/cpa-store/tests/postgres.rs::postgres_store_reports_go_errors`
+## `crates/cliproxy-internal/tests/storage_postgres.rs::postgres_store_reports_go_errors`
 
 Replacement: `postgres_store_reports_actionable_failures`. Failure context and password redaction replace exact Go prose. Concurrent per-credential cooldown merge assertions remain; cluster-backed execution depends on installed PostgreSQL binaries.
 
-## `crates/cpa-store/tests/postgres.rs::cooldown_instances_merge_like_go`
+## `crates/cliproxy-internal/tests/storage_postgres.rs::cooldown_instances_merge_like_go`
 
 Replacement: `concurrent_cooldown_instances_merge_each_credential_state`. Failure context and password redaction replace exact Go prose. Concurrent per-credential cooldown merge assertions remain; cluster-backed execution depends on installed PostgreSQL binaries.
 
@@ -302,11 +302,11 @@ Removed obsolete owned Go JSON outputs, Home and SigV4 recorders, and all `clipr
 
 - Network namespace denies external networking and enables loopback only. CMAKE uses `/home/zak/.local/share/mise/installs/cmake/4.5.0/cmake-4.5.0-linux-x86_64/bin/cmake`; `CARGO_BUILD_JOBS=2 nice -n 19`; Cargo uses `--offline`.
 - `cargo test --offline -p cliproxy --bin cliproxy`: 146 passed, 0 failed, after final source changes. Log `/tmp/cliproxy-parity-migration/cli-tests.log`.
-- `cargo test --offline -p cpa-home --lib`: 132 passed, 0 failed in initial validation; final post-cleanup rerun recorded in `owned-final-tests.log`.
-- `cargo test --offline -p cpa-store --lib`: 41 passed, 0 failed in initial and final validation.
+- `cargo test --offline -p cliproxy-internal --lib`: 132 passed, 0 failed in initial validation; final post-cleanup rerun recorded in `owned-final-tests.log`.
+- `cargo test --offline -p cliproxy-internal --lib`: 41 passed, 0 failed in initial and final validation.
 - Final rerun: Home 132/132, store lib 41/41, store_mode 2/2. PostgreSQL test process reported 6/6 but five cluster-backed tests returned early because PostgreSQL binaries are absent; only the failure/redaction test executed its database-independent assertions. Log `/tmp/cliproxy-parity-migration/owned-final-tests.log`.
 - PostgreSQL executables were not found through PATH, `/usr/lib/postgresql`, `/usr`, `/opt`, or `/home/zak/.local`. Do not count skipped cluster-backed tests as executed.
-- `git diff --check -- crates/cliproxy crates/cpa-home crates/cpa-store`: passed. Owned changed Rust files formatted with rustfmt.
+- `git diff --check -- crates/cliproxy crates/cliproxy-internal crates/cliproxy-internal`: passed. Owned changed Rust files formatted with rustfmt.
 
 ## Parent integration follow-up
 

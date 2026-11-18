@@ -167,7 +167,7 @@ The legacy top-level `pprof` mapping works too. `/debug/pprof/` lists the routes
 `cmdline` returns NUL-separated arguments and `symbol` accepts program counters in
 the raw query or a POST body, separated by `+`. Go runtime profiles return plain-text
 `501` answers. CPU `profile?seconds=30` requires a Unix build with
-`cargo build --release -p cliproxy --features cpa-server/pprof` and returns a pprof
+`cargo build --release -p cliproxy --features cliproxy-internal/pprof` and returns a pprof
 protobuf. Default builds and the local Docker image exclude the
 profiler and symbol resolver. Their `symbol` route consumes POST bodies but returns
 only `num_symbols: 1`, without resolving any names, including shared-library names.
@@ -211,7 +211,7 @@ This fork has no native plugin support. A `plugins` section, in either layout an
 
 - `MANAGEMENT_PASSWORD`: the management key, instead of `management.secret-key`.
 - `TOKIO_WORKER_THREADS`: the number of request threads, instead of `worker-threads`.
-- `RUST_LOG`: overrides the log level, for example `RUST_LOG=debug`.
+- `RUST_LOG`: overrides the log level, for example `RUST_LOG=debug`. Module filters use the current Rust paths, such as `RUST_LOG=info,cliproxy_internal::providers=debug`.
 - `CLIPROXY_NO_UPDATE_CHECK=1`: disables explicit checks for the upstream Rust project's latest release.
 - A `.env` file in the working directory is loaded at start, as in CLIProxyAPI.
 - `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` keep the config and the account files in PostgreSQL, an S3-compatible bucket or a git repository, as in CLIProxyAPI. When the store has no config yet, the local one (or `config.example.yaml`) seeds it after a plaintext management key is replaced with its bcrypt hash and legacy settings that a v8 setting overrides are removed. A file in which the key's value would still appear as another setting's value, for example through a YAML anchor, is refused and the server does not start; comments and keys are not checked.

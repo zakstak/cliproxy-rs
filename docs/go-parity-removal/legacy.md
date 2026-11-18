@@ -1,6 +1,6 @@
 # Legacy management integration migration
 
-Owned target: old `crates/cpa-server/tests/legacy_go.rs` replaced by `legacy_contract.rs`. Runtime behavior is unchanged.
+Owned target: old `crates/cliproxy-internal/tests/legacy_go.rs` replaced by `legacy_contract.rs`. Runtime behavior is unchanged.
 
 | Original inventory entry | Disposition and independently specified replacement |
 | --- | --- |
@@ -14,7 +14,7 @@ Owned target: old `crates/cpa-server/tests/legacy_go.rs` replaced by `legacy_con
 All nine final contract tests pass with `CPA_TEST_NO_SKIP=1` in a network-denied user namespace with only loopback enabled. Log: `/tmp/cliproxy-parity-migration/legacy-final.log`.
 
 Command:
-`unshare --user --map-root-user --net sh -c 'ip link set lo up && CPA_TEST_NO_SKIP=1 CMAKE=/home/zak/.local/share/mise/installs/cmake/4.5.0/cmake-4.5.0-linux-x86_64/bin/cmake CARGO_BUILD_JOBS=2 nice -n19 cargo test --offline -p cpa-server --test legacy_contract'`
+`unshare --user --map-root-user --net sh -c 'ip link set lo up && CPA_TEST_NO_SKIP=1 CMAKE=/home/zak/.local/share/mise/installs/cmake/4.5.0/cmake-4.5.0-linux-x86_64/bin/cmake CARGO_BUILD_JOBS=2 nice -n19 cargo test --offline -p cliproxy-internal --test legacy_contract'`
 
 Before replay retirement, all 12 tests passed with the original full Go oracle and new independently authored tables active together; log `/tmp/cliproxy-parity-migration/legacy-old-and-new.log`. After retirement, added aggregate config-view/download checks and deterministic failed-save check all pass. Each server uses a private credential directory and fake keys; no provider endpoint is contacted.
 

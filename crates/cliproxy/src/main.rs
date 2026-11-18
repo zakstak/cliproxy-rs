@@ -3,7 +3,7 @@ mod dotenv;
 mod home;
 mod tui;
 
-use cpa_core::gostr::GoStr;
+use cliproxy_internal::text::GoStr;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
-use cpa_core::config::Config;
-use cpa_exec::Executors;
-use cpa_exec::claude::{ClaudeExecutor, DEFAULT_BASE_URL};
-use cpa_server::Runtime;
-use cpa_server::listener::bind;
+use cliproxy_internal::config::Config;
+use cliproxy_internal::gateway::listener::bind;
+use cliproxy_internal::providers::Executors;
+use cliproxy_internal::providers::claude::{ClaudeExecutor, DEFAULT_BASE_URL};
+use cliproxy_internal::runtime::Runtime;
 
 /// Same strings as the management `X-CPA-*` headers.
 const VERSION: &str = concat!("cliproxy-rs-", env!("CARGO_PKG_VERSION"));
@@ -457,7 +457,7 @@ fn runtime(config: Option<&Path>) -> io::Result<tokio::runtime::Runtime> {
 /// `worker-threads` as written in `path`, if any.
 fn configured_workers(path: &Path) -> Option<u64> {
     let raw = std::fs::read_to_string(path).ok()?;
-    let doc = cpa_core::config::parse_yaml(&raw).ok()?;
+    let doc = cliproxy_internal::config::parse_yaml(&raw).ok()?;
     doc.get("worker-threads")?.as_u64()
 }
 
@@ -542,7 +542,7 @@ fn flag_error(cmd: &mut clap::Command, message: &str) -> ! {
 }
 
 fn main() -> anyhow::Result<()> {
-    cpa_server::logging::init();
+    cliproxy_internal::gateway::logging::init();
     let raw: Vec<String> = std::env::args().collect();
     // First, so .env, the default config and relative paths resolve there.
     let working_dir = prescan_value(&raw[1..], "working-dir");
@@ -554,7 +554,7 @@ fn main() -> anyhow::Result<()> {
     // An empty value is left for the parse to reject.
     let log_file = prescan_value(&raw[1..], "log-file");
     if let Some(path) = log_file.as_deref().filter(|p| !p.is_empty()) {
-        cpa_server::logging::set_log_file(path.into()).context("open process log")?;
+        cliproxy_internal::gateway::logging::set_log_file(path.into()).context("open process log")?;
     }
     if raw.get(1).map(String::as_str) == Some("discover") {
         let flags = go_flags(&DiscoverArgs::command(), raw.into_iter().skip(1))
@@ -653,7 +653,7 @@ mod heap_trim {
                     break;
                 }
             }
-            cpa_common::idle::park().await;
+            cliproxy_internal::protocol::idle::park().await;
         }
     }
 
@@ -689,7 +689,7 @@ mod heap_trim {
 
     impl Drop for Done {
         fn drop(&mut self) {
-            cpa_common::idle::activity();
+            cliproxy_internal::protocol::idle::activity();
         }
     }
 }
@@ -718,8 +718,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // Go main: PGSTORE_*, OBJECTSTORE_* or GITSTORE_* keep config and auth files in a
     // remote store, served from its local mirror (never in Home mode).
     let env = |key: &str| std::env::var(key).ok();
-    let store = match cpa_store::select(&env, &wd, home) {
-        Some(selection) => match cpa_store::bootstrap(selection, &wd).await {
+    let store = match cliproxy_internal::storage::select(&env, &wd, home) {
+        Some(selection) => match cliproxy_internal::storage::bootstrap(selection, &wd).await {
             Ok(store) => Some(store),
             Err(line) => {
                 tracing::error!("{line}");
@@ -774,7 +774,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         None => !cloud || cloud_config_present(&config_path, &config),
     };
     // Go ConfigureLogOutput and SetLogLevel, before any login command.
-    cpa_server::logging::configure(&config);
+    cliproxy_internal::gateway::logging::configure(&config);
     tracing::info!("{}", banner());
     let before = store.as_ref().map(|store| auth_files(&store.auth_dir));
     let ran = command(&args, &config).await;
@@ -903,10 +903,10 @@ async fn standalone_tui(
     config_path: PathBuf,
     password: String,
     local_model: bool,
-    store: Option<cpa_store::Store>,
-    home_config: Option<cpa_home::HomeConfig>,
+    store: Option<cliproxy_internal::storage::Store>,
+    home_config: Option<cliproxy_internal::home::HomeConfig>,
 ) {
-    let hook = cpa_server::logging::capture(2000);
+    let hook = cliproxy_internal::gateway::logging::capture(2000);
     let (quiet, out): (Option<QuietStdio>, Box<dyn io::Write + Send>) = match QuietStdio::start() {
         Ok((guard, tty)) => (Some(guard), Box::new(tty)),
         Err(_) => (None, Box::new(io::stdout())),
@@ -951,7 +951,7 @@ async fn standalone_tui(
     };
     // Restores stdout and stderr.
     drop(quiet);
-    cpa_server::logging::release();
+    cliproxy_internal::gateway::logging::release();
     if let Err(e) = result {
         eprintln!("TUI error: {e}");
     }
@@ -974,7 +974,10 @@ fn auth_files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 
 /// Go's token store `Save` after a login command: what the login wrote goes to the
 /// remote store, or the next bootstrap would not know it.
-async fn persist_login(store: &cpa_store::Store, before: &std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+async fn persist_login(
+    store: &cliproxy_internal::storage::Store,
+    before: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
+) {
     for (path, data) in auth_files(&store.auth_dir) {
         if before.get(&path) == Some(&data) {
             continue;
@@ -1007,7 +1010,7 @@ enum Ran {
 /// directory (even when it failed), only the file a `-siwc-bind` bound, and nothing for
 /// a failed one.
 async fn persist_command(
-    store: &cpa_store::Store,
+    store: &cliproxy_internal::storage::Store,
     before: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
     ran: &anyhow::Result<Ran>,
 ) {
@@ -1020,7 +1023,7 @@ async fn persist_command(
 
 /// Saves the file `-siwc-bind` bound, under the store's spelling of the auth directory
 /// (the bound path has its symlinks resolved).
-async fn persist_bound(store: &cpa_store::Store, path: &Path) {
+async fn persist_bound(store: &cliproxy_internal::storage::Store, path: &Path) {
     let path = std::fs::canonicalize(&store.auth_dir)
         .ok()
         .and_then(|dir| path.strip_prefix(dir).ok().map(|rel| store.auth_dir.join(rel)))
@@ -1055,24 +1058,24 @@ fn removed_command(args: &Args) -> Option<(&'static str, &'static str)> {
 /// migration guidance and changes nothing.
 async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
     if let Some((provider, flag)) = removed_command(args) {
-        anyhow::bail!(cpa_core::removed::operation_error(provider, flag));
+        anyhow::bail!(cliproxy_internal::removed::operation_error(provider, flag));
     }
     if !args.siwc_bind.is_empty() {
         // Go DoSIWCBind: failures are reported and the command still exits normally,
         // except a busy callback port (ErrPortInUse's code 13).
-        let options = cpa_exec::codex_oauth::LoginOptions {
+        let options = cliproxy_internal::providers::codex_oauth::LoginOptions {
             no_browser: args.no_browser,
             callback_port: args.oauth_callback_port,
         };
-        match cpa_exec::codex_siwc_bind::bind(config, &args.siwc_bind, &options).await {
+        match cliproxy_internal::providers::codex_siwc_bind::bind(config, &args.siwc_bind, &options).await {
             Ok(path) => {
                 println!("SIWC credentials bound and saved to {}", path.display());
                 println!("Sign in with ChatGPT authentication successful!");
                 return Ok(Ran::Bound(Some(path)));
             }
-            Err(cpa_exec::codex_siwc_bind::BindError::Log(line)) => tracing::error!("{line}"),
-            Err(cpa_exec::codex_siwc_bind::BindError::Print(line)) => println!("{line}"),
-            Err(cpa_exec::codex_siwc_bind::BindError::PortInUse) => {
+            Err(cliproxy_internal::providers::codex_siwc_bind::BindError::Log(line)) => tracing::error!("{line}"),
+            Err(cliproxy_internal::providers::codex_siwc_bind::BindError::Print(line)) => println!("{line}"),
+            Err(cliproxy_internal::providers::codex_siwc_bind::BindError::PortInUse) => {
                 tracing::error!(
                     "The required port is already in use. Please close any applications using port 3000 and try again."
                 );
@@ -1082,34 +1085,34 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
         return Ok(Ran::Bound(None));
     }
     if args.codex_login || args.codex_device_login {
-        let options = cpa_exec::codex_oauth::LoginOptions {
+        let options = cliproxy_internal::providers::codex_oauth::LoginOptions {
             no_browser: args.no_browser,
             callback_port: match args.oauth_callback_port {
-                0 => cpa_exec::codex_oauth::DEFAULT_CALLBACK_PORT,
+                0 => cliproxy_internal::providers::codex_oauth::DEFAULT_CALLBACK_PORT,
                 port => port,
             },
         };
         let path = if args.codex_login {
-            cpa_exec::codex_oauth::login(&config.auth_dir, &options).await?
+            cliproxy_internal::providers::codex_oauth::login(&config.auth_dir, &options).await?
         } else {
-            cpa_exec::codex_oauth::device_login(&config.auth_dir, &options).await?
+            cliproxy_internal::providers::codex_oauth::device_login(&config.auth_dir, &options).await?
         };
         println!("Authentication saved to {}", path.display());
         println!("Codex authentication successful!");
         return Ok(Ran::Login);
     }
     if args.claude_login {
-        let options = cpa_exec::claude_login::LoginOptions {
+        let options = cliproxy_internal::providers::claude_login::LoginOptions {
             no_browser: args.no_browser,
             callback_port: match args.oauth_callback_port {
-                0 => cpa_exec::claude_login::DEFAULT_CALLBACK_PORT,
+                0 => cliproxy_internal::providers::claude_login::DEFAULT_CALLBACK_PORT,
                 port => port,
             },
         };
-        if let Err(error) = cpa_exec::claude_login::login(&config.auth_dir, &options).await {
+        if let Err(error) = cliproxy_internal::providers::claude_login::login(&config.auth_dir, &options).await {
             let message = String::from_utf8_lossy(&error.body).into_owned();
             // DoClaudeLogin: a busy callback port exits with ErrPortInUse's code 13.
-            if message.starts_with(cpa_exec::claude_login::PORT_IN_USE) {
+            if message.starts_with(cliproxy_internal::providers::claude_login::PORT_IN_USE) {
                 tracing::error!(
                     "The required port is already in use. Please close any applications using port 3000 and try again."
                 );
@@ -1121,13 +1124,13 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
     }
     if args.xai_login {
         // Go DoXAILogin: a failure is logged and the command still exits normally.
-        if let Err(error) = cpa_exec::xai_auth::login(config, args.no_browser).await {
+        if let Err(error) = cliproxy_internal::providers::xai_auth::login(config, args.no_browser).await {
             tracing::error!("xAI authentication failed: {}", String::from_utf8_lossy(&error.body));
         }
         return Ok(Ran::Login);
     }
     if args.meta_login {
-        cpa_exec::meta_auth::login(config, args.no_browser).await?;
+        cliproxy_internal::providers::meta_auth::login(config, args.no_browser).await?;
         return Ok(Ran::Login);
     }
     Ok(Ran::Nothing)
@@ -1174,21 +1177,28 @@ fn ensure_auth_dir(dir: &Path) -> anyhow::Result<()> {
 
 /// The served routes. In Home mode the config comes from Home and every management
 /// route answers 404 (Go `managementAvailable`), so the Management API is not mounted.
-fn app(rt: &Arc<Runtime>, management: &Arc<cpa_server::management::Management>, home: bool) -> axum::Router {
+fn app(
+    rt: &Arc<Runtime>,
+    management: &Arc<cliproxy_internal::gateway::management::Management>,
+    home: bool,
+) -> axum::Router {
     let app = if home {
-        cpa_server::router(rt.clone()).layer(axum::middleware::from_fn_with_state(
+        cliproxy_internal::gateway::router(rt.clone()).layer(axum::middleware::from_fn_with_state(
             rt.clone(),
-            cpa_server::remote::gate,
+            cliproxy_internal::gateway::remote::gate,
         ))
     } else {
-        let app = cpa_server::app(rt.clone(), cpa_server::management::router(management.clone()));
-        cpa_server::safe_mode::router(rt, app)
+        let app = cliproxy_internal::gateway::app(
+            rt.clone(),
+            cliproxy_internal::gateway::management::router(management.clone()),
+        );
+        cliproxy_internal::gateway::safe_mode::router(rt, app)
     };
     // Go applies its CORS middleware to every route, not only management.
-    let app = app.layer(axum::middleware::from_fn(cpa_server::management::cors));
-    let app = cpa_server::request_logging::router(management, app);
-    let app = cpa_server::body_limit::layer(rt, app);
-    cpa_server::observability::router(rt, app)
+    let app = app.layer(axum::middleware::from_fn(cliproxy_internal::gateway::management::cors));
+    let app = cliproxy_internal::gateway::request_logging::router(management, app);
+    let app = cliproxy_internal::gateway::body_limit::layer(rt, app);
+    cliproxy_internal::gateway::observability::router(rt, app)
 }
 
 /// `listening` (standalone TUI only) receives the bound address and whether TLS is on.
@@ -1198,8 +1208,8 @@ async fn serve(
     config_path: PathBuf,
     password: String,
     local_model: bool,
-    store: Option<cpa_store::Store>,
-    home_config: Option<cpa_home::HomeConfig>,
+    store: Option<cliproxy_internal::storage::Store>,
+    home_config: Option<cliproxy_internal::home::HomeConfig>,
     shutdown: impl std::future::Future<Output = ()>,
     listening: Option<tokio::sync::oneshot::Sender<(SocketAddr, bool)>>,
 ) -> anyhow::Result<()> {
@@ -1216,9 +1226,9 @@ async fn serve(
     let (credentials, read) = match home_config {
         Some(_) => Default::default(),
         None => {
-            let scan = cpa_core::config::credentials::scan_auth_dir(&config);
+            let scan = cliproxy_internal::config::credentials::scan_auth_dir(&config);
             let mut all = scan.credentials;
-            all.extend(cpa_core::config::credentials::from_config(&config));
+            all.extend(cliproxy_internal::config::credentials::from_config(&config));
             (all, scan.read)
         }
     };
@@ -1227,7 +1237,7 @@ async fn serve(
         bind(&config.host, config.port).with_context(|| format!("binding {}:{}", config.host, config.port))?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
     // Go `Server.Start`: TLS is validated after the listener is open.
-    let tls = cpa_server::listener::tls_acceptor(&config)?;
+    let tls = cliproxy_internal::gateway::listener::tls_acceptor(&config)?;
     tracing::info!(addr = %listener.local_addr()?, tls = tls.is_some(), "listening");
     let standalone = listening.is_some();
     if let Some(listening) = listening {
@@ -1235,7 +1245,7 @@ async fn serve(
     }
     let executors = Executors {
         claude: ClaudeExecutor::new(DEFAULT_BASE_URL)?,
-        codex: cpa_exec::codex::CodexExecutor::new()?,
+        codex: cliproxy_internal::providers::codex::CodexExecutor::new()?,
         meta: Default::default(),
         xai: Default::default(),
     };
@@ -1248,7 +1258,7 @@ async fn serve(
         rt.set_cooldown_backend(cooldown);
     }
     // Go `misc.StartAntigravityVersionUpdater` and `startModelCatalogUpdaters`.
-    cpa_server::model_updater::start(&rt, home_config.is_some());
+    cliproxy_internal::gateway::model_updater::start(&rt, home_config.is_some());
     let home = home_config.map(|home_config| {
         let dispatcher = Arc::new(home::Dispatcher::new(&rt));
         rt.set_remote_dispatch(Some(dispatcher.clone()));
@@ -1258,24 +1268,26 @@ async fn serve(
     });
     // Translators and thinking validation read model capabilities through the global
     // overlay; without it they see only the static catalog.
-    cpa_server::install_registry(&rt);
+    cliproxy_internal::runtime::registry::install(&rt);
     rt.start_auto_refresh();
-    let options = cpa_server::management::Options {
+    let options = cliproxy_internal::gateway::management::Options {
         local_password: password,
         standalone,
         store: store.map(|store| store.persister),
         ..Default::default()
     };
-    let management = cpa_server::management::Management::with_options(rt.clone(), config_path, options);
+    let management = cliproxy_internal::gateway::management::Management::with_options(rt.clone(), config_path, options);
     if home.is_some() {
         // Go enables the usage queue in Home mode whatever the management secret
         // (`redisqueue.SetEnabled(... || cfg.Home.Enabled)`); the forwarder drains it.
         rt.usage_queue().configure(true, &rt.config());
     }
-    let pprof = cpa_server::pprof::Server::start(&rt);
+    let pprof = cliproxy_internal::gateway::pprof::Server::start(&rt);
     // Home mode: the config comes from Home, and management answers 404 (Go
     // `managementAvailable`).
-    let _watcher = home.is_none().then(|| cpa_server::watching::start(&management));
+    let _watcher = home
+        .is_none()
+        .then(|| cliproxy_internal::gateway::watching::start(&management));
     let advertiser = {
         let rt = rt.clone();
         // The served transport decides `tls=`: HTTPS exactly when server.tls loaded.
@@ -1287,7 +1299,7 @@ async fn serve(
     let app = heap_trim::layer(app);
     // Go's listener also serves the Redis protocol (usage queue) to management clients;
     // in Home mode it answers "ERR redis usage output disabled in home mode".
-    let mut server = Box::pin(cpa_server::listener::serve_with_resp(
+    let mut server = Box::pin(cliproxy_internal::gateway::listener::serve_with_resp(
         listener,
         app,
         tls,
@@ -1357,7 +1369,7 @@ mod tests {
     #[tokio::test]
     async fn siwc_bind_saves_only_the_bound_file() {
         struct Recorder(std::sync::Mutex<Vec<Vec<PathBuf>>>, PathBuf);
-        impl cpa_server::persist::StorePersister for Recorder {
+        impl cliproxy_internal::persistence::StorePersister for Recorder {
             fn persist_config(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
                 Box::pin(async { Ok(()) })
             }
@@ -1393,7 +1405,7 @@ mod tests {
         std::fs::write(auth.join("c.json"), r#"{"use_siwc":true}"#).unwrap();
         std::fs::write(auth.join("other.json"), "{}").unwrap();
         let recorder = Arc::new(Recorder(Default::default(), auth.clone()));
-        let store = cpa_store::Store {
+        let store = cliproxy_internal::storage::Store {
             config_path: root.join("config.yaml"),
             auth_dir: auth.clone(),
             persister: recorder.clone(),
@@ -1782,8 +1794,12 @@ mod tests {
                 meta: Default::default(),
                 xai: Default::default(),
             };
-            let rt = Arc::new(cpa_server::testing::runtime(config.clone(), Vec::new(), executors));
-            let options = cpa_server::management::Options {
+            let rt = Arc::new(cliproxy_internal::gateway::testing::runtime(
+                config.clone(),
+                Vec::new(),
+                executors,
+            ));
+            let options = cliproxy_internal::gateway::management::Options {
                 // MANAGEMENT_PASSWORD; with no config secret it alone decides availability.
                 management_password: Some(if enabled {
                     "fake-management-only".into()
@@ -1794,7 +1810,8 @@ mod tests {
                 log_dir: Some(dir.join("logs")),
                 ..Default::default()
             };
-            let management = cpa_server::management::Management::with_options(rt.clone(), path.clone(), options);
+            let management =
+                cliproxy_internal::gateway::management::Management::with_options(rt.clone(), path.clone(), options);
             let mut request = axum::http::Request::post("/v8/management/oauth/siwc/bind")
                 .header("content-type", "application/json")
                 .extension(axum::extract::ConnectInfo(SocketAddr::from((

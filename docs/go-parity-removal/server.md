@@ -235,7 +235,7 @@ Final targets: `tests/body_limits.rs` (formerly body_limit_go.rs), `tests/media_
 
 ## Cooldown fixture failure during final validation
 
-The full workspace run exposed a timing assumption in the unchanged `migrated_leases` tests in [model_cooldown_keys.rs](../../crates/cpa-server/tests/model_cooldown_keys.rs). The fixture saved a cooldown that expired after 100 ms, then loaded it from disk. If disk IO consumed that interval, the scheduler correctly ignored the expired record. The alias publication then had no state to migrate. A later failure created a new cooldown under `m`, while the test expected the previously migrated key `M`.
+The full workspace run exposed a timing assumption in the unchanged `migrated_leases` tests in [model_cooldown_keys.rs](../../crates/cliproxy-internal/tests/gateway_model_cooldown_keys.rs). The fixture saved a cooldown that expired after 100 ms, then loaded it from disk. If disk IO consumed that interval, the scheduler correctly ignored the expired record. The alias publication then had no state to migrate. A later failure created a new cooldown under `m`, while the test expected the previously migrated key `M`.
 
 A temporary 150 ms delay before restoring only the `old-key-failure` fixture reproduced the exact failure. The cooldown had model `m`, status 429, and about 600 seconds remaining. The same temporary delay passed after the fixture correction.
 
@@ -248,7 +248,7 @@ unshare --user --map-current-user --keep-caps --net sh -c '
   ip link set lo up &&
   setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
     env CARGO_BUILD_JOBS=2 CARGO_NET_OFFLINE=true \
-    cargo test -p cpa-server --test model_cooldown_keys -- --nocapture
+    cargo test -p cliproxy-internal --test model_cooldown_keys -- --nocapture
 '
 ```
 

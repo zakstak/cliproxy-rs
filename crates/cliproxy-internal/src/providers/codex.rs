@@ -1,0 +1,874 @@
+//! Codex executor: OpenAI Responses on the ChatGPT Codex backend, with an OAuth token
+//! (bearer + `Chatgpt-Account-Id`) or a configured API key (`codex-api-key`).
+//!
+//! HTTP paths port codex_executor_execute.go and codex_executor_stream.go. The WebSocket
+//! upstream lives in `codex_ws`.
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::config::Config;
+use crate::credential::{Credential, MetadataPatch};
+use crate::execution::{
+    ExecError, ExecRequest, ExecResponse, ExecSession, ExecStream, FailureScope, Operation, ResponseBody,
+};
+use crate::format::Format;
+use bytes::Bytes;
+use chrono::Utc;
+use futures_util::StreamExt;
+use http::HeaderMap;
+
+use crate::protocol::rawjson;
+use crate::providers::codex_capture::Wire;
+use crate::providers::codex_oauth::{self, CodexOAuth};
+use crate::providers::codex_quota::QuotaSignals;
+use crate::providers::codex_request::{self as request, Settings, View};
+use crate::providers::codex_response::{self as response, Bootstrap, Processor};
+
+pub use crate::providers::codex_request::DEFAULT_BASE_URL;
+pub use crate::providers::codex_ws::{
+    Authority, ClientFrames, InterruptError, NO_ACTIVE_UPSTREAM, Refusal, SessionLosses, SteeringInput, TakenLoss,
+    handshake_metadata_event,
+};
+pub use native::APPEND_REFUSED;
+
+pub struct CodexExecutor {
+    /// Its own TLS client for chatgpt.com (no browser fingerprint, #26), Go's standard
+    /// transport elsewhere, per proxy.
+    pub(crate) transport: crate::providers::codex_tls::Transport,
+    oauth: CodexOAuth,
+    quota: Arc<QuotaSignals>,
+    /// Upstream Responses WebSocket sockets per downstream session.
+    pub(crate) ws: Arc<crate::providers::codex_ws::Pool>,
+    /// Claude clients' reasoning replay (process-wide in Go).
+    /// Base for OAuth Alpha Search, which Go never derives from credential attributes.
+    alpha_base_url: String,
+    /// Live call, sideband and hangup URLs (`codex_live`).
+    pub(crate) live: crate::providers::codex_live::Endpoints,
+}
+
+/// The production executor. Construction only fails if the TLS backend cannot initialise.
+impl Default for CodexExecutor {
+    fn default() -> Self {
+        Self::new().expect("codex HTTP client")
+    }
+}
+
+impl CodexExecutor {
+    /// Production transports: the chatgpt.com client, Go's standard transport
+    /// elsewhere, both per effective proxy (crate::providers::proxy). Token refreshes use the
+    /// standard transport for the credential's effective proxy.
+    pub fn new() -> wreq::Result<Self> {
+        Ok(Self::with_transport(
+            crate::providers::codex_tls::Transport::new(crate::providers::proxy::Hooks::default()),
+            CodexOAuth::new(crate::providers::proxy::default_client()),
+        ))
+    }
+
+    /// Caller-built transports. Tests pass a plain client and an OAuth service pointed at
+    /// a local mock so nothing reaches OpenAI. Unproxied non-chatgpt.com requests use
+    /// `client`.
+    pub fn with_client(client: wreq::Client, oauth: CodexOAuth) -> Self {
+        Self::with_transport(crate::providers::codex_tls::Transport::with_default(client), oauth)
+    }
+
+    fn with_transport(transport: crate::providers::codex_tls::Transport, oauth: CodexOAuth) -> Self {
+        Self {
+            transport,
+            oauth,
+            quota: Arc::default(),
+            ws: Default::default(),
+            alpha_base_url: DEFAULT_BASE_URL.into(),
+            live: Default::default(),
+        }
+    }
+
+    /// Test hook: where OAuth Alpha Search requests go.
+    pub fn with_alpha_base_url(mut self, base: impl Into<String>) -> Self {
+        self.alpha_base_url = base.into().trim_end_matches('/').to_owned();
+        self
+    }
+
+    /// Passive quota snapshots per credential (M4-0016), for the management API.
+    pub fn quota(&self) -> &QuotaSignals {
+        &self.quota
+    }
+
+    pub(crate) fn quota_handle(&self) -> Arc<QuotaSignals> {
+        self.quota.clone()
+    }
+
+    /// One turn of a downstream Responses WebSocket session (`CodexAutoExecutor`). Every
+    /// turn is the client's own `response.create` frame (`codex_native.rs`): credentials
+    /// with `websockets` carry it on a pooled upstream socket, and others send a first
+    /// turn as an HTTP stream with the session as prompt-cache identity. A continuation
+    /// without an upstream socket gets the replay close, and any other frame is refused.
+    pub async fn execute_in_session(
+        &self,
+        credential: &Credential,
+        req: ExecRequest,
+        cfg: &Config,
+        session: &ExecSession,
+    ) -> Result<ExecResponse, ExecError> {
+        check_response_format(&req)?;
+        check_native_body(&req)?;
+        crate::providers::codex_siwc::require_token(credential)?;
+        crate::providers::codex_identity::check_credential(credential)?;
+        let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
+        let settings = Settings::scoped(cfg, &view);
+        settings.refuse_compat(&req, credential)?;
+        if view.websockets() {
+            return self.stream_ws(&view, &settings, req, session, cfg).await;
+        }
+        if session.continuation {
+            return Err(ExecError::replay_required());
+        }
+        match native::route_ws(&view, &req) {
+            Some(profile) => self.native_ws_http(&view, &settings, req, profile, &session.id).await,
+            None => Err(native::refused_frame(&req.body)),
+        }
+    }
+
+    /// Whether `req` on `credential` takes the native HTTP route (`codex_native.rs`). The
+    /// server then gives the executor the client's own bytes and keeps request and
+    /// response mutation hooks away from the attempt.
+    pub fn native_http(credential: &Credential, req: &ExecRequest) -> bool {
+        native::eligible(&View::new(credential), req).is_some()
+    }
+
+    /// Whether a WebSocket turn whose client frame is `frame` takes the native WebSocket
+    /// route on `credential` (`codex_native.rs`, #24): the same handover as
+    /// [`Self::native_http`], for a `response.create` on a credential with `websockets`.
+    pub fn native_ws(credential: &Credential, req: &ExecRequest, frame: &[u8]) -> bool {
+        native::eligible_ws(&View::new(credential), req, frame).is_some()
+    }
+
+    /// The refusal of a client Responses request a built-in Codex credential cannot carry
+    /// natively: on a WebSocket turn, a frame other than `response.create` (such as Go's
+    /// `response.append`); over HTTP, a request outside the native route. No rewritten
+    /// request stands in (#28).
+    pub fn refused_native(turn: bool, body: &[u8]) -> ExecError {
+        if turn {
+            return native::refused_frame(body);
+        }
+        ExecError::local(
+            400,
+            FailureScope::Request,
+            "this Responses request cannot be sent to Codex natively; send a Responses generation or compaction",
+        )
+    }
+
+    /// Whether `source` and `response` are the native route's formats: Responses on both
+    /// sides, in either spelling (`openai-response` or `codex`). A caller that builds a
+    /// request for the native route (`dispatch::NativeRequest`) uses this, so its
+    /// eligibility cannot drift from the executor's.
+    pub fn responses_pair(source: Format, response: Format) -> bool {
+        request::responses_pair(source, response)
+    }
+
+    /// Whether a WebSocket client frame is one the native WebSocket route serves (a
+    /// `response.create`), whatever the credential: with [`Self::native_profile`] and
+    /// [`Self::upstream_websocket`], the server's test of whether a pool can serve a turn
+    /// natively.
+    pub fn native_ws_frame(frame: &[u8]) -> bool {
+        native::creates(frame)
+    }
+
+    /// Whether `credential` is on a native profile (every profile is, `siwc` included since
+    /// #28), whatever the request: the server's test of whether a pool can serve a
+    /// Responses request natively.
+    pub fn native_profile(credential: &Credential) -> bool {
+        native::Profile::of(&View::new(credential)).is_some()
+    }
+
+    /// Whether `credential` keeps upstream state on a WebSocket (Go:
+    /// `websocketUpstreamSupportsIncrementalInput`).
+    pub fn upstream_websocket(credential: &Credential) -> bool {
+        View::new(credential).websockets()
+    }
+
+    /// `upstream.codex.response-steering` as the Responses WebSocket handler reads it
+    /// (Go `SDKConfig.CodexResponseSteering`), shared by every credential kind.
+    pub fn response_steering_configured(cfg: &Config) -> bool {
+        request::response_steering(cfg)
+    }
+
+    /// Binds a downstream connection's later client frames to its session (Go
+    /// `WithWebsocketInput` and `WithWebsocketAuthCheck`). A steering turn on that session
+    /// reads them after its first `response.created`; [`Self::close_session`] releases them.
+    pub fn attach_steering(&self, session: &str, input: SteeringInput) {
+        self.ws.attach_steering(session, input);
+    }
+
+    /// Binds a downstream connection's live client authorization to its session: each
+    /// upstream write of a client frame on that session first asks it (N1 #111 W2).
+    pub fn attach_authority(&self, session: &str, authority: std::sync::Arc<Authority>) {
+        self.ws.attach_authority(session, authority);
+    }
+
+    /// Go `InterruptExecutionSession`: forwards a client's `response.interrupt` to the
+    /// session's upstream socket (see `codex_ws::Pool::interrupt`). `Some` is upstream's
+    /// acknowledgement of an interrupt for a response that had already ended, for the
+    /// caller to send to the client.
+    pub async fn interrupt_session(
+        &self,
+        session: &str,
+        payload: &[u8],
+        enabled: impl FnOnce(&str) -> bool,
+    ) -> Result<Option<Bytes>, InterruptError> {
+        self.ws.interrupt(session, payload, enabled).await
+    }
+
+    /// A new attempt of session `id` starts
+    /// ([`Executors::session_attempt`](crate::providers::Executors::session_attempt)).
+    pub fn begin_session_attempt(&self, id: &str) {
+        self.ws.begin_attempt(id);
+    }
+
+    /// The losses of the session's upstream sockets (what Go's disconnect notifier hands
+    /// the downstream handler), each socket's taken once ([`SessionLosses`]).
+    pub fn session_losses(&self, id: &str) -> SessionLosses {
+        self.ws.losses(id)
+    }
+
+    /// Releases the session's upstream socket (downstream connection ended).
+    pub fn close_session(&self, id: &str) {
+        self.ws.close(id);
+    }
+
+    /// Refresh due: the outer tokens under Go's 96h Codex lead, or the Sign in with
+    /// ChatGPT partition under its 5-minute lead (Go `shouldRefresh`). Cheap and side-effect free.
+    pub fn needs_prepare(&self, credential: &Credential, cfg: &Config) -> bool {
+        self.needs_prepare_at(credential, cfg, Utc::now())
+    }
+
+    pub fn needs_prepare_at(&self, credential: &Credential, _cfg: &Config, now: chrono::DateTime<Utc>) -> bool {
+        codex_oauth::refresh_due(credential, now)
+            || crate::providers::codex_siwc::refresh_due(credential, now) == Some(true)
+    }
+
+    /// The refresh grants for `credential`, on the client its proxy selects
+    /// (`NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)`: the credential's proxy, then the
+    /// global one, on Go's standard transport).
+    pub fn refresher(&self, credential: &Credential, cfg: &Config) -> crate::providers::codex_refresh::Refresher {
+        let proxy = crate::providers::proxy::Proxy::effective(credential, cfg);
+        crate::providers::codex_refresh::Refresher::new(self.oauth.with_client(self.transport.standard(&proxy)))
+    }
+
+    /// [`crate::providers::codex_refresh::Refresher::prepare`].
+    pub async fn prepare(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        self.refresher(credential, cfg).prepare(credential).await
+    }
+
+    /// [`crate::providers::codex_refresh::Refresher::refresh_now`].
+    pub async fn refresh_now(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        self.refresher(credential, cfg).refresh_now(credential).await
+    }
+
+    /// [`crate::providers::codex_refresh::Refresher::refresh_all`].
+    pub async fn refresh_all(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        self.refresher(credential, cfg).refresh_all(credential).await
+    }
+
+    pub async fn execute(
+        &self,
+        credential: &Credential,
+        req: ExecRequest,
+        cfg: &Config,
+    ) -> Result<ExecResponse, ExecError> {
+        if req.operation == Operation::CountTokens {
+            return count_tokens(&req, cfg);
+        }
+        check_response_format(&req)?;
+        crate::providers::codex_siwc::require_token(credential)?;
+        crate::providers::codex_identity::check_credential(credential)?;
+        // Credential checks stay above the native route: it skips only payload work.
+        let view = View::for_request(credential, cfg).with_session(explicit_session(&req));
+        let settings = Settings::scoped(cfg, &view);
+        settings.refuse_compat(&req, credential)?;
+        if let Some(profile) = native::route(&view, &req) {
+            // The native route reads the body through the boundary itself.
+            return self.native(&view, &settings, req, profile).await;
+        }
+        if translated::route(&view, &req) {
+            return self.translated(&view, &settings, req).await;
+        }
+        Err(unrouted(&req))
+    }
+
+    /// Go's `http.Client.Do` through the Codex transport: the client is picked per hop
+    /// (the chatgpt.com client, Go's standard transport elsewhere), redirects are
+    /// followed like Go's, and gzip is undone only when the transport asked for it.
+    pub(crate) async fn post(
+        &self,
+        view: &View<'_>,
+        url: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+    ) -> Result<crate::providers::proxy::Upstream, ExecError> {
+        let transport = &self.transport;
+        let (proxy, keep_alive, handshake) = (&view.proxy, view.chatgpt_keep_alive, view.handshake);
+        let route = |hop: &url::Url| {
+            Ok(crate::providers::proxy::Route {
+                client: transport.for_url(hop.as_str(), proxy, keep_alive, handshake),
+                order: None,
+            })
+        };
+        crate::providers::proxy::send_routed(&route, url, go_headers(headers), body, None, None).await
+    }
+
+    /// [`Self::post`], reporting whether a failure provably sent nothing
+    /// ([`crate::providers::proxy::send_routed_certain`]).
+    async fn post_certain(
+        &self,
+        view: &View<'_>,
+        url: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+        gate: Option<crate::providers::proxy::Gate>,
+    ) -> Result<crate::providers::proxy::Upstream, (ExecError, bool)> {
+        let transport = &self.transport;
+        let (proxy, keep_alive, handshake) = (&view.proxy, view.chatgpt_keep_alive, view.handshake);
+        // A gated request dials its own connection and is admitted after the dial,
+        // before any HTTP byte (`crate::providers::proxy::admit_dials`); the same TLS, ALPN and proxy.
+        let gated = gate.is_some();
+        let route = |hop: &url::Url| {
+            let client = if gated {
+                transport.admitting_for_url(hop.as_str(), proxy, keep_alive, handshake)
+            } else {
+                transport.for_url(hop.as_str(), proxy, keep_alive, handshake)
+            };
+            Ok(crate::providers::proxy::Route { client, order: None })
+        };
+        crate::providers::proxy::send_routed_certain(&route, url, go_headers(headers), body, gate).await
+    }
+
+    /// One POST to the Codex backend, captured as Go's call sites record it: the
+    /// request, a transport error, the response metadata and an error body. A non-2xx
+    /// answer is the returned error; success bodies are read (and recorded) by the
+    /// caller as its Go call site does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open(
+        &self,
+        view: &View<'_>,
+        settings: &Settings,
+        url: String,
+        headers: HeaderMap,
+        body: String,
+        wire: &Wire,
+        error_body: ErrorBody,
+    ) -> Result<crate::providers::proxy::Upstream, ExecError> {
+        // The shaped body names the base model, the key of per-model quota snapshots.
+        let model = rawjson::get(&body, "model").str().to_owned();
+        self.open_for(
+            view,
+            settings,
+            url,
+            headers,
+            Bytes::from(body),
+            wire,
+            error_body,
+            &model,
+            false,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::open`] for a known upstream `model` (the quota-snapshot key). With
+    /// `direct`, a non-2xx answer keeps its classification (status and scope) for the
+    /// scheduler, and the client receives the upstream status, body and filtered headers
+    /// unchanged (the native HTTP route).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_for(
+        &self,
+        view: &View<'_>,
+        settings: &Settings,
+        url: String,
+        headers: HeaderMap,
+        body: Bytes,
+        wire: &Wire,
+        error_body: ErrorBody,
+        model: &str,
+        direct: bool,
+        sent_once: bool,
+        authority: Option<Arc<crate::providers::codex_ws::Authority>>,
+    ) -> Result<crate::providers::proxy::Upstream, ExecError> {
+        wire.request(&url, &headers, &body);
+        let posted = if sent_once {
+            // A request the upstream may have read is never sent again (N1 #111): only a
+            // failure that provably sent nothing may fail over. The client authority, if
+            // any, decides when the HTTP client takes the body, after the connection
+            // wait (`crate::providers::proxy::GatedBody`).
+            let refused = Arc::new(std::sync::Mutex::new(None));
+            let gate = authority.map(|authority| {
+                let refused = refused.clone();
+                Arc::new(move || match authority() {
+                    Some(refusal) => {
+                        *refused.lock().expect("refusal") = Some(refusal);
+                        false
+                    }
+                    None => true,
+                }) as crate::providers::proxy::Gate
+            });
+            let posted = self.post_certain(view, &url, &headers, body, gate).await;
+            posted.map_err(|(error, unsent)| {
+                if let Some(refusal) = refused.lock().expect("refusal").take() {
+                    refusal.error()
+                } else if unsent {
+                    error
+                } else {
+                    crate::providers::codex_ws::uncertain(error)
+                }
+            })
+        } else {
+            self.post(view, &url, &headers, body).await
+        };
+        let mut upstream = match posted {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                // ponytail: the text is this executor's transport message, not net/http's
+                // `Post "<url>": ...`.
+                wire.exec_error(&error);
+                return Err(error);
+            }
+        };
+        wire.metadata(upstream.status, &upstream.headers);
+        self.quota.observe(&view.credential.id, model, &upstream.headers);
+        let status = upstream.status;
+        upstream.headers.remove(http::header::CONTENT_ENCODING);
+        upstream.headers.remove(http::header::CONTENT_LENGTH);
+        if !(200..300).contains(&status) {
+            let lossy = error_body == ErrorBody::Lossy;
+            let body =
+                match crate::providers::proxy::read_all(upstream.body, crate::providers::proxy::MAX_ERROR_BODY, lossy)
+                    .await
+                {
+                    Ok(body) => body,
+                    Err(error) => {
+                        wire.exec_error(&error);
+                        return Err(error);
+                    }
+                };
+            wire.chunk(&body);
+            let mut error = response::status_error(status, &body, upstream.headers, settings.model_level_cooling);
+            if direct {
+                // `status` stays the scheduler's classification (a usage or capacity
+                // limit is classified 429); the client gets the upstream's own status.
+                error.body = body;
+                error.direct = true;
+                error.delivered_status = std::num::NonZeroU16::new(status);
+            }
+            return Err(error);
+        }
+        Ok(upstream)
+    }
+
+    /// [`Self::open`], then the body: SSE framed into events, anything else read whole.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send(
+        &self,
+        view: &View<'_>,
+        settings: &Settings,
+        url: String,
+        headers: HeaderMap,
+        body: String,
+        wire: &Wire,
+        error_body: ErrorBody,
+    ) -> Result<ExecResponse, ExecError> {
+        let upstream = self.open(view, settings, url, headers, body, wire, error_body).await?;
+        let (status, headers) = (upstream.status, upstream.headers);
+        let sse = headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        let body = if sse {
+            ResponseBody::Stream(crate::providers::upstream::framed(upstream.body))
+        } else {
+            match crate::providers::proxy::read_all(upstream.body, usize::MAX, false).await {
+                Ok(body) => ResponseBody::Buffered(body),
+                Err(error) => {
+                    wire.exec_error(&error);
+                    return Err(error);
+                }
+            }
+        };
+        Ok(ExecResponse {
+            status,
+            headers,
+            body,
+            omitted: Default::default(),
+        })
+    }
+
+    /// The URL an Alpha Search on `credential` posts to; `None` for an API key without
+    /// a base URL.
+    pub fn alpha_search_url(&self, credential: &Credential, cfg: &Config) -> Option<String> {
+        self.alpha_search_url_for(&View::for_request(credential, cfg))
+    }
+
+    fn alpha_search_url_for(&self, view: &View<'_>) -> Option<String> {
+        if !view.api_key {
+            return Some(format!("{}/alpha/search", self.alpha_base_url));
+        }
+        let base = view.attr("base_url").trim();
+        (!base.is_empty()).then(|| format!("{}/alpha/search", base.trim_end_matches('/')))
+    }
+
+    /// The standalone Codex Alpha Search call (`Server.codexAlphaSearch` minus selection):
+    /// already in Codex search format, never translated. The upstream status and body are
+    /// returned as is, with only its Content-Type.
+    ///
+    /// `upstream_model` is the credential-resolved model; it replaces `model` for API keys.
+    /// `capture` records the attempt as Go's route does (`server_routes.go`).
+    pub async fn alpha_search(
+        &self,
+        credential: &Credential,
+        body: &[u8],
+        client: &HeaderMap,
+        upstream_model: &str,
+        cfg: &Config,
+        capture: &crate::execution::CaptureSink,
+    ) -> Result<ExecResponse, ExecError> {
+        // Go selects with `X-Session-ID` set from the body's `id`; the request context then
+        // carries that explicit session for `$CPA-SESSION-ID`.
+        let mut selection_headers = client.clone();
+        let id = rawjson::get(&String::from_utf8_lossy(body), "id")
+            .str()
+            .trim()
+            .to_owned();
+        if !id.is_empty()
+            && let Ok(value) = http::HeaderValue::from_str(&id)
+        {
+            selection_headers.insert("x-session-id", value);
+        }
+        let session = crate::protocol::session::cpa_session_id(Some(&crate::protocol::session::extract_session_id(
+            &selection_headers,
+            body,
+            &Default::default(),
+        )));
+        let view = View::for_request(credential, cfg).with_session(session);
+        let mut body = sanitize_alpha_search(body);
+        let Some(url) = self.alpha_search_url_for(&view) else {
+            return Err(ExecError::local(
+                503,
+                FailureScope::Credential,
+                "Codex Alpha Search API key base URL unavailable",
+            ));
+        };
+        if view.api_key && !upstream_model.trim().is_empty() {
+            body = rewrite_alpha_search_model(body, upstream_model.trim());
+        }
+        // `PrepareRequest` (inside `NewHttpRequest`): Sign in with ChatGPT needs its token.
+        crate::providers::codex_siwc::require_token(credential)?;
+        crate::providers::codex_identity::check_credential(credential)?;
+        let mut headers = HeaderMap::new();
+        let mut set = |name: &'static str, value: &str| {
+            if let Ok(value) = http::HeaderValue::from_str(value) {
+                headers.insert(name, value);
+            }
+        };
+        set("content-type", "application/json");
+        set("accept", "application/json");
+        // Go fixes `originator: codex_cli_rs` over the client's. The caller's own
+        // identity goes instead, else the proxy's (#26, `crate::providers::codex_identity`).
+        let origin = crate::providers::codex_identity::Origin::Caller;
+        if let Some(originator) = crate::providers::codex_identity::originator(origin, client, true) {
+            set("originator", originator);
+        }
+        set(
+            "user-agent",
+            crate::providers::codex_identity::user_agent(origin, client),
+        );
+        for name in ["version", "session_id", "x-client-request-id"] {
+            let value = request::header(client, name).trim();
+            if !value.is_empty() {
+                set(name, value);
+            }
+        }
+        if let Some(account) = credential.str("account_id").map(str::trim).filter(|s| !s.is_empty()) {
+            set("chatgpt-account-id", account);
+        }
+        // PrepareRequest: bearer from the API key or access token, then operator headers.
+        if !view.token.trim().is_empty() {
+            set("authorization", &format!("Bearer {}", view.token));
+        }
+        for (name, value) in request::custom_headers(&view, client) {
+            if let (Ok(name), Ok(value)) = (
+                http::HeaderName::try_from(name.as_str()),
+                http::HeaderValue::from_str(&value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+        let wire = Wire::new(capture, credential);
+        wire.request(&url, &headers, &body);
+        let upstream = match self.post(&view, &url, &headers, Bytes::from(body)).await {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                wire.exec_error(&error);
+                return Err(error);
+            }
+        };
+        wire.metadata(upstream.status, &upstream.headers);
+        let status = upstream.status;
+        let content_type = upstream.headers.get(http::header::CONTENT_TYPE).cloned();
+        // `io.ReadAll(io.LimitReader(resp.Body, 32 MiB))`: bytes past the limit are never
+        // read off the socket. On a read error Go records what arrived, then the error.
+        let mut body = upstream.body;
+        let mut data = Vec::new();
+        let failed = loop {
+            if data.len() >= ALPHA_SEARCH_MAX_RESPONSE {
+                break None;
+            }
+            match body.next().await {
+                Some(Ok(chunk)) => {
+                    let take = chunk.len().min(ALPHA_SEARCH_MAX_RESPONSE - data.len());
+                    data.extend_from_slice(&chunk[..take]);
+                }
+                Some(Err(error)) => break Some(error),
+                None => break None,
+            }
+        };
+        wire.chunk(&data);
+        if let Some(error) = failed {
+            wire.exec_error(&error);
+            return Err(ExecError::local(
+                502,
+                FailureScope::Transport,
+                "Failed to read Codex search response",
+            ));
+        }
+        let data = Bytes::from(data);
+        let mut headers = HeaderMap::new();
+        if let Some(value) = content_type {
+            headers.insert(http::header::CONTENT_TYPE, value);
+        }
+        Ok(ExecResponse {
+            status,
+            headers,
+            body: ResponseBody::Buffered(data),
+            omitted: Default::default(),
+        })
+    }
+}
+
+/// `CountTokens` (codex_executor_tokens.go): the request shaped as for Codex, counted
+/// locally with the model's tiktoken encoding; nothing is sent upstream.
+fn count_tokens(req: &ExecRequest, _cfg: &Config) -> Result<ExecResponse, ExecError> {
+    let model = request::base_model(&req.model);
+    // The body the request would send: a Responses client's own bytes, or the built-in
+    // translation (#27). No Codex-client rewrite, default instructions or payload rule
+    // changes what is counted. A Responses body is read in place, after the same request
+    // boundary as the routes that would send it.
+    let translated;
+    let body: &[u8] = if request::responses_formats(req) {
+        check_native_body(req)?;
+        &req.body
+    } else {
+        translated = translated::upstream_body(req, &model)?;
+        translated.as_bytes()
+    };
+    let encoding = crate::providers::codex_tokens::encoding_for_model(&model);
+    let count = crate::providers::codex_tokens::count_input_tokens(encoding, body).map_err(|e| {
+        ExecError::local(
+            500,
+            FailureScope::Request,
+            format!("codex executor: tokenizer init failed: {e}"),
+        )
+    })?;
+    let usage =
+        format!(r#"{{"response":{{"usage":{{"input_tokens":{count},"output_tokens":0,"total_tokens":{count}}}}}}}"#);
+    let payload =
+        crate::translation::translate_token_count(req.response_format, Format::Codex, count, usage.as_bytes());
+    // The count is this proxy's tokenizer estimate, never provider-reported usage.
+    let mut headers = HeaderMap::new();
+    headers.insert(LOCAL_TOKEN_COUNT, http::HeaderValue::from_static("local-estimate"));
+    Ok(ExecResponse {
+        status: 200,
+        headers,
+        body: ResponseBody::Buffered(Bytes::from(payload)),
+        omitted: Default::default(),
+    })
+}
+
+/// Go reads at most 32 MiB of an Alpha Search response, whatever its status.
+const ALPHA_SEARCH_MAX_RESPONSE: usize = 32 << 20;
+
+/// Go's compact policy (`isResponsesCompactRequestFaultError`,
+/// `isResponsesCompactAvailabilityNeutralError`): an upstream without compact support must
+/// not cool ordinary Responses traffic. Request faults stop the request; other failures
+/// except auth/payment/quota fail over without cooldown.
+// ponytail: Go also exempts Cloudflare challenges and invalid_grant bodies from both rules;
+// those classifiers are not ported (M4-0024).
+fn compact_error(mut error: ExecError) -> ExecError {
+    let credential_quota = error.status == 429 && error.scope == FailureScope::Credential;
+    if credential_quota || matches!(error.status, 401 | 402 | 403 | 429) || error.scope == FailureScope::Transport {
+        return error;
+    }
+    let body = String::from_utf8_lossy(&error.body);
+    // FP2: a first-party reading (`ExecError::sourced`) decides before Go's rules.
+    let request = match error.sourced {
+        Some(crate::execution::SourcedFault::RequestTerminal) => true,
+        Some(crate::execution::SourcedFault::Retryable) => false,
+        None => {
+            matches!(error.status, 400 | 404 | 405 | 409 | 413 | 422 | 501)
+                || response::request_fault(error.status, &body)
+        }
+    };
+    error.scope = if request {
+        FailureScope::Request
+    } else {
+        FailureScope::Transport
+    };
+    error
+}
+
+/// `sanitizeCodexAlphaSearchBody`: drop prompt-cache fields, re-marshalling only when one
+/// was present (Go's map round trip sorts keys and compacts).
+pub fn sanitize_alpha_search(body: &[u8]) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return body.to_vec();
+    };
+    crate::providers::codex_json::go_remarshal_object(text, |members| {
+        let a = members.remove("prompt_cache_key").is_some();
+        let b = members.remove("prompt_cache_retention").is_some();
+        a || b
+    })
+    .map(String::into_bytes)
+    .unwrap_or_else(|| body.to_vec())
+}
+
+/// `rewriteCodexAlphaSearchModel`.
+fn rewrite_alpha_search_model(body: Vec<u8>, model: &str) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(&body) else {
+        return body;
+    };
+    let quoted = crate::providers::codex_json::go_quote(model, true);
+    crate::providers::codex_json::go_remarshal_object(text, |members| match members.get_mut("model") {
+        Some(current) if *current != quoted => {
+            *current = quoted.clone();
+            true
+        }
+        _ => false,
+    })
+    .map(String::into_bytes)
+    .unwrap_or(body)
+}
+
+/// The shaped headers as Go's `http.Header`: canonical keys, values in order. Go's
+/// transport adds `Accept-Encoding: gzip` itself unless a header already set it.
+/// How a call site reads a non-2xx body: Go's Execute and compact ignore a read error
+/// (`b, _ := io.ReadAll`) and report what arrived; its stream and Images paths record the
+/// read error and return it instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErrorBody {
+    Lossy,
+    Strict,
+}
+
+fn go_headers(headers: &HeaderMap) -> crate::providers::proxy::GoHeaders {
+    let mut out = crate::providers::proxy::GoHeaders::new();
+    for (name, value) in headers {
+        out.add_raw(
+            &crate::providers::proxy::canonical_header(name.as_str()),
+            String::from_utf8_lossy(value.as_bytes()),
+        );
+    }
+    out
+}
+
+/// Go `SetTranslatedReasoningEffort`: the finalized upstream payload (prompt-cache key
+/// set, input IDs sanitized), for the usage record's reasoning effort (c7b4d573).
+pub(crate) fn report_request(req: &ExecRequest, upstream: Format, body: &str) {
+    if req.usage.enabled() {
+        req.usage.request(upstream, body.as_bytes());
+    }
+}
+
+/// Go's request-context session for `$CPA-SESSION-ID` headers.
+pub(crate) fn explicit_session(req: &ExecRequest) -> Option<String> {
+    crate::protocol::session::cpa_session_id(req.session.as_deref())
+}
+
+/// The Codex request boundary ([`crate::protocol::codex_body`]) for a body a Responses client
+/// sent to a Responses route: HTTP streaming, buffered, compact and WebSocket turns. A
+/// body it refuses fails here, before translation and before any upstream send, with a
+/// client-safe request error. Other source formats arrive through a cross-API translator
+/// and keep its parsing until #27.
+fn check_native_body(req: &ExecRequest) -> Result<(), ExecError> {
+    if request::responses_formats(req) {
+        crate::protocol::codex_body::CodexBody::parse(&req.body)?;
+    }
+    Ok(())
+}
+
+/// The refusal of a request no Codex route carries (#28): the native route takes
+/// Responses on both sides, the translated route a generation from its built-in
+/// sources. Nothing else reaches the provider, and no legacy rewrite stands in.
+fn unrouted(req: &ExecRequest) -> ExecError {
+    ExecError::local(
+        400,
+        FailureScope::Request,
+        format!(
+            "this request cannot be sent to Codex: {} -> {} {} is neither a native Responses request nor a supported translation (Claude Messages or Chat Completions generations)",
+            req.source_format.as_str(),
+            req.response_format.as_str(),
+            req.alt.as_deref().unwrap_or("generation"),
+        ),
+    )
+}
+
+fn check_response_format(req: &ExecRequest) -> Result<(), ExecError> {
+    let identity = matches!(req.response_format, Format::Codex | Format::OpenAIResponse);
+    if identity || crate::translation::pair(req.response_format, Format::Codex).is_some() {
+        return Ok(());
+    }
+    Err(ExecError::local(
+        501,
+        FailureScope::Request,
+        format!(
+            "codex -> {} response translation is not registered",
+            req.response_format.as_str()
+        ),
+    ))
+}
+
+/// Upstream body as framed SSE events, whatever its declared content type (Go scans lines).
+pub(crate) fn events(body: ResponseBody) -> ExecStream {
+    match body {
+        ResponseBody::Stream(stream) => stream,
+        ResponseBody::Buffered(bytes) => {
+            let mut framer = crate::translation::sse::Framer::default();
+            let mut events = framer.push(&bytes).unwrap_or_default();
+            events.extend(framer.finish());
+            futures_util::stream::iter(events.into_iter().map(Ok)).boxed()
+        }
+    }
+}
+
+fn translate_error(error: crate::translation::Error) -> ExecError {
+    ExecError::local(502, FailureScope::Request, error.to_string())
+}
+
+#[path = "codex_native.rs"]
+pub(crate) mod native;
+
+#[path = "codex_translated.rs"]
+mod translated;
+
+/// The response header that marks a token count as this proxy's local estimate.
+pub const LOCAL_TOKEN_COUNT: &str = "x-cliproxy-token-count";
+
+#[cfg(test)]
+#[path = "codex_boundary_tests.rs"]
+mod boundary_tests;
+
+#[cfg(test)]
+#[path = "codex_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "codex_identity_tests.rs"]
+mod identity_tests;

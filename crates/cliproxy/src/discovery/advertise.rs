@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cpa_core::config::Config;
+use cliproxy_internal::config::Config;
 use tokio::sync::oneshot;
 
 use super::mdns::Responder;

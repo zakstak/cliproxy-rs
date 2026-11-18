@@ -5,10 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cpa_core::config::Config;
-use cpa_exec::Executors;
-use cpa_exec::claude::ClaudeExecutor;
-use cpa_server::management::{self, Management, Options};
+use cliproxy_internal::config::Config;
+use cliproxy_internal::gateway::management::{self, Management, Options};
+use cliproxy_internal::providers::Executors;
+use cliproxy_internal::providers::claude::ClaudeExecutor;
 
 use super::app::{self, App};
 use super::{Cmd, i18n};
@@ -37,8 +37,8 @@ async fn serve(dir: &std::path::Path) -> String {
     )
     .unwrap();
     let config = Config::load(&path).unwrap();
-    let credentials = cpa_core::config::credentials::load(&config);
-    let rt = Arc::new(cpa_server::testing::runtime(
+    let credentials = cliproxy_internal::config::credentials::load(&config);
+    let rt = Arc::new(cliproxy_internal::gateway::testing::runtime(
         config,
         credentials,
         Executors {

@@ -713,12 +713,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
- "cpa-common",
- "cpa-core",
- "cpa-exec",
- "cpa-home",
- "cpa-server",
- "cpa-store",
+ "cliproxy-internal",
  "futures-util",
  "getrandom 0.3.4",
  "http-body",
@@ -733,6 +728,62 @@ dependencies = [
  "tracing",
  "url",
  "wreq",
+]
+
+[[package]]
+name = "cliproxy-internal"
+version = "0.4.1-zak.3"
+dependencies = [
+ "anyhow",
+ "async-compression",
+ "async-trait",
+ "axum",
+ "backtrace",
+ "base64 0.22.1",
+ "bcrypt",
+ "btls",
+ "bytes",
+ "chrono",
+ "cliproxy-internal",
+ "flate2",
+ "futures-util",
+ "getrandom 0.3.4",
+ "http",
+ "http-body",
+ "http2",
+ "httpdate",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "memchr",
+ "pprof",
+ "rand 0.9.5",
+ "regex",
+ "rtc",
+ "ryu",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.10.9",
+ "socket2",
+ "subtle",
+ "tiktoken-rs",
+ "tokio",
+ "tokio-btls",
+ "tokio-postgres",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tower",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+ "unsafe-libyaml",
+ "url",
+ "uuid",
+ "webrtc",
+ "wreq",
+ "yaml-edit",
+ "zstd",
 ]
 
 [[package]]
@@ -825,191 +876,6 @@ name = "countme"
 version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7704b5fdd17b18ae31c4c1da5a2e0305a2bf17b5249300a9ee9ed7b72114c636"
-
-[[package]]
-name = "cpa-common"
-version = "0.4.1-zak.3"
-dependencies = [
- "base64 0.22.1",
- "cpa-core",
- "flate2",
- "http",
- "memchr",
- "ryu",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.10.9",
- "tokio",
-]
-
-[[package]]
-name = "cpa-core"
-version = "0.4.1-zak.3"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bcrypt",
- "bytes",
- "futures-util",
- "http",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.10.9",
- "tracing",
- "unsafe-libyaml",
- "yaml-edit",
-]
-
-[[package]]
-name = "cpa-exec"
-version = "0.4.1-zak.3"
-dependencies = [
- "async-compression",
- "axum",
- "base64 0.22.1",
- "btls",
- "bytes",
- "chrono",
- "cpa-common",
- "cpa-core",
- "cpa-home",
- "cpa-translate",
- "flate2",
- "futures-util",
- "getrandom 0.3.4",
- "http",
- "http-body",
- "http2",
- "httpdate",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.10.9",
- "socket2",
- "tiktoken-rs",
- "tokio",
- "tokio-btls",
- "tokio-tungstenite",
- "tokio-util",
- "tower",
- "tracing",
- "url",
- "uuid",
- "wreq",
-]
-
-[[package]]
-name = "cpa-home"
-version = "0.4.1-zak.3"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "btls",
- "chrono",
- "cpa-common",
- "cpa-core",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.10.9",
- "tokio",
- "tokio-btls",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "cpa-server"
-version = "0.4.1-zak.3"
-dependencies = [
- "anyhow",
- "async-compression",
- "async-trait",
- "axum",
- "backtrace",
- "base64 0.22.1",
- "bcrypt",
- "btls",
- "bytes",
- "chrono",
- "cpa-common",
- "cpa-core",
- "cpa-exec",
- "cpa-translate",
- "futures-util",
- "getrandom 0.3.4",
- "http-body",
- "hyper",
- "hyper-util",
- "libc",
- "pprof",
- "regex",
- "rtc",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "sha2 0.10.9",
- "socket2",
- "subtle",
- "tokio",
- "tokio-btls",
- "tokio-tungstenite",
- "tokio-util",
- "tower",
- "tower-service",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "webrtc",
- "wreq",
- "zstd",
-]
-
-[[package]]
-name = "cpa-store"
-version = "0.4.1-zak.3"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "bcrypt",
- "btls",
- "bytes",
- "chrono",
- "cpa-core",
- "cpa-server",
- "futures-util",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tokio-btls",
- "tokio-postgres",
- "tracing",
- "url",
- "wreq",
-]
-
-[[package]]
-name = "cpa-translate"
-version = "0.4.1-zak.3"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "cpa-common",
- "cpa-core",
- "rand 0.9.5",
- "regex",
- "serde_json",
- "sha2 0.10.9",
- "uuid",
-]
 
 [[package]]
 name = "cpufeatures"

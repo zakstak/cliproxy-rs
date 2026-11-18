@@ -1,6 +1,6 @@
 # Additional server module migration ledger
 
-Owns only `capabilities.rs`, `registry.rs`, `session.rs`, and `scheduler.rs` in `crates/cpa-server/src`. Production code is unchanged. No Go-generated output fixture remains included in these four modules.
+Owns only `capabilities.rs`, `registry.rs`, `session.rs`, and `scheduler.rs` in `crates/cliproxy-internal/src/gateway`. Production code is unchanged. No Go-generated output fixture remains included in these four modules.
 
 | Original inventory test | Replacement and independent behavior |
 | --- | --- |

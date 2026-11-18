@@ -29,4 +29,4 @@ Deleted global `clippy.toml` prohibition on Rust Unicode casing methods. AGENTS.
 
 ## Validation
 
-Network-denied loopback-only runs: `cargo test --offline -p cpa-server --test ws_e2e` passed all 69; `cargo test --offline -p cpa-server --test realtime` passed all 6 (containing the input matrices above). Full integration checks follow in the parent migration report. These checks do not prove real provider acceptance or deployment.
+Network-denied loopback-only runs: `cargo test --offline -p cliproxy-internal --test ws_e2e` passed all 69; `cargo test --offline -p cliproxy-internal --test realtime` passed all 6 (containing the input matrices above). Full integration checks follow in the parent migration report. These checks do not prove real provider acceptance or deployment.

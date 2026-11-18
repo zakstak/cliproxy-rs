@@ -59,12 +59,12 @@ pub fn load_scan_filters(path: &str) -> Result<(Vec<String>, Vec<String>), Strin
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Ok(Default::default());
     };
-    if cpa_core::config::parse_yaml(&text).is_err() {
+    if cliproxy_internal::config::parse_yaml(&text).is_err() {
         return Ok(Default::default());
     }
     let refused = |e: anyhow::Error| format!("discovery interface filters in {}: {e}", path.display());
-    let mut doc = cpa_core::config::config_value(&text).map_err(refused)?;
-    cpa_core::config::expand_merges(&mut doc).map_err(refused)?;
+    let mut doc = cliproxy_internal::config::config_value(&text).map_err(refused)?;
+    cliproxy_internal::config::expand_merges(&mut doc).map_err(refused)?;
     // yaml.v3 decodes null into zero values and fails on a wrong-kind node anywhere
     // on the path, which drops both lists.
     let mapping = |v: Option<&Yaml>| -> Option<Option<Yaml>> {
@@ -151,7 +151,7 @@ pub fn sanitize_terminal(s: &str) -> String {
     s.chars()
         .filter_map(|c| match c {
             '\t' => Some(' '),
-            c if cpa_common::gostr::is_print(c)
+            c if cliproxy_internal::text::is_print(c)
                 && !bidi(c)
                 && !matches!(
                     c,

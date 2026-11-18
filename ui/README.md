@@ -18,7 +18,7 @@ npm run build
 
 Vite binds to loopback on port 5173. It proxies `/v8`, `/v1` and `/healthz` to `CPA_BACKEND` (default `http://127.0.0.1:8317`). Point it at a disposable server when experimenting: the dashboard edits that server's configuration and credentials.
 
-`npm run build` builds Ledger and copies `dist/index.html` to `dist/management.html`. Rebuild the UI before compiling Rust; `crates/cpa-server/build.rs` embeds those assets. Fonts and icons are local. Effect is the only additional runtime dependency; Tailwind and Vite are build tools.
+`npm run build` builds Ledger and copies `dist/index.html` to `dist/management.html`. Rebuild the UI before compiling Rust; `crates/cliproxy-internal/build.rs` embeds those assets. Fonts and icons are local. Effect is the only additional runtime dependency; Tailwind and Vite are build tools.
 
 ## Safe sandbox verification
 
