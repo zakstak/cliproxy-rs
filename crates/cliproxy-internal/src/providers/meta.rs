@@ -418,6 +418,8 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
     // working one, even when they are equal.
     let original_translated = translate(original(req));
     let mut body = translate(&req.body)?;
+    // ponytail: A refused baseline loses its partial conversion and uses the working
+    // body. Return partial bodies with translation errors to preserve that baseline.
     let mut original_translated = original_translated.unwrap_or_else(|_| body.to_vec());
     // The payload-rule baseline carries the client's explicit retention too, so a
     // `default` rule does not replace it (Go v8.0.67 f77a3c10).

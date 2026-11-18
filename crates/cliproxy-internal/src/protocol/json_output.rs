@@ -2,6 +2,8 @@
 //!
 //! Raw fields retain their JSON bytes. String fields use the shared JSON encoder.
 //! Request and response passthrough bodies do not go through this builder.
+//! Keep encoding deterministic: `home::inflight::pack` measures the encoded bytes
+//! against Home's part, revision and count limits.
 
 use std::collections::BTreeMap;
 

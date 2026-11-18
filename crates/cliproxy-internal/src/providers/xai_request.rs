@@ -165,6 +165,8 @@ pub(crate) async fn prepare(
     let client = crate::translation::client::Client::new(&req.headers, cfg, PROVIDER, is_compat);
     let original_translated = translate(req, &client, to, &base_model, stream, &original_payload);
     let body = translate(req, &client, to, &base_model, stream, &req.body)?;
+    // ponytail: A refused baseline loses its partial conversion and uses the working
+    // body. Return partial bodies with translation errors to preserve that baseline.
     let original_translated = original_translated.unwrap_or_else(|_| body.to_vec());
     let original_translated = preserve_output_controls(original_translated, &original_payload, req.source_format);
     let body = preserve_output_controls(body, &req.body, req.source_format);
