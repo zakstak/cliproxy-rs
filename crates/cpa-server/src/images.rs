@@ -589,8 +589,7 @@ impl Prepared {
             request_path: self.path.clone(),
             peer: self.peer,
             native: None,
-            turn: None,
-            media: Some(Arc::new(Media {
+            mode: dispatch::CallMode::Media(Arc::new(Media {
                 kind: MediaKind::Images,
                 pinned: None,
                 on_selected: None,
