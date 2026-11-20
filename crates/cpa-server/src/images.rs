@@ -402,24 +402,6 @@ fn compat_json_request(body: &[u8], model: &str, stream: bool) -> Vec<u8> {
     out
 }
 
-/// `parseIntField`.
-fn parse_int(raw: &str, fallback: i64) -> i64 {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return fallback;
-    }
-    parse_go_int(raw).unwrap_or(fallback)
-}
-
-/// `strconv.ParseInt(s, 10, 64)`.
-fn parse_go_int(s: &str) -> Option<i64> {
-    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
-}
-
 /// `parseBoolField`.
 fn parse_bool(raw: &str, fallback: bool) -> bool {
     match raw.go_lower().trim() {
@@ -1021,7 +1003,7 @@ async fn edits_multipart(p: Prepared, content_type: &str, body: &[u8]) -> Respon
             aspect_ratio: aspect_ratio_from_size(&size, &aspect_ratio(&form.value("aspect_ratio"), "")),
             resolution: resolution(&form.value("resolution"), &size, ""),
             quality: form.value("quality").trim().to_owned(),
-            n: parse_int(&form.value("n"), 0),
+            n: form.value("n").trim().parse().unwrap_or(0),
         };
         let req = xai_edit_request(&model, &prompt, &images, &format, &options);
         let original = edit_original(&req, &raw_format);

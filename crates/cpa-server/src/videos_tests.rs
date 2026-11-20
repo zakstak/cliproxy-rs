@@ -35,10 +35,15 @@ fn bindings_expire() {
 // Product policy: The supported video API accepts integer duration inputs and clamps them to the documented provider range.
 fn video_durations_clamp_to_the_supported_provider_range() {
     assert_eq!(seconds(""), Ok(4));
+    assert_eq!(seconds("  \t"), Ok(4));
+    assert_eq!(seconds(" \t+007 "), Ok(7));
     assert_eq!(seconds("+20"), Ok(15));
     assert_eq!(seconds("-3"), Ok(1));
-    assert_eq!(seconds("1.5"), Err("seconds must be an integer".into()));
-    assert_eq!(seconds("9223372036854775808"), Err("seconds must be an integer".into()));
+    assert_eq!(seconds("-9223372036854775808"), Ok(1));
+    assert_eq!(seconds("9223372036854775807"), Ok(15));
+    for bad in ["1.5", "+", "1 2", "9223372036854775808", "-9223372036854775809"] {
+        assert_eq!(seconds(bad), Err("seconds must be an integer".into()), "{bad:?}");
+    }
 }
 
 /// Grok Imagine Video 1.5 Lite (#87) is its own model: accepted under the vendor

@@ -938,6 +938,25 @@ fn stored_websocket_flags_use_explicit_attribute_then_typed_metadata() {
     assert!(!websockets_enabled(&c), "numbers are not bools");
 }
 
+#[test]
+fn bare_error_frames_prefer_the_first_positive_status() {
+    for (code, nested_status, outer_code, message, expected) in [
+        (" +00429 ", "401", "402", "", 429),
+        ("-1", " 408 ", "402", "", 408),
+        ("0", "4_01", "418", "", 418),
+        ("9223372036854775808", "+", "  ", "Request validation error", 400),
+        ("4.0", "", "", "", 500),
+        ("65536", "401", "", "", 500),
+    ] {
+        let frame = serde_json::json!({
+            "error": {"code": code, "status": nested_status, "message": message},
+            "code": outer_code,
+        });
+        let error = ws_error(frame.to_string().as_bytes()).unwrap();
+        assert_eq!(error.status, expected, "{frame}");
+    }
+}
+
 /// Standard scheme conversion preserves the resource path, escaped query and port.
 #[test]
 fn websocket_urls_keep_the_http_resource_and_refuse_missing_or_unsupported_origins() {
