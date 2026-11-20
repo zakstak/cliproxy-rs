@@ -1,54 +1,5 @@
-//! The dynamic model registry lives in `cpa_core::registry::dynamic` so translators and
-//! shared helpers can read capabilities; this module publishes the runtime's copy.
-
-use cpa_core::registry::ModelInfo;
+//! Model registrations shared by routing and request translation.
 pub use cpa_core::registry::dynamic::*;
-
-/// Exposes the runtime's registry through `cpa_core::registry::lookup_model`.
-pub struct Overlay(pub std::sync::Weak<crate::Runtime>);
-
-impl cpa_core::registry::Overlay for Overlay {
-    fn lookup(&self, id: &str, provider: Option<&str>) -> Option<ModelInfo> {
-        self.0.upgrade()?.registry().info(id, provider).map(|s| s.to_info())
-    }
-
-    fn for_credential(&self, credential_id: &str, model: &str) -> Option<ModelInfo> {
-        self.0
-            .upgrade()?
-            .registry()
-            .client_model(credential_id, model)
-            .map(|s| s.to_info())
-    }
-
-    fn available_by_provider(&self, provider: &str) -> Vec<ModelInfo> {
-        let Some(rt) = self.0.upgrade() else {
-            return Vec::new();
-        };
-        rt.registry()
-            .available_by_provider(provider, |client, model| rt.suspension(client, model))
-            .iter()
-            .map(|s| s.to_info())
-            .collect()
-    }
-
-    fn model_providers(&self, model: &str) -> Vec<String> {
-        self.0
-            .upgrade()
-            .map(|rt| rt.registry().model_providers(model))
-            .unwrap_or_default()
-    }
-
-    fn available(&self) -> Vec<ModelInfo> {
-        let Some(rt) = self.0.upgrade() else {
-            return Vec::new();
-        };
-        let registry = rt.registry();
-        registry
-            .available_with(|c, m| rt.suspension(c, m))
-            .map(|s| s.to_info())
-            .collect()
-    }
-}
 
 #[cfg(test)]
 mod tests {

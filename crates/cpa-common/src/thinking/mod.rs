@@ -193,9 +193,13 @@ impl From<&ModelInfo> for ModelCaps {
 
 /// `registry.LookupModelInfo(model, provider)`: the server's dynamic registry
 /// (provider-specific registration, then the last registration), then the pinned catalog.
-pub fn lookup_model_info(model: &str, provider: &str) -> Option<ModelCaps> {
+pub fn lookup_model_info(
+    registry: Option<&cpa_core::registry::dynamic::Registry>,
+    model: &str,
+    provider: &str,
+) -> Option<ModelCaps> {
     let provider = Some(provider).filter(|p| !p.is_empty());
-    cpa_core::registry::lookup_model(model, provider).map(|info| ModelCaps::from(&info))
+    cpa_core::registry::lookup_model(registry, model, provider).map(|info| ModelCaps::from(&info))
 }
 
 /// `SuffixResult`.

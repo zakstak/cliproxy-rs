@@ -7,7 +7,6 @@ use crate::{
     claude_chat_request::{apply_effort, text_part},
     claude_property_keys::PropertyKeys,
     common::{self, trim_space},
-    thinking,
 };
 use cpa_common::json::{self as gj, Kind, Res};
 use cpa_core::gostr::GoStr;
@@ -45,19 +44,20 @@ pub(crate) fn convert(
     preserve_thinking: bool,
 ) -> Result<Vec<u8>, crate::Error> {
     let (model, stream, tool_search) = (ctx.model, ctx.stream, ctx.tool_search);
+    let info = cpa_core::registry::lookup_model(ctx.registry, model, Some("claude"));
     let raw = normalize_codex_agent_messages(input);
     let mut drops = common::UserTurnDrops::default();
     let user_id = common::derive_claude_user_id(&raw);
     let mut out = br#"{"model":"","max_tokens":32000,"messages":[],"metadata":{}}"#.to_vec();
     gj::set_str(&mut out, "metadata.user_id", &user_id);
-    gj::set_int(&mut out, "max_tokens", default_max_tokens(model));
+    gj::set_int(&mut out, "max_tokens", default_max_tokens(model, info.as_ref()));
     let root = gj::parse(&raw);
-    apply_effort(&mut out, &root.get("reasoning.effort"), model);
+    apply_effort(&mut out, &root.get("reasoning.effort"), info.as_ref());
     gj::set_str(&mut out, "model", model);
     let max_output = root.get("max_output_tokens");
     if max_output.exists() && max_output.kind != Kind::Null {
         let mut val = max_output.int();
-        let limit = max_completion_tokens(model);
+        let limit = max_completion_tokens(info.as_ref());
         if limit > 0 && val > limit {
             val = limit;
         }
@@ -339,26 +339,22 @@ pub(crate) fn convert(
         }
         _ => {}
     }
-    let out = thinking::apply_translated_summary_to_claude(out, &raw, "openai-response", model);
+    let out =
+        cpa_common::thinking::apply_translated_summary_to_claude(ctx.registry, &out, &raw, "openai-response", model);
     drops.result().map(|()| out)
 }
 
-fn model_info_int(model: &str, key: &str) -> i64 {
-    thinking::lookup_model_info(model, "claude")
-        .and_then(|m| m.raw.get(key).and_then(serde_json::Value::as_i64))
+fn max_completion_tokens(info: Option<&cpa_core::registry::ModelInfo>) -> i64 {
+    info.and_then(|m| m.raw.get("max_completion_tokens")?.as_i64())
         .unwrap_or(0)
-}
-
-fn max_completion_tokens(model: &str) -> i64 {
-    model_info_int(model, "max_completion_tokens")
 }
 
 /// The `max_tokens` an OpenAI Chat or Responses request without one gets: the
 /// registered model's output limit, except that Fable keeps its 64000 ceiling.
-pub(crate) fn default_max_tokens(model: &str) -> i64 {
+pub(crate) fn default_max_tokens(model: &str, info: Option<&cpa_core::registry::ModelInfo>) -> i64 {
     let fable = model.trim().go_lower().contains("fable");
     let base = if fable { 64000 } else { 32000 };
-    match max_completion_tokens(model) {
+    match max_completion_tokens(info) {
         limit if limit <= 0 || (fable && limit >= base) => base,
         limit => limit,
     }

@@ -59,6 +59,7 @@ fn request(body: impl Into<Bytes>, model: &str, stream: bool, alt: Option<&str>)
         headers: HeaderMap::new(),
         execution_session: None,
         derived_session: None,
+        registry: None,
         resolved_model: None,
         usage: Default::default(),
         request_path: String::new(),

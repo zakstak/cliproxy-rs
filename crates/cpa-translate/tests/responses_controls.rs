@@ -12,6 +12,7 @@ use cpa_core::format::Format;
 use cpa_translate::{Error, RequestCtx, claude_to_codex_with_compat, codex_request, translate_request};
 
 const CTX: RequestCtx<'static> = RequestCtx {
+    registry: None,
     model: "grok-4.7",
     stream: true,
     tool_search: false,

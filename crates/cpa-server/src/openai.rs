@@ -499,7 +499,9 @@ pub async fn responses(
     let native = dispatch::NativeRequest::new(body.clone(), headers.clone(), path.clone());
     // A body the preparation leaves alone keeps the client's buffer, so a native request
     // holds one copy of its body, not two (#29).
-    let body = match cpa_common::codex_client::prepare_responses_request_if_changed(&headers, &body, &settings) {
+    let body = match cpa_common::codex_client::prepare_responses_request_if_changed(&headers, &body, &settings, || {
+        crate::codex_models::spawn_agent_models(&rt)
+    }) {
         Some(prepared) => Bytes::from(prepared),
         None => body,
     };

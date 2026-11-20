@@ -12,6 +12,7 @@ use cpa_translate::{RequestCtx, ResponseCtx, pair, translate_request};
 use serde_json::{Value, json};
 
 const CTX: RequestCtx<'static> = RequestCtx {
+    registry: None,
     model: "claude-opus-5-5",
     stream: true,
     tool_search: false,

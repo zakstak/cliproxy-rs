@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 fn convert(mut request: Value, enabled: bool) -> Value {
     request["model"] = json!("claude-sonnet-4-5");
     let ctx = RequestCtx {
+        registry: None,
         model: "claude-sonnet-4-5",
         stream: false,
         tool_search: enabled,

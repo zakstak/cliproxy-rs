@@ -35,6 +35,7 @@ fn supported_format_pairs_and_token_count_adapters() {
 #[test]
 fn unregistered_pairs_only_rewrite_the_model_and_keep_unknown_bytes() {
     let ctx = RequestCtx {
+        registry: None,
         model: "chosen",
         stream: false,
         tool_search: false,

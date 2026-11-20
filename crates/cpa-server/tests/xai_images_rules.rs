@@ -13,10 +13,6 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// `install_registry` sets the process-wide registry the image routes read (Go's
-/// global registry): one test at a time, each using the runtime it installed last.
-static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Requests one mock upstream received: path and JSON body.
 type Seen = Arc<Mutex<Vec<(String, Value)>>>;
 
@@ -109,7 +105,6 @@ async fn proxy(credentials: &[(&str, &str)], extra: &str) -> Proxy {
         xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
-    cpa_server::install_registry(&rt);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let app = cpa_server::router(rt.clone());
@@ -156,7 +151,6 @@ const DEFAULTS: &str = "payload:\n  default:\n    - models: [{name: \"grok-imagi
 /// follows the format sent upstream.
 #[tokio::test]
 async fn default_rules_fill_only_what_the_client_left_out() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream().await;
     let p = proxy(&[("", &up)], DEFAULTS).await;
     let (status, body) = generate(&p.addr, json!({"model": "grok-imagine-image", "prompt": "draw"})).await;
@@ -186,7 +180,6 @@ async fn default_rules_fill_only_what_the_client_left_out() {
 /// JSON and as a multipart form.
 #[tokio::test]
 async fn default_rules_fill_an_edits_response_format() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream().await;
     let p = proxy(&[("", &up)], DEFAULTS).await;
     let edit =
@@ -230,7 +223,6 @@ async fn default_rules_fill_an_edits_response_format() {
 /// back as `b64_json`, not as a data URL.
 #[tokio::test]
 async fn the_answer_follows_the_rule_settled_format() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream().await;
     let rules = "payload:\n  override:\n    - models: [{name: \"grok-imagine-*\"}]\n      params: {response_format: b64_json}\n";
     let p = proxy(&[("", &up)], rules).await;
@@ -300,7 +292,6 @@ impl cpa_server::remote::RemoteDispatch for HomePick {
 /// format from the finalized upstream request, for both buffered and streamed answers.
 #[tokio::test]
 async fn home_selected_credentials_use_the_rule_settled_format() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream().await;
     let p = proxy(&[("", &up)], DEFAULTS).await;
     let auth_dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("xai-images-home");
@@ -348,7 +339,6 @@ const FORCED: &str = "routing:\n  force-model-prefix: true\n";
 /// `team` credential, and `xai/` reaches a credential whose prefix is `xai`.
 #[tokio::test]
 async fn registered_prefixes_route_to_their_credential() {
-    let _registry = REGISTRY.lock().await;
     for extra in ["", FORCED] {
         let (team, team_seen) = upstream().await;
         let (plain, plain_seen) = upstream().await;
@@ -371,7 +361,6 @@ async fn registered_prefixes_route_to_their_credential() {
 /// the unprefixed credentials (8a3e7622); any other unregistered prefix is refused.
 #[tokio::test]
 async fn vendor_aliases_fall_back_under_force_model_prefix() {
-    let _registry = REGISTRY.lock().await;
     let (team, team_seen) = upstream().await;
     let (plain, plain_seen) = upstream().await;
     let p = proxy(&[("team", &team), ("", &plain)], FORCED).await;

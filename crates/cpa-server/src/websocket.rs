@@ -1199,7 +1199,9 @@ impl Connection {
         }
         if fallback_error.is_none() && (client.optimize_multi_agent_v2 || client.orphan_delegation) {
             let prepared =
-                cpa_common::codex_client::prepare_responses_request(&self.headers, request.as_bytes(), &client);
+                cpa_common::codex_client::prepare_responses_request(&self.headers, request.as_bytes(), &client, || {
+                    crate::codex_models::spawn_agent_models(&self.rt)
+                });
             request = String::from_utf8(prepared).unwrap_or(request);
         }
 

@@ -552,6 +552,7 @@ mod tests {
     #[test]
     fn translated_clients_keep_the_output_limit() {
         let ctx = crate::RequestCtx {
+            registry: None,
             model: "grok-4.7",
             stream: true,
             tool_search: false,
@@ -597,6 +598,7 @@ mod tests {
     #[test]
     fn translated_clients_refuse_unreadable_controls() {
         let ctx = crate::RequestCtx {
+            registry: None,
             model: "grok-4.7",
             stream: true,
             system_turns: false,

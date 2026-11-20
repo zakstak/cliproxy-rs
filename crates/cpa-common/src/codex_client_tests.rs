@@ -259,8 +259,8 @@ fn prepare_if_changed_matches_the_full_preparation() {
             optimize_multi_agent_v2: true,
             orphan_delegation: orphan_on,
         };
-        let full = prepare_responses_request(&headers, body, &settings);
-        let changed = prepare_responses_request_if_changed(&headers, body, &settings);
+        let full = prepare_responses_request(&headers, body, &settings, String::new);
+        let changed = prepare_responses_request_if_changed(&headers, body, &settings, String::new);
         assert_eq!(changed.as_deref().unwrap_or(body), full.as_slice());
         assert_eq!(changed.is_some(), full != body);
     }

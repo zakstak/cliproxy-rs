@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 fn translate(system_turns: bool, body: &Value) -> Value {
     let ctx = RequestCtx {
+        registry: None,
         model: "claude-opus-4-8",
         stream: false,
         tool_search: false,

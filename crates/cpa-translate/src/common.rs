@@ -1142,6 +1142,7 @@ mod tests {
                 r#"{{"model":"m","max_tokens":10,"messages":[{{"role":"user","content":[{{"type":"image","source":{{"type":"url","url":"{url}"}}}}]}}]}}"#
             );
             let ctx = crate::RequestCtx {
+                registry: None,
                 model: "m",
                 stream: false,
                 tool_search: false,
