@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bytes::Bytes;
-use cpa_common::gostr::{GoStr, quote as go_quote, trim_space};
+use cpa_common::gostr::{GoStr, query_escape, quote as go_quote, trim_space};
 use cpa_common::json::{self as gj, GoValue, Kind};
 use cpa_core::config::Config;
 use cpa_core::credential::Credential;
@@ -612,19 +612,6 @@ fn query_first(query: &str, name: &str) -> Option<String> {
             let (k, v) = (unescape(k, true)?, unescape(v, true)?);
             (k == name.as_bytes()).then(|| String::from_utf8_lossy(&v).into_owned())
         })
-}
-
-/// `url.QueryEscape`.
-fn query_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 /// The three sideband URL shapes (`sidebandStyle`).
