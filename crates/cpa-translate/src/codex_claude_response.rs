@@ -35,7 +35,7 @@ struct Call {
 
 #[derive(Default)]
 struct State {
-    original: Vec<u8>,
+    short_to_original: HashMap<Vec<u8>, Vec<u8>>,
     has_emitted_tool_use: bool,
     block_index: i64,
     has_text_delta: bool,
@@ -62,7 +62,7 @@ struct State {
 
 pub fn go_stream(ctx: &ResponseCtx<'_>) -> Box<dyn GoStream> {
     Box::new(State {
-        original: ctx.original_request.to_vec(),
+        short_to_original: short_to_original(ctx.original_request),
         ..Default::default()
     })
 }
@@ -400,9 +400,8 @@ impl State {
                 "content_block.id",
                 shorten_call_id(&sanitize_claude_tool_id(&c.call_id)),
             );
-            let names = short_to_original(&self.original);
-            let name = names.get(&c.name).cloned().unwrap_or_else(|| c.name.clone());
-            gj::set_str(&mut start, "content_block.name", &name);
+            let name = self.short_to_original.get(&c.name).unwrap_or(&c.name);
+            gj::set_str(&mut start, "content_block.name", name);
             event(out, "content_block_start", &start);
             if c.emit_initial_empty_delta {
                 Self::argument_delta(out, b"", c.block_index);

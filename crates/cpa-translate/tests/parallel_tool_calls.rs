@@ -278,6 +278,53 @@ fn responses_to_chat_keeps_parallel_calls_and_reasoning_count() {
 }
 
 #[test]
+fn responses_to_claude_restores_colliding_tool_names_in_call_order() {
+    let namespace = "x".repeat(64);
+    let first = format!("mcp__{namespace}_first__lookup");
+    let second = format!("mcp__{namespace}_second__lookup");
+    let request = serde_json::to_vec(&json!({"tools":[
+        {"name":first,"input_schema":{"type":"object"}},
+        {"name":second,"input_schema":{"type":"object"}}
+    ]}))
+    .unwrap();
+
+    // Call the second declaration first, then a tool absent from the name map.
+    let mut events = vec![];
+    let mut output = vec![];
+    for (index, name) in ["mcp__lookup_1", "undeclared", "mcp__lookup"].iter().enumerate() {
+        let mut item = json!({"type":"function_call","call_id":format!("call_{index}"),"name":name,"arguments":""});
+        events.push(json!({"type":"response.output_item.added","output_index":index,"item":item}));
+        item["arguments"] = json!("{}");
+        output.push(item);
+    }
+    let completed = json!({"type":"response.completed","response":{"output":output}});
+    events.push(completed.clone());
+
+    let expected = [second.as_str(), "undeclared", first.as_str()];
+    let streamed = stream(Format::Claude, Format::Codex, &request, &events);
+    let names: Vec<_> = streamed
+        .iter()
+        .filter(|event| event["type"] == "content_block_start")
+        .map(|event| event["content_block"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, expected);
+
+    let buffered = non_stream(
+        Format::Claude,
+        Format::Codex,
+        &request,
+        completed.to_string().as_bytes(),
+    );
+    let names: Vec<_> = buffered["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, expected);
+}
+
+#[test]
 fn responses_to_claude_keeps_parallel_calls_and_reasoning_parts() {
     let events = stream(Format::Claude, Format::Codex, CLAUDE, &responses_events());
     let mut blocks: Vec<(i64, Value)> = events
