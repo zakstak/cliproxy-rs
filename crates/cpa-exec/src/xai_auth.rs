@@ -16,6 +16,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use cpa_common::gostr::{GoStr, quote, values_encode};
 use cpa_common::json::{self as gj, GoValue, Kind};
 use cpa_core::config::Config;
+use cpa_core::config::credentials::canonical_metadata_key;
 use cpa_core::credential::{Credential, MetadataPatch};
 use cpa_core::exec::{ExecError, FailureScope};
 use futures_util::FutureExt;
@@ -1017,36 +1018,17 @@ fn is_token_key(key: &str) -> bool {
     )
 }
 
-/// `CanonicalCredentialMetadataKey`.
-fn canonical_key(key: &str) -> &str {
-    match key {
-        "api-key" => "api_key",
-        "base-url" => "base_url",
-        "disable-cooling" => "disable_cooling",
-        "excluded-models" => "excluded_models",
-        "fingerprint-profile" => "fingerprint_profile",
-        "model-aliases" => "model_aliases",
-        "openapi-location" => "openapi_location",
-        "openapi-models" => "openapi_models",
-        "proxy-url" => "proxy_url",
-        "request-retry" => "request_retry",
-        "request-scoped-errors" => "request_scoped_errors",
-        "tool-prefix-disabled" => "tool_prefix_disabled",
-        other => other,
-    }
-}
-
 /// `NormalizeCredentialMetadata` on one document: each legacy key takes its canonical
 /// name unless the document already has that name, which then wins.
 fn normalize_keys(document: &mut BTreeMap<String, GoValue>) {
     let aliases: Vec<String> = document
         .keys()
-        .filter(|k| canonical_key(k) != k.as_str())
+        .filter(|k| canonical_metadata_key(k) != k.as_str())
         .cloned()
         .collect();
     for key in aliases {
         let value = document.remove(&key).expect("present");
-        document.entry(canonical_key(&key).to_owned()).or_insert(value);
+        document.entry(canonical_metadata_key(&key).to_owned()).or_insert(value);
     }
 }
 

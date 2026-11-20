@@ -92,6 +92,8 @@ pub struct ExecRequest {
     /// Contains client credentials: never log or forward wholesale.
     pub headers: HeaderMap,
     pub caller: Caller,
+    /// Registrations from the dispatching runtime. Standalone requests use the pinned catalog.
+    pub registry: Option<std::sync::Arc<crate::registry::dynamic::Registry>>,
     /// Go `cliproxyauth.ResolvedModelInfo(req)`: the model capabilities the dispatch
     /// loop bound to this attempt for the selected credential and upstream model (Go
     /// `attachResolvedExecutionModelInfo`, sdk/cliproxy/auth/api_key_model_capabilities.go).

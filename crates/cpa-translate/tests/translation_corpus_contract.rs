@@ -79,6 +79,7 @@ fn every_request_context_carries_a_fresh_user_turn_and_tool_schema() {
             }
             let model = case["model"].as_str().unwrap();
             let ctx = RequestCtx {
+                registry: None,
                 model,
                 stream: case["stream"].as_bool().unwrap_or(false),
                 tool_search: false,

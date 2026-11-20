@@ -1152,6 +1152,7 @@ impl<'a> Ctx<'a> {
     fn apply_thinking(&self, req: &ExecRequest, body: String) -> Result<String, ExecError> {
         use cpa_common::thinking::{RequestThinking, apply_request_thinking};
         apply_request_thinking(&RequestThinking {
+            registry: req.registry.as_deref(),
             body: body.as_bytes(),
             payload: &req.body,
             original: &req.original_body,
@@ -1376,7 +1377,7 @@ impl<'a> Ctx<'a> {
                 }
             }
         }
-        body = self.ensure_max_tokens(body);
+        body = self.ensure_max_tokens(body, req.registry.as_deref());
         if !caller_thinking {
             body = disable_thinking_if_tool_choice_forced(body);
         }
@@ -1886,22 +1887,21 @@ impl<'a> Ctx<'a> {
 
     /// `ensureModelMaxTokens`: only a model some Claude credential registered gets a
     /// default `max_tokens`, its registered completion limit or 1024.
-    fn ensure_max_tokens(&self, body: String) -> String {
+    fn ensure_max_tokens(&self, body: String, registry: Option<&cpa_core::registry::dynamic::Registry>) -> String {
+        let Some(registry) = registry else { return body };
         let model = self.base_model.trim();
         if !rawjson::valid(&body)
             || rawjson::get(&body, "max_tokens").exists()
-            || !cpa_core::registry::model_providers(model)
+            || !registry
+                .model_providers(model)
                 .iter()
                 .any(|p| p.eq_ignore_ascii_case("claude"))
         {
             return body;
         }
-        let max = cpa_core::registry::registered_model(model, Some("claude"))
-            .and_then(|info| {
-                info.raw
-                    .get("max_completion_tokens")
-                    .and_then(serde_json::Value::as_i64)
-            })
+        let max = registry
+            .info(model, Some("claude"))
+            .map(|spec| spec.max_completion_tokens)
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_TOKENS);
         rawjson::set_raw(&body, "max_tokens", &max.to_string())

@@ -13,6 +13,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use cpa_common::gostr::values_encode;
 use cpa_common::json::{self as gj, GoValue};
+use cpa_core::config::credentials::canonical_metadata_key;
 use cpa_core::exec::{ExecError, FailureScope};
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
@@ -728,25 +729,6 @@ fn is_token_payload_key(key: &str) -> bool {
     )
 }
 
-/// `CanonicalCredentialMetadataKey`.
-fn canonical_key(key: &str) -> &str {
-    match key {
-        "api-key" => "api_key",
-        "base-url" => "base_url",
-        "disable-cooling" => "disable_cooling",
-        "excluded-models" => "excluded_models",
-        "fingerprint-profile" => "fingerprint_profile",
-        "model-aliases" => "model_aliases",
-        "openapi-location" => "openapi_location",
-        "openapi-models" => "openapi_models",
-        "proxy-url" => "proxy_url",
-        "request-retry" => "request_retry",
-        "request-scoped-errors" => "request_scoped_errors",
-        "tool-prefix-disabled" => "tool_prefix_disabled",
-        other => other,
-    }
-}
-
 /// `MergeExistingAuthMetadata` for a login that lands on an existing file: user settings
 /// survive, token payload (and Meta's key material) does not. Returns the disabled flag
 /// the file carried, unless the new metadata sets one.
@@ -762,7 +744,7 @@ pub(crate) fn merge_existing(metadata: &mut GoMap, existing: &GoMap, provider: &
         }
         if meta
             && matches!(
-                canonical_key(key),
+                canonical_metadata_key(key),
                 "api_key" | "dca_token" | "dca_expired" | "dca_expires_at"
             )
         {
@@ -777,11 +759,11 @@ pub(crate) fn merge_existing(metadata: &mut GoMap, existing: &GoMap, provider: &
 pub(crate) fn normalize_metadata(metadata: &mut GoMap) {
     let aliases: Vec<String> = metadata
         .keys()
-        .filter(|k| canonical_key(k) != k.as_str())
+        .filter(|k| canonical_metadata_key(k) != k.as_str())
         .cloned()
         .collect();
     for alias in aliases {
-        let canonical = canonical_key(&alias).to_owned();
+        let canonical = canonical_metadata_key(&alias).to_owned();
         if let Some(value) = metadata.remove(&alias) {
             metadata.entry(canonical).or_insert(value);
         }
@@ -1014,6 +996,18 @@ mod tests {
             go_float("1e400").is_none(),
             "unrepresentable metadata must be flagged, not persisted as infinity"
         );
+    }
+
+    #[test]
+    fn normalization_renames_only_known_top_level_aliases() {
+        let (mut metadata, _) = go_map_from_json(
+            br#"{"proxy-url":"old","proxy_url":null,"request-retry":3,"vendor-setting":{"api-key":true}}"#,
+        )
+        .unwrap();
+        normalize_metadata(&mut metadata);
+        let (expected, _) =
+            go_map_from_json(br#"{"proxy_url":null,"request_retry":3,"vendor-setting":{"api-key":true}}"#).unwrap();
+        assert_eq!(metadata, expected);
     }
 
     #[test]

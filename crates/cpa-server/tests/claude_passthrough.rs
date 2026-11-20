@@ -124,18 +124,11 @@ async fn proxy(dir: &Path, upstream_url: &str) -> String {
         max_retry_credentials: 1,
         ..Default::default()
     });
-    // Like main.rs (Go's global registry): the executor reads registered models, for
-    // example for the default max_tokens. Callers hold REGISTRY while the overlay is theirs.
-    cpa_server::install_registry(&rt);
     serve(router(rt)).await
 }
 
-/// One test at a time owns the process-wide registry overlay.
-static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 #[tokio::test]
 async fn claude_messages_end_to_end() {
-    let _registry = REGISTRY.lock().await;
     let log: Log = Arc::default();
     let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(log.clone())).await;
     let dir = auth_dir(
@@ -302,7 +295,6 @@ data: {"type":"error","error":{"type":"api_error","message":"unexpected EOF"#
 
 #[tokio::test]
 async fn disabled_and_removed_provider_models_fail_without_upstream_calls() {
-    let _registry = REGISTRY.lock().await;
     let dir = auth_dir(
         "empty",
         &[
@@ -363,7 +355,6 @@ async fn disabled_and_removed_provider_models_fail_without_upstream_calls() {
 async fn request_log_masks_upstream_credentials() {
     const API_KEY: &str = "sk-upstream-secret-0123456789";
     const HEADER_KEY: &str = "custom-header-secret-abcdef";
-    let _registry = REGISTRY.lock().await;
     let log: Log = Arc::default();
     let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(log.clone())).await;
     let dir = auth_dir("request-log", &[]);
@@ -387,7 +378,6 @@ async fn request_log_masks_upstream_credentials() {
         xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, creds, executors));
-    cpa_server::install_registry(&rt);
     let management = cpa_server::management::Management::with_options(
         rt.clone(),
         dir.join("config.yaml"),
@@ -554,9 +544,49 @@ async fn usage_proxy_with(dir: &Path, upstream_url: &str, extra: &str) -> (Arc<c
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, creds, executors));
     rt.usage_queue().configure(true, &rt.config());
-    cpa_server::install_registry(&rt);
     let proxy = serve(cpa_server::observability::router(&rt, router(rt.clone()))).await;
     (rt, format!("{proxy}/v1/messages"))
+}
+
+#[tokio::test]
+async fn concurrent_runtimes_translate_with_their_own_model_registration() {
+    async fn start(name: &str, models: &str) -> (String, Log) {
+        let log: Log = Arc::default();
+        let upstream = serve(axum::Router::new().fallback(upstream).with_state(log.clone())).await;
+        let (_, url) = usage_proxy_with(&auth_dir(name, &[]), &upstream, models).await;
+        (url.trim_end_matches("/v1/messages").to_owned(), log)
+    }
+
+    let (standard, standard_log) = start("registry-standard", "").await;
+    let (custom, custom_log) = start("registry-custom", "    models: [{name: claude-opus-5-5}]\n").await;
+    let client = wreq::Client::new();
+    for (route, input) in [
+        ("chat/completions", r#""messages":[{"role":"user","content":"hi"}]"#),
+        ("responses", r#""input":"hi""#),
+    ] {
+        let body = format!(r#"{{"model":"claude-opus-5-5","stream":true,{input}}}"#);
+        let post = |proxy: &str| {
+            client
+                .post(format!("{proxy}/v1/{route}"))
+                .header("x-api-key", "client-key-1")
+                .body(body.clone())
+                .send()
+        };
+        let (left, right) = tokio::join!(post(&standard), post(&custom));
+        for response in [left, right] {
+            let response = response.unwrap();
+            assert_eq!(response.status().as_u16(), 200, "{route}");
+            response.bytes().await.unwrap();
+        }
+        // The built-in registration has a completion limit. A configured model with
+        // the same ID has none, so the translator supplies its 32k default.
+        for (log, limit) in [(&standard_log, 128_000), (&custom_log, 32_000)] {
+            let calls = std::mem::take(&mut *log.lock().unwrap());
+            assert_eq!(calls.len(), 1, "{route}");
+            let sent: serde_json::Value = serde_json::from_slice(&calls[0].body).unwrap();
+            assert_eq!(sent["max_tokens"], limit, "{route}");
+        }
+    }
 }
 
 /// The next `count` usage records, as JSON. A stream's record is published as the
@@ -579,7 +609,6 @@ async fn usage_records(rt: &cpa_server::Runtime, count: usize) -> Vec<serde_json
 /// request on the pooled connection reported as reused.
 #[tokio::test]
 async fn usage_record_times_each_stage() {
-    let _registry = REGISTRY.lock().await;
     let seen = Arc::default();
     let upstream_url = slow_upstream(Arc::clone(&seen)).await;
     let dir = auth_dir("timings", &[]);
@@ -709,7 +738,6 @@ async fn usage_record_times_each_stage() {
 /// `prompt_prefix_hash`. No prompt text is kept.
 #[tokio::test]
 async fn usage_record_names_the_conversation_and_prompt_prefix() {
-    let _registry = REGISTRY.lock().await;
     let upstream_url = slow_upstream(Arc::default()).await;
     let dir = auth_dir("conversation", &[]);
     let (rt, url) = usage_proxy(&dir, &upstream_url).await;
@@ -791,7 +819,6 @@ async fn usage_record_names_the_conversation_and_prompt_prefix() {
 /// telemetry off changes neither the prepared request bytes nor the response bytes.
 #[tokio::test]
 async fn claude_cache_telemetry_is_final_content_free_and_observational() {
-    let _registry = REGISTRY.lock().await;
     const REPLY: &str = r#"{"id":"msg_cache","type":"message","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":13,"output_tokens":3,"cache_read_input_tokens":1700,"cache_creation_input_tokens":900,"cache_creation":{"ephemeral_5m_input_tokens":217,"ephemeral_1h_input_tokens":683}}}"#;
     let seen: Log = Arc::default();
     let upstream_url = serve(
@@ -981,7 +1008,6 @@ async fn claude_cache_telemetry_is_final_content_free_and_observational() {
 /// tools. Automatic caching skips ineligible suffixes without inventing a write.
 #[tokio::test]
 async fn claude_cache_telemetry_lookup_boundaries_and_automatic_targets() {
-    let _registry = REGISTRY.lock().await;
     let log: Log = Arc::default();
     let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(log)).await;
     let dir = auth_dir("cache-lookup", &[]);
@@ -1115,7 +1141,6 @@ async fn claude_cache_telemetry_lookup_boundaries_and_automatic_targets() {
 /// API's default, `auto`), and without a rule the client's tier is sent and recorded.
 #[tokio::test]
 async fn usage_record_names_the_service_tier_sent_after_payload_rules() {
-    let _registry = REGISTRY.lock().await;
     let rule = |kind: &str, params: &str| {
         format!("payload:\n  {kind}:\n    - models: [{{name: \"claude-*\"}}]\n      params: {params}\n")
     };
@@ -1165,7 +1190,6 @@ async fn usage_record_names_the_service_tier_sent_after_payload_rules() {
 /// `output_config`, an unknown member included, byte for byte, buffered and streamed.
 #[tokio::test]
 async fn native_claude_keeps_standalone_effort() {
-    let _registry = REGISTRY.lock().await;
     let log: Log = Arc::default();
     let upstream_url = serve(axum::Router::new().fallback(upstream).with_state(log.clone())).await;
     let dir = auth_dir(

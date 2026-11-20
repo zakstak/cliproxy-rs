@@ -207,12 +207,6 @@ async fn go_framing(req: axum::extract::Request, next: middleware::Next) -> Resp
     Response::from_parts(parts, Body::from_stream(chunks))
 }
 
-/// Installs the runtime's model registry as the translators' capability lookup
-/// (`cpa_core::registry::lookup_model`). Call once at startup.
-pub fn install_registry(rt: &Arc<Runtime>) {
-    cpa_core::registry::install_overlay(Some(Arc::new(registry::Overlay(Arc::downgrade(rt)))));
-}
-
 async fn healthz(method: Method) -> Response {
     if method == Method::HEAD {
         return StatusCode::OK.into_response();

@@ -248,7 +248,6 @@ async fn proxy_with(keys: &[(&str, bool)], extra: &str) -> Proxy {
         xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
-    cpa_server::install_registry(&rt);
     let addr = serve(router(rt.clone())).await;
     Proxy {
         addr,
@@ -256,9 +255,6 @@ async fn proxy_with(keys: &[(&str, bool)], extra: &str) -> Proxy {
         _auth_dir: AuthDir(dir),
     }
 }
-
-/// Serializes the tests: the model registry overlay is process-wide.
-static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 type Socket = wreq::ws::WebSocket;
 
@@ -402,7 +398,6 @@ fn closed(frames: &[Frame]) -> bool {
 
 #[tokio::test]
 async fn one_exhausted_account_fails_over_without_an_error() {
-    let _registry = REGISTRY.lock().await;
     let proxy = proxy(&[("sk-fake-a", false), ("sk-fake-b", false)]).await;
     // Whichever key the scheduler picks first is exhausted; the other one serves.
     proxy
@@ -422,7 +417,6 @@ async fn one_exhausted_account_fails_over_without_an_error() {
 
 #[tokio::test]
 async fn all_accounts_exhausted_deliver_the_structured_limit() {
-    let _registry = REGISTRY.lock().await;
     let proxy = proxy(&[("sk-fake-a", false), ("sk-fake-b", false)]).await;
     let resets_at = now() + 3600;
     for key in ["sk-fake-a", "sk-fake-b"] {
@@ -478,7 +472,6 @@ async fn all_accounts_exhausted_deliver_the_structured_limit() {
 
 #[tokio::test]
 async fn other_clients_keep_the_silent_close() {
-    let _registry = REGISTRY.lock().await;
     let proxy = proxy(&[("sk-fake-a", false)]).await;
     proxy.mock.push("sk-fake-a", http_limit(now() + 3600));
     let mut socket = connect(&proxy, false).await;
@@ -490,7 +483,6 @@ async fn other_clients_keep_the_silent_close() {
 
 #[tokio::test]
 async fn other_rate_limits_keep_the_silent_close() {
-    let _registry = REGISTRY.lock().await;
     let proxy = proxy(&[("sk-fake-a", false)]).await;
     let body = json!({"error": {"type": "rate_limit_error", "code": "rate_limit_exceeded", "message": "slow down"}});
     proxy.mock.push(
@@ -508,7 +500,6 @@ async fn other_rate_limits_keep_the_silent_close() {
 /// error event with its own headers).
 #[tokio::test]
 async fn first_frame_rejection_delivers_the_structured_limit() {
-    let _registry = REGISTRY.lock().await;
     let proxy = proxy(&[("sk-fake-ws", true)]).await;
     let resets_at = now() + 1800;
     let event = json!({
@@ -532,7 +523,6 @@ async fn first_frame_rejection_delivers_the_structured_limit() {
 /// `resets_in_seconds` alone still tells Codex when the limit resets.
 #[tokio::test]
 async fn relative_reset_becomes_an_absolute_reset() {
-    let _registry = REGISTRY.lock().await;
     let proxy = proxy(&[("sk-fake-ws", true)]).await;
     let event = r#"{"type":"error","status":429,"error":{"type":"usage_limit_reached","message":"limit","resets_in_seconds":600}}"#;
     proxy.mock.push("sk-fake-ws", json!({"events": [event]}));
@@ -553,7 +543,6 @@ async fn relative_reset_becomes_an_absolute_reset() {
 /// none it gets the limit.
 #[tokio::test]
 async fn pinned_continuation_at_its_limit() {
-    let _registry = REGISTRY.lock().await;
     let resets_at = now() + 900;
     let limit_event = json!({
         "type": "error",
@@ -619,7 +608,6 @@ async fn limit_after_streamed_output_on_the_upstream_socket() {
 }
 
 async fn limit_after_output(websocket: bool) {
-    let _registry = REGISTRY.lock().await;
     let proxy = proxy(&[("sk-fake-a", websocket)]).await;
     let resets_at = now() + 7200;
     let failed = json!({
@@ -709,7 +697,6 @@ async fn native_account_failures_after_start_never_reach_the_client_as_sent() {
     for steering in [false, true] {
         for codex_client in [true, false] {
             for (shape, failure) in account_failures(now() + 7200) {
-                let _registry = REGISTRY.lock().await;
                 let config = if steering { STEERING } else { "" };
                 let proxy = proxy_with(&[("sk-fake-a", true)], config).await;
                 let name = format!("steering={steering} codex={codex_client} {shape}");
@@ -762,7 +749,6 @@ async fn native_account_failures_after_start_never_reach_the_client_as_sent() {
 #[tokio::test]
 async fn native_account_failure_of_a_pending_create_never_reaches_the_client_as_sent() {
     for (shape, failure) in account_failures(now() + 7200) {
-        let _registry = REGISTRY.lock().await;
         let proxy = proxy_with(&[("sk-fake-a", true)], STEERING).await;
         proxy.mock.push("sk-fake-a", json!({"events": [created("resp_1")]}));
         proxy.mock.push("sk-fake-a", json!({"events": [failure]}));

@@ -25,7 +25,6 @@ async fn main() -> anyhow::Result<()> {
     };
     // The deny-all test runtime: a credential that is not local cannot leave the machine.
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
-    cpa_server::install_registry(&rt);
     let options = cpa_server::management::Options { login_base: Some(login_base), ..Default::default() };
     let management = cpa_server::management::Management::with_options(rt.clone(), path, options);
     let _watcher = cpa_server::watching::start(&management);

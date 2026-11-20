@@ -87,6 +87,7 @@ pub(crate) fn translate_request(
     let summary = extract_translated_summary_config(&payload, from.as_str(), to.as_str());
     let translated = translate(ctx, &payload)?;
     Ok(apply_summary_config_for_model(
+        ctx.registry,
         &translated,
         to.as_str(),
         ctx.model,

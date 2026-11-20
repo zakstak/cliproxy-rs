@@ -699,8 +699,8 @@ fn raw_models(v: Option<&Value>) -> Vec<Json> {
         .collect()
 }
 
-/// Go's legacy credential metadata keys and their canonical names.
-const LEGACY_METADATA_KEYS: [(&str, &str); 12] = [
+/// Legacy credential metadata keys and their canonical names, in normalization order.
+pub const LEGACY_METADATA_KEYS: [(&str, &str); 12] = [
     ("api-key", "api_key"),
     ("base-url", "base_url"),
     ("disable-cooling", "disable_cooling"),

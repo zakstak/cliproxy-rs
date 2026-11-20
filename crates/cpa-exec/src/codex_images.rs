@@ -236,7 +236,7 @@ impl CodexExecutor {
     ) -> Result<ExecResponse, ExecError> {
         let prepared = prepare(&req, json, path)?;
         let main_model = main_model(&settings.image_base_model);
-        let body = tool_body(&prepared.body, main_model)?;
+        let body = tool_body(&prepared.body, main_model, req.registry.as_deref())?;
         // No synthesized prompt-cache key in the body (#27); the session identity reaches
         // the headers only, and #26 owns those. The input is the adapter's own.
         let cache = request::session_uuid(&req, None);
@@ -1174,8 +1174,13 @@ fn responses_request(prompt: &str, images: &[Image], tool: &str) -> String {
 }
 
 /// `prepareCodexOpenAIImageBody`: thinking, then the Codex request rules.
-fn tool_body(body: &str, main_model: &str) -> Result<String, ExecError> {
+fn tool_body(
+    body: &str,
+    main_model: &str,
+    registry: Option<&cpa_core::registry::dynamic::Registry>,
+) -> Result<String, ExecError> {
     let thought = cpa_common::thinking::apply_thinking_with_source_payload(
+        registry,
         body.as_bytes(),
         body.as_bytes(),
         body.as_bytes(),
@@ -1365,6 +1370,7 @@ mod tests {
             headers: Default::default(),
             execution_session: None,
             derived_session: None,
+            registry: None,
             resolved_model: None,
             usage: Default::default(),
             request_path: String::new(),

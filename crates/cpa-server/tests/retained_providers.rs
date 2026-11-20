@@ -171,7 +171,6 @@ async fn proxy_with(provider: Provider, replies: Vec<Reply>, extra: &str) -> Pro
         xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
-    cpa_server::install_registry(&rt);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = cpa_server::router(rt.clone());

@@ -150,6 +150,30 @@ fn openai_map(m: &Spec) -> BTreeMap<String, GoValue> {
     out
 }
 
+/// The models this runtime can serve, for the Codex client's `spawn_agent` tool.
+pub(crate) fn spawn_agent_models(rt: &Runtime) -> String {
+    use cpa_common::codex_catalog::Registry as _;
+    use cpa_common::codex_client::{self, AvailableModel};
+
+    let registry = rt.registry();
+    let available = registry
+        .available_with(|c, m| rt.suspension(c, m))
+        .map(|spec| AvailableModel {
+            id: spec.id.clone(),
+            display_name: spec.display_name.clone(),
+            description: spec.description.clone(),
+        })
+        .collect::<Vec<_>>();
+    let facts = Facts(&registry);
+    codex_client::spawn_agent_models(&available, &|id| {
+        let info = facts.lookup(id, None)?;
+        Some(codex_client::ModelFacts {
+            description: info.description,
+            thinking_levels: info.thinking.map(|t| t.levels).unwrap_or_default(),
+        })
+    })
+}
+
 struct Facts<'a>(&'a Registry);
 
 fn from_spec(s: &Spec) -> ModelFacts {

@@ -46,6 +46,7 @@ fn request(source: Format, body: impl Into<Bytes>, stream: bool, alt: Option<&st
         headers: HeaderMap::new(),
         execution_session: None,
         derived_session: None,
+        registry: None,
         resolved_model: None,
         usage: Default::default(),
         request_path: String::new(),

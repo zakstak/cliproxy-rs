@@ -21,6 +21,7 @@ fn pairs() -> [(Format, Format); 7] {
 }
 fn convert(client: Format, upstream: Format, body: &Value) -> Value {
     let ctx = RequestCtx {
+        registry: None,
         model: "chosen",
         stream: true,
         tool_search: false,
@@ -274,6 +275,7 @@ fn attachment_conversion_keeps_bytes_metadata_and_neighboring_text() {
 #[test]
 fn unsupported_attachments_refuse_each_emptied_user_turn_but_keep_text_neighbors() {
     let ctx = RequestCtx {
+        registry: None,
         model: "chosen",
         stream: false,
         tool_search: false,
@@ -805,6 +807,7 @@ fn codex_reasoning_carriers_replay_opaquely_in_order_and_foreign_thinking_is_ref
     token[40] = 9;
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token);
     let ctx = RequestCtx {
+        registry: None,
         model: "gpt-5",
         stream: true,
         tool_search: false,

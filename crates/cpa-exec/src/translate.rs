@@ -138,6 +138,7 @@ fn translate_body(
     system_turns: bool,
 ) -> Result<Bytes, ExecError> {
     let ctx = RequestCtx {
+        registry: req.registry.as_deref(),
         model,
         stream: req.stream || req.source_format != Format::Claude,
         tool_search,
@@ -388,6 +389,7 @@ mod tests {
             session: None,
             execution_session: None,
             derived_session: None,
+            registry: None,
             resolved_model: None,
             usage: Default::default(),
             request_path: String::new(),
