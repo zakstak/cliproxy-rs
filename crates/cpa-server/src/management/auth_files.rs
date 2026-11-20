@@ -848,7 +848,7 @@ fn prepare_upload(state: &Management, name: &str, data: &[u8]) -> Result<Upload,
     // Loading tolerates invalid exclusion rules, so they are rejected here (Go 1a28c61e),
     // after Go's `NormalizeCredentialMetadata`, so an error names the canonical key.
     let mut canonical = meta.clone();
-    for (alias, canon) in ALIASES {
+    for (alias, canon) in &credentials::LEGACY_METADATA_KEYS {
         if let Some(v) = canonical.remove(*alias) {
             canonical.entry(*canon).or_insert(v);
         }
@@ -874,7 +874,7 @@ fn prepare_upload(state: &Management, name: &str, data: &[u8]) -> Result<Upload,
     // auth's disabled flag, in `json.Marshal` key order with no trailing newline.
     let uploaded: BTreeMap<String, Value> = meta.into_iter().collect();
     let mut persisted = uploaded.clone();
-    for (alias, canon) in ALIASES {
+    for (alias, canon) in &credentials::LEGACY_METADATA_KEYS {
         if let Some(v) = persisted.remove(*alias) {
             persisted.entry((*canon).to_owned()).or_insert(v);
         }
@@ -1544,25 +1544,6 @@ pub(crate) async fn status(State(state): State<Arc<Management>>, body: Result<Fi
     saved.unwrap_or_else(|e| patch_error(Some(PatchError::Io(e))))
 }
 
-const ALIASES: &[(&str, &str)] = &[
-    ("api-key", "api_key"),
-    ("base-url", "base_url"),
-    ("disable-cooling", "disable_cooling"),
-    ("excluded-models", "excluded_models"),
-    ("fingerprint-profile", "fingerprint_profile"),
-    ("model-aliases", "model_aliases"),
-    ("openapi-location", "openapi_location"),
-    ("openapi-models", "openapi_models"),
-    ("proxy-url", "proxy_url"),
-    ("request-retry", "request_retry"),
-    ("request-scoped-errors", "request_scoped_errors"),
-    ("tool-prefix-disabled", "tool_prefix_disabled"),
-];
-
-fn canonical(key: &str) -> &str {
-    ALIASES.iter().find(|(a, _)| *a == key).map_or(key, |(_, c)| *c)
-}
-
 /// One `fields` member: its canonical path, the value the handlers check and the
 /// value as Go decoded it.
 struct Field {
@@ -1622,7 +1603,7 @@ pub(crate) async fn fields(State(state): State<Arc<Management>>, body: Result<Fi
     for (key, raw) in req.iter().filter(|(k, _)| k.as_str() != "name") {
         let mut parts: Vec<String> = key.trim().split('.').map(|p| p.trim().to_owned()).collect();
         let original_root = parts[0].clone();
-        parts[0] = canonical(&original_root).to_owned();
+        parts[0] = credentials::canonical_metadata_key(&original_root).to_owned();
         let path = parts.join(".");
         let is_canonical = original_root == parts[0];
         // ponytail: serde holds the value the handlers check, so a number past f64
@@ -1729,7 +1710,7 @@ fn apply_fields(
     }
     // Start from Go's normalized metadata so aliases persist under canonical names.
     let mut meta = target.metadata.clone();
-    for (alias, canon) in ALIASES {
+    for (alias, canon) in &credentials::LEGACY_METADATA_KEYS {
         if let Some(v) = meta.remove(*alias) {
             meta.entry(*canon).or_insert(v);
         }
@@ -2141,7 +2122,7 @@ fn go_json_equal(a: &GoValue, b: &GoValue) -> bool {
 /// Go `NormalizeCredentialMetadata`: aliases move to their canonical key unless it is
 /// already set.
 fn normalize_go(doc: &mut BTreeMap<String, GoValue>) {
-    for (alias, canon) in ALIASES {
+    for (alias, canon) in &credentials::LEGACY_METADATA_KEYS {
         if let Some(v) = doc.remove(*alias) {
             doc.entry((*canon).to_owned()).or_insert(v);
         }
