@@ -391,62 +391,6 @@ fn strip_paths(payload: &[u8], paths: &[&str]) -> Vec<u8> {
     out
 }
 
-/// The first existing path's integer (Go's `Exists()` fallbacks in parseOpenAIStyleUsageNode).
-fn pick(node: &crate::protocol::json::Res<'_>, paths: &[&str]) -> i64 {
-    paths
-        .iter()
-        .map(|p| node.get(p))
-        .find(|r| r.exists())
-        .map_or(0, |r| r.int())
-}
-
-/// Go `hasNonZeroTokenUsage` for the detail parsed from `node`.
-fn usage_nonzero(node: &crate::protocol::json::Res<'_>) -> bool {
-    [
-        &["prompt_tokens", "input_tokens"][..],
-        &["completion_tokens", "output_tokens"],
-        &["total_tokens"],
-        &[
-            "prompt_tokens_details.cached_tokens",
-            "input_tokens_details.cached_tokens",
-        ],
-        &[
-            "input_tokens_details.cache_creation_tokens",
-            "input_tokens_details.cache_write_tokens",
-            "prompt_tokens_details.cache_creation_tokens",
-            "prompt_tokens_details.cache_write_tokens",
-        ],
-        &[
-            "completion_tokens_details.reasoning_tokens",
-            "output_tokens_details.reasoning_tokens",
-        ],
-    ]
-    .iter()
-    .any(|paths| pick(node, paths) != 0)
-}
-
-/// Go `hasOpenAIStyleUsageTokenFields`.
-fn usage_has_fields(node: &crate::protocol::json::Res<'_>) -> bool {
-    node.is_object()
-        && [
-            "total_tokens",
-            "prompt_tokens",
-            "input_tokens",
-            "completion_tokens",
-            "output_tokens",
-            "prompt_tokens_details.cached_tokens",
-            "input_tokens_details.cached_tokens",
-            "prompt_tokens_details.cache_write_tokens",
-            "prompt_tokens_details.cache_creation_tokens",
-            "input_tokens_details.cache_write_tokens",
-            "input_tokens_details.cache_creation_tokens",
-            "completion_tokens_details.reasoning_tokens",
-            "output_tokens_details.reasoning_tokens",
-        ]
-        .iter()
-        .any(|f| node.get(f).exists())
-}
-
 /// Go `extractResponseServiceTier`: the first non-blank tier of a valid payload.
 pub(crate) fn response_tier(payload: &[u8]) -> String {
     if !crate::protocol::json::valid(payload) {
@@ -470,14 +414,14 @@ fn observe_parsed(merged: &mut Merged, format: crate::format::Format, payload: &
     };
     let node = crate::protocol::json::get(payload, path);
     let tier = response_tier(payload);
-    if !usage_has_fields(&node) {
+    let Some(counts) = crate::protocol::openai_usage::TokenCounts::parse(&node) else {
         if tier.is_empty() {
             return false;
         }
         merged.observe(None, tier, false);
         return true;
-    }
-    merged.observe(Some((format, node.raw().to_vec())), tier, usage_nonzero(&node));
+    };
+    merged.observe(Some((format, node.raw().to_vec())), tier, counts.has_nonzero());
     true
 }
 

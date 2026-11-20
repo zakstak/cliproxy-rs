@@ -881,22 +881,7 @@ pub(crate) fn is_bad_credentials(body: &[u8]) -> bool {
 /// (`hasOpenAIStyleUsageTokenFields`), or the event names a service tier.
 pub(crate) fn codex_usage_ok(event: &[u8]) -> bool {
     let node = gj::get(event, "response.usage");
-    let fields = [
-        "total_tokens",
-        "prompt_tokens",
-        "input_tokens",
-        "completion_tokens",
-        "output_tokens",
-        "prompt_tokens_details.cached_tokens",
-        "input_tokens_details.cached_tokens",
-        "prompt_tokens_details.cache_write_tokens",
-        "prompt_tokens_details.cache_creation_tokens",
-        "input_tokens_details.cache_write_tokens",
-        "input_tokens_details.cache_creation_tokens",
-        "completion_tokens_details.reasoning_tokens",
-        "output_tokens_details.reasoning_tokens",
-    ];
-    if node.is_object() && fields.iter().any(|f| node.get(f).exists()) {
+    if crate::protocol::openai_usage::TokenCounts::parse(&node).is_some() {
         return true;
     }
     // extractResponseServiceTier.

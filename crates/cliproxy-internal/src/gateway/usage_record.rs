@@ -416,83 +416,28 @@ fn service_tier(payload: &[u8]) -> String {
     service_tier_valid(payload)
 }
 
-fn has_openai_bucket_fields(node: &Res<'_>) -> bool {
-    [
-        "prompt_tokens",
-        "input_tokens",
-        "completion_tokens",
-        "output_tokens",
-        "prompt_tokens_details.cached_tokens",
-        "input_tokens_details.cached_tokens",
-        "prompt_tokens_details.cache_write_tokens",
-        "prompt_tokens_details.cache_creation_tokens",
-        "input_tokens_details.cache_write_tokens",
-        "input_tokens_details.cache_creation_tokens",
-        "completion_tokens_details.reasoning_tokens",
-        "output_tokens_details.reasoning_tokens",
-    ]
-    .iter()
-    .any(|p| node.get(*p).exists())
-}
-
-/// Go `hasOpenAIStyleUsageTokenFields`.
-fn has_openai_token_fields(node: &Res<'_>) -> bool {
-    node.exists() && node.is_object() && (node.get("total_tokens").exists() || has_openai_bucket_fields(node))
-}
-
-/// Go `parseOpenAIStyleUsageNode`.
-fn parse_openai_node(node: &Res<'_>) -> Detail {
-    let input = first(node, &["prompt_tokens", "input_tokens"]);
-    let output = first(node, &["completion_tokens", "output_tokens"]);
+fn parse_openai_node(node: &Res<'_>) -> Option<Detail> {
+    let counts = crate::protocol::openai_usage::TokenCounts::parse(node)?;
     let mut d = Detail {
-        input: input.int(),
-        output: output.int(),
-        total: node.get("total_tokens").int(),
+        input: counts.input.unwrap_or_default(),
+        output: counts.output.unwrap_or_default(),
+        total: counts.total.unwrap_or_default(),
+        cached: counts.cache_read.unwrap_or_default(),
+        cache_read: counts.cache_read.unwrap_or_default(),
+        cache_creation: counts.cache_creation.unwrap_or_default(),
+        reasoning: counts.reasoning.unwrap_or_default(),
         ..Detail::default()
     };
-    let cached = first(
-        node,
-        &[
-            "prompt_tokens_details.cached_tokens",
-            "input_tokens_details.cached_tokens",
-        ],
-    );
-    if cached.exists() {
-        d.cached = cached.int();
-        d.cache_read = cached.int();
-    }
-    let creation = first(
-        node,
-        &[
-            "input_tokens_details.cache_creation_tokens",
-            "input_tokens_details.cache_write_tokens",
-            "prompt_tokens_details.cache_creation_tokens",
-            "prompt_tokens_details.cache_write_tokens",
-        ],
-    );
-    if creation.exists() {
-        d.cache_creation = creation.int();
-    }
-    let reasoning = first(
-        node,
-        &[
-            "completion_tokens_details.reasoning_tokens",
-            "output_tokens_details.reasoning_tokens",
-        ],
-    );
-    if reasoning.exists() {
-        d.reasoning = reasoning.int();
-    }
-    d.breakdown = Some(if has_openai_bucket_fields(node) {
-        if input.exists() && output.exists() {
+    d.breakdown = Some(if counts.has_buckets() {
+        if counts.input.is_some() && counts.output.is_some() {
             subset(d.input, d.cache_read, d.cache_creation, d.output, d.reasoning, d.total)
         } else {
-            let (cache_read, cache_creation) = if input.exists() {
+            let (cache_read, cache_creation) = if counts.input.is_some() {
                 (d.cache_read, d.cache_creation)
             } else {
                 (0, 0)
             };
-            let reasoning = if output.exists() { d.reasoning } else { 0 };
+            let reasoning = if counts.output.is_some() { d.reasoning } else { 0 };
             partial_subset(d.input, cache_read, cache_creation, d.output, reasoning, d.total)
         }
     } else {
@@ -511,20 +456,14 @@ fn parse_openai_node(node: &Res<'_>) -> Detail {
             .filter_map(|name| number(tools.get(name)).map(|n| (*name, n)))
             .collect();
     }
-    d
+    Some(d)
 }
 
 /// Go `ParseOpenAIUsage`.
 pub fn parse_openai(body: &[u8]) -> Detail {
     let tier = service_tier(body);
     let node = gj::parse(body).get("usage");
-    if !has_openai_token_fields(&node) {
-        return Detail {
-            response_service_tier: tier,
-            ..Detail::default()
-        };
-    }
-    let mut d = parse_openai_node(&node);
+    let mut d = parse_openai_node(&node).unwrap_or_default();
     d.response_service_tier = tier;
     d
 }
@@ -533,13 +472,12 @@ pub fn parse_openai(body: &[u8]) -> Detail {
 pub fn parse_codex(data: &[u8]) -> Option<Detail> {
     let tier = service_tier(data);
     let node = gj::parse(data).get("response.usage");
-    if !has_openai_token_fields(&node) {
+    let Some(mut d) = parse_openai_node(&node) else {
         return (!tier.is_empty()).then(|| Detail {
             response_service_tier: tier,
             ..Detail::default()
         });
-    }
-    let mut d = parse_openai_node(&node);
+    };
     d.response_service_tier = tier;
     Some(d)
 }
@@ -727,8 +665,8 @@ impl StreamUsage {
         let mut usage_ok = false;
         if usage_candidate {
             let node = gj::get(payload, "usage");
-            if has_openai_token_fields(&node) {
-                detail = parse_openai_node(&node);
+            if let Some(parsed) = parse_openai_node(&node) {
+                detail = parsed;
                 usage_ok = true;
             }
         }
