@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use crate::config::credentials::canonical_metadata_key;
+use crate::config::credentials::{canonical_metadata_key, is_token_payload_key};
 use crate::execution::{ExecError, FailureScope};
 use crate::protocol::json::{self as gj, GoValue};
 use crate::text::values_encode;
@@ -710,25 +710,6 @@ pub(crate) fn save_token_file(path: &Path, storage: &TokenStorage, snapshot: Opt
     write_private(path, encode_token_file(storage, snapshot, disk.as_deref()).as_bytes())
 }
 
-/// `IsAuthTokenPayloadKey`: token fields a re-login always replaces.
-fn is_token_payload_key(key: &str) -> bool {
-    matches!(
-        key.trim().to_ascii_lowercase().as_str(),
-        "access_token"
-            | "refresh_token"
-            | "id_token"
-            | "session_id"
-            | "expired"
-            | "last_refresh"
-            | "expires_in"
-            | "timestamp"
-            | "token_type"
-            | "user_code"
-            | "verification_uri"
-            | "verification_uri_complete"
-    )
-}
-
 /// `MergeExistingAuthMetadata` for a login that lands on an existing file: user settings
 /// survive, token payload (and Meta's key material) does not. Returns the disabled flag
 /// the file carried, unless the new metadata sets one.
@@ -739,7 +720,7 @@ pub(crate) fn merge_existing(metadata: &mut GoMap, existing: &GoMap, provider: &
     };
     let meta = provider.trim().eq_ignore_ascii_case("meta");
     for (key, value) in existing {
-        if is_token_payload_key(key) {
+        if is_token_payload_key(&key.trim().to_ascii_lowercase()) {
             continue;
         }
         if meta

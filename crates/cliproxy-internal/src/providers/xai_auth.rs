@@ -11,7 +11,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use crate::config::Config;
-use crate::config::credentials::canonical_metadata_key;
+use crate::config::credentials::{canonical_metadata_key, is_token_payload_key};
 use crate::credential::{Credential, MetadataPatch};
 use crate::execution::{ExecError, FailureScope};
 use crate::protocol::json::{self as gj, GoValue, Kind};
@@ -1000,25 +1000,6 @@ pub fn login_record(tokens: &TokenData, last_refresh: &str, token_endpoint: &str
     }
 }
 
-/// `IsAuthTokenPayloadKey`.
-fn is_token_key(key: &str) -> bool {
-    matches!(
-        key.trim().go_lower().as_str(),
-        "access_token"
-            | "refresh_token"
-            | "id_token"
-            | "session_id"
-            | "expired"
-            | "last_refresh"
-            | "expires_in"
-            | "timestamp"
-            | "token_type"
-            | "user_code"
-            | "verification_uri"
-            | "verification_uri_complete"
-    )
-}
-
 /// `NormalizeCredentialMetadata` on one document: each legacy key takes its canonical
 /// name unless the document already has that name, which then wins.
 fn normalize_keys(document: &mut BTreeMap<String, GoValue>) {
@@ -1066,7 +1047,7 @@ pub fn saved_document(
             disabled = *b;
         }
         for (k, v) in file {
-            if !is_token_key(&k) {
+            if !is_token_payload_key(&k.trim().go_lower()) {
                 record.entry(k).or_insert(v);
             }
         }

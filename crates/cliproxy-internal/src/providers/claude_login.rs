@@ -7,6 +7,7 @@
 //! credential is written under Go's file name, merged with an existing file of that
 //! name and with a matching legacy file, which is then removed.
 
+use crate::config::credentials::is_token_payload_key;
 use crate::text::GoStr;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -521,29 +522,10 @@ pub(crate) fn credential_file_name(email: &str, organization: &str, account: &st
     format!("claude-{hash}-{email}.json")
 }
 
-/// `IsAuthTokenPayloadKey`: never inherited from an existing file.
-fn token_payload_key(key: &str) -> bool {
-    matches!(
-        key.trim().go_lower().as_str(),
-        "access_token"
-            | "refresh_token"
-            | "id_token"
-            | "session_id"
-            | "expired"
-            | "last_refresh"
-            | "expires_in"
-            | "timestamp"
-            | "token_type"
-            | "user_code"
-            | "verification_uri"
-            | "verification_uri_complete"
-    )
-}
-
 /// `MergeExistingAuthMetadata`: fills keys the new credential lacks.
 fn merge_existing(target: &mut BTreeMap<String, Value>, existing: &serde_json::Map<String, Value>) {
     for (key, value) in existing {
-        if !token_payload_key(key) && !target.contains_key(key) {
+        if !is_token_payload_key(&key.trim().go_lower()) && !target.contains_key(key) {
             target.insert(key.clone(), value.clone());
         }
     }

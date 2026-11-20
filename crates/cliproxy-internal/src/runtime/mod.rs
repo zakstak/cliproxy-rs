@@ -3452,31 +3452,16 @@ fn rebase_patch(
         "expired",
         "plan_type",
     ];
-    // Go `IsAuthTokenPayloadKey`.
-    let token_payload = |k: &str| {
-        matches!(
-            k.trim().to_ascii_lowercase().as_str(),
-            "access_token"
-                | "refresh_token"
-                | "id_token"
-                | "session_id"
-                | "expired"
-                | "last_refresh"
-                | "expires_in"
-                | "timestamp"
-                | "token_type"
-                | "user_code"
-                | "verification_uri"
-                | "verification_uri_complete"
-        )
-    };
     let codex = provider == "codex";
     let kept_by_user = |k: &str| base.get(k) == user.get(k);
     let mut out = MetadataPatch::default();
     let mut partition_applies = false;
     for (k, v) in &patch.set {
         let outer = codex && (CODEX_OUTER.contains(&k.as_str()) || k == "siwc");
-        if !outer && base.get(k) != Some(v) && (kept_by_user(k) || token_payload(k)) {
+        if !outer
+            && base.get(k) != Some(v)
+            && (kept_by_user(k) || crate::config::credentials::is_token_payload_key(&k.trim().to_ascii_lowercase()))
+        {
             out.set.insert(k.clone(), v.clone());
         }
     }

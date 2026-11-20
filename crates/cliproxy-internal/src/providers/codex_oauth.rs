@@ -1007,25 +1007,11 @@ pub fn login_record(tokens: &Tokens, last_refresh: &str) -> Result<(String, Map<
 
 /// `MergeExistingAuthMetadata`: keep non-token fields the user set on an older file.
 fn merge_existing(record: &mut Map<String, Value>, existing: Map<String, Value>) {
-    const TOKEN_KEYS: &[&str] = &[
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "session_id",
-        "expired",
-        "last_refresh",
-        "expires_in",
-        "timestamp",
-        "token_type",
-        "user_code",
-        "verification_uri",
-        "verification_uri_complete",
-    ];
     // Go's fresh login metadata has no `disabled`, so MergeExistingAuthMetadata keeps an
     // existing boolean and FileStore.Save writes it; anything else becomes false.
     let disabled = existing.get("disabled").and_then(Value::as_bool).unwrap_or(false);
     for (k, v) in existing {
-        if TOKEN_KEYS.contains(&k.trim().to_ascii_lowercase().as_str()) {
+        if crate::config::credentials::is_token_payload_key(&k.trim().to_ascii_lowercase()) {
             continue;
         }
         record.entry(k).or_insert(v);

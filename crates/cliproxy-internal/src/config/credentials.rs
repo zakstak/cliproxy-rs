@@ -715,6 +715,26 @@ pub const LEGACY_METADATA_KEYS: [(&str, &str); 12] = [
     ("tool-prefix-disabled", "tool_prefix_disabled"),
 ];
 
+/// Fields supplied by a fresh login or token refresh. Callers apply the case rules
+/// of their existing credential format before testing the key.
+pub(crate) fn is_token_payload_key(normalized_key: &str) -> bool {
+    matches!(
+        normalized_key,
+        "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "session_id"
+            | "expired"
+            | "last_refresh"
+            | "expires_in"
+            | "timestamp"
+            | "token_type"
+            | "user_code"
+            | "verification_uri"
+            | "verification_uri_complete"
+    )
+}
+
 /// Go `CanonicalCredentialMetadataKey`.
 pub fn canonical_metadata_key(key: &str) -> &str {
     LEGACY_METADATA_KEYS
