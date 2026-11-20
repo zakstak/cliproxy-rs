@@ -9,5 +9,5 @@ move the contract pin. [docs/codex/CONTRACT.md](../../../../../../docs/codex/CON
 defines the contract and the rules for adding a fixture.
 
 Never generate a file here by running cliproxy-rs or from a Go golden. Use placeholders
-only: no credentials, captured traffic or account IDs. `cpa_exec::codex_contract` reads
+only: no credentials, captured traffic or account IDs. `providers::codex_contract` reads
 these files, and its tests fail when a file is missing from the manifest.
