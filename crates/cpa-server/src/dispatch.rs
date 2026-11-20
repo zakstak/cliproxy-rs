@@ -51,12 +51,49 @@ pub struct Call {
     /// The client's own bytes, for an attempt a Codex credential serves on the native
     /// HTTP (#23) or WebSocket (#24) route. Set only by the Responses routes.
     pub native: Option<Arc<NativeRequest>>,
-    /// A turn of a long-lived downstream session (the Responses WebSocket), `None` for
-    /// ordinary HTTP requests.
-    pub turn: Option<Arc<SessionTurn>>,
-    /// A media route (Go's `openai-image` / `openai-video` / `openai-speech` handler
-    /// types), `None` for inference routes.
-    pub media: Option<Arc<Media>>,
+    pub mode: CallMode,
+}
+
+/// Selects the executor operation for this request and carries its routing state.
+#[derive(Clone)]
+pub enum CallMode {
+    Ordinary,
+    /// One turn on a downstream Responses WebSocket.
+    SessionTurn(Arc<SessionTurn>),
+    /// An image, video, or speech request.
+    Media(Arc<Media>),
+}
+
+impl CallMode {
+    fn media(&self) -> Option<&Media> {
+        match self {
+            Self::Media(media) => Some(media),
+            Self::Ordinary | Self::SessionTurn(_) => None,
+        }
+    }
+
+    fn home(&self) -> Option<&Arc<crate::home_session::SessionHome>> {
+        match self {
+            Self::SessionTurn(turn) => turn.home.as_ref(),
+            Self::Ordinary | Self::Media(_) => None,
+        }
+    }
+
+    fn pinned(&self) -> Option<&str> {
+        match self {
+            Self::Ordinary => None,
+            Self::SessionTurn(turn) => turn.pinned.as_deref(),
+            Self::Media(media) => media.pinned.as_deref(),
+        }
+    }
+
+    fn on_selected(&self) -> Option<&OnSelected> {
+        match self {
+            Self::Ordinary => None,
+            Self::SessionTurn(turn) => turn.on_selected.as_ref(),
+            Self::Media(media) => media.on_selected.as_ref(),
+        }
+    }
 }
 
 /// A Responses request that a Codex credential may serve on a native route
@@ -167,7 +204,6 @@ pub enum MediaKind {
 }
 
 impl Call {
-    /// `WithPinnedAuthID` of a session turn, media call or host model callback.
     /// The headers and body that choose the session, affinity and credential. When a
     /// native Codex attempt is possible ([`native_possible`]), they are the client's own
     /// request, before any rewrite (#23); otherwise the rewritten call, as in Go.
@@ -176,21 +212,6 @@ impl Call {
             Some(native) if native.possible() => (&native.headers, &native.body),
             _ => (&self.headers, &self.body),
         }
-    }
-
-    pub(crate) fn pinned(&self) -> Option<String> {
-        self.turn
-            .as_ref()
-            .and_then(|t| t.pinned.clone())
-            .or_else(|| self.media.as_ref().and_then(|m| m.pinned.clone()))
-    }
-
-    /// `WithSelectedAuthIDCallback` of a session turn or media call.
-    fn on_selected(&self) -> Option<&OnSelected> {
-        self.turn
-            .as_ref()
-            .and_then(|t| t.on_selected.as_ref())
-            .or_else(|| self.media.as_ref().and_then(|m| m.on_selected.as_ref()))
     }
 }
 
@@ -492,7 +513,7 @@ fn route_base_name(model: &str) -> &str {
 /// routes.
 fn check_route_only(base: &str, call: &Call) -> Result<(), RunError> {
     let name = route_base_name(base).go_lower();
-    let kind = call.media.as_ref().map(|m| m.kind);
+    let kind = call.mode.media().map(|m| m.kind);
     if IMAGE_ONLY.contains(&name.as_str()) && kind != Some(MediaKind::Images) {
         return Err(Failure::ImageOnly(base.to_owned()).into());
     }
@@ -577,8 +598,8 @@ where
     F: FnOnce(Result<Done, Failure>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
 {
-    let sse = call.media.as_ref().is_some_and(|m| m.sse);
-    let speech = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Speech);
+    let sse = call.mode.media().is_some_and(|m| m.sse);
+    let speech = call.mode.media().is_some_and(|m| m.kind == MediaKind::Speech);
     let interval = if sse {
         crate::respond::keepalive(&rt.config())
     } else {
@@ -713,7 +734,7 @@ fn upstream_headers(cfg: &Config, result: &Result<Done, Failure>) -> Option<Upst
 /// non-stream generate handlers do; the count-tokens handlers (code_handlers.go,
 /// gemini_handlers.go) and the speech handler never call `StartNonStreamingKeepAlive`.
 fn nonstream_keepalive(call: &Call, cfg: &Config) -> Option<Duration> {
-    let speech = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Speech);
+    let speech = call.mode.media().is_some_and(|m| m.kind == MediaKind::Speech);
     if call.stream || call.operation != Operation::Generate || speech {
         return None;
     }
@@ -761,10 +782,11 @@ fn native_possible(rt: &Arc<Runtime>, call: &Call, (providers, model): &(Vec<Str
     let Some(native) = &call.native else {
         return;
     };
-    let turn = call.turn.is_some();
-    let eligible = (!turn || cpa_exec::codex::CodexExecutor::native_ws_frame(&native.body))
-        && call.media.is_none()
-        && call.operation == Operation::Generate
+    let eligible = match call.mode {
+        CallMode::Ordinary => true,
+        CallMode::SessionTurn(_) => cpa_exec::codex::CodexExecutor::native_ws_frame(&native.body),
+        CallMode::Media(_) => false,
+    } && call.operation == Operation::Generate
         // Under Home the pool is remote and `providers` is just `home`: any Responses
         // request may reach a native Codex credential there.
         && (rt.remote_dispatch().is_some() || providers.iter().any(|p| p.eq_ignore_ascii_case("codex")) && {
@@ -1022,7 +1044,7 @@ async fn run_routed(
     let (usage, unauthorized) = if home_count { (None, facts) } else { (facts, None) };
     // `WithPinnedAuthID`: every other credential is excluded in every round.
     // A remote dispatcher receives the pinned ID itself.
-    let mut pinned_exclusion: Vec<String> = match call.pinned() {
+    let mut pinned_exclusion: Vec<String> = match call.mode.pinned() {
         Some(pinned) if !pinned.is_empty() && rt.remote_dispatch().is_none() => rt
             .store()
             .snapshot()
@@ -1034,7 +1056,7 @@ async fn run_routed(
     };
     // `WithDisallowFreeAuth`: free-plan Codex credentials are ineligible in every round.
     // ponytail: Home mode selects remotely and does not see this flag.
-    if call.media.as_ref().is_some_and(|m| m.disallow_free) {
+    if call.mode.media().is_some_and(|m| m.disallow_free) {
         for credential in rt.store().snapshot() {
             let free = credential.provider.trim().eq_ignore_ascii_case("codex")
                 && credential
@@ -1065,8 +1087,8 @@ async fn run_routed(
         requested_model: model.clone(),
         model: model.clone(),
         original_body: call
-            .media
-            .as_ref()
+            .mode
+            .media()
             .and_then(|m| m.original.clone())
             .unwrap_or_else(|| call.body.clone()),
         body: call.body.clone(),
@@ -1446,7 +1468,7 @@ async fn run_remote(
     remote: Arc<dyn crate::remote::RemoteDispatch>,
     base: Selection,
 ) -> Result<Done, RunError> {
-    let pinned = cx.call.pinned().is_some_and(|p| !p.trim().is_empty());
+    let pinned = cx.call.mode.pinned().is_some_and(|p| !p.trim().is_empty());
     let max_wait = cx.policy.max_retry_interval;
     let default_retry = cx.policy.request_retry as i64;
     let allowed = |attempt: i64, limit: i64| home_retry_allowed(default_retry, attempt, limit);
@@ -1592,7 +1614,7 @@ async fn remote_round(
         // stream died of a connection-lifecycle error (or a downstream-WebSocket 426)
         // may come back once. Buffered calls exclude everything tried.
         let stream = cx.call.stream;
-        let websocket = cx.call.turn.is_some();
+        let websocket = matches!(cx.call.mode, CallMode::SessionTurn(_));
         let mut tried: Vec<String> = Vec::new();
         let mut excluded: Vec<String> = Vec::new();
         let mut same_retries: std::collections::HashMap<String, u32> = Default::default();
@@ -1623,24 +1645,19 @@ async fn remote_round(
             let request = remote_request(cx.call, &selection, count, cx.trace);
             // Go `retainedHomeSessionSelection`: a WebSocket turn runs on the pick its
             // session's pooled socket kept, when it still fits.
-            let kept = cx
-                .call
-                .turn
-                .as_ref()
-                .and_then(|turn| turn.home.as_ref())
-                .and_then(|home| {
-                    home.reuse(
-                        count <= 1 && round <= 0,
-                        &selection.model,
-                        &selection.exclude,
-                        cx.call.pinned().as_deref(),
-                        &releases,
-                    )
-                });
+            let home = cx.call.mode.home();
+            let kept = home.and_then(|home| {
+                home.reuse(
+                    count <= 1 && round <= 0,
+                    &selection.model,
+                    &selection.exclude,
+                    cx.call.mode.pinned(),
+                    &releases,
+                )
+            });
             let picked = match kept {
                 Some((lease, user_key, request_retry)) => Ok((lease, request_retry, user_key)),
                 None => {
-                    let home = cx.call.turn.as_ref().and_then(|turn| turn.home.as_ref());
                     // Go `endHomeSelectionBeforeRedispatch` for a kept pick that ended.
                     if home.is_some() {
                         settle(releases.clone()).await?;
@@ -1932,9 +1949,9 @@ fn remote_request(call: &Call, selection: &Selection, count: i64, trace: &Trace)
         count,
         retry_round: selection.retry_round as i64,
         excluded: selection.exclude.clone(),
-        pinned: call.pinned().unwrap_or_default().to_owned(),
+        pinned: call.mode.pinned().unwrap_or_default().to_owned(),
         request_id: trace.request_id(),
-        kind: if call.turn.is_some() {
+        kind: if matches!(call.mode, CallMode::SessionTurn(_)) {
             "websocket"
         } else if call.stream {
             "stream"
@@ -2006,17 +2023,9 @@ async fn attempt(
     let mut refreshed = false;
     // Go `Options.ExecutionLifecycle`: a session turn's Home pick, which a pooled
     // upstream socket may keep beyond the turn.
-    let home = call
-        .turn
-        .as_ref()
-        .and_then(|turn| turn.home.as_ref())
-        .filter(|_| lease.is_remote());
+    let home = call.mode.home().filter(|_| lease.is_remote());
     let pick = home.map(|home| home.pick(&lease.credential.id));
     let mut guard = pick.clone().map(crate::home_session::PickGuard::new);
-    let session = call.turn.as_ref().map(|turn| cpa_core::exec::ExecSession {
-        lease: pick.as_ref().map(crate::home_session::Pick::lease),
-        ..turn.session.clone()
-    });
     for (i, upstream) in target.models.iter().enumerate() {
         // Go `stateModelForExecution`: the upstream model when Home chose one.
         let home_model = lease
@@ -2046,28 +2055,27 @@ async fn attempt(
         if let Some(m) = &lcp {
             req.session = Some(cpa_common::session::bound_session_identity(&m.session));
         }
-        if let Some(on_selected) = call.on_selected() {
+        if let Some(on_selected) = call.mode.on_selected() {
             on_selected(&lease.credential);
         }
         // The native Codex HTTP (#23) and WebSocket (#24) routes: the client's own bytes.
-        let builtin_codex = call.media.is_none() && lease.credential.provider.trim().eq_ignore_ascii_case("codex");
-        let native = call.native.as_ref().filter(|request| {
-            builtin_codex
-                && match call.turn {
-                    None => cpa_exec::codex::CodexExecutor::native_http(&lease.credential, &req),
-                    Some(_) => cpa_exec::codex::CodexExecutor::native_ws(&lease.credential, &req, &request.body),
-                }
+        let native = call.native.as_ref().filter(|_| {
+            lease.credential.provider.trim().eq_ignore_ascii_case("codex") && !matches!(call.mode, CallMode::Media(_))
         });
-        // A client Responses request that a built-in Codex credential cannot carry
-        // natively (a `response.append` frame, for one) is refused: the rewritten request
-        // other providers receive never reaches Codex (#28).
-        if native.is_none()
-            && builtin_codex
-            && let Some(request) = &call.native
-        {
-            let error = cpa_exec::codex::CodexExecutor::refused_native(call.turn.is_some(), &request.body);
-            lease.complete(Outcome::Neutral(error.clone()));
-            return Attempt::Stop(Fault { error, bootstrap: None });
+        if let Some(request) = native {
+            let websocket = matches!(call.mode, CallMode::SessionTurn(_));
+            let supported = if websocket {
+                cpa_exec::codex::CodexExecutor::native_ws(&lease.credential, &req, &request.body)
+            } else {
+                cpa_exec::codex::CodexExecutor::native_http(&lease.credential, &req)
+            };
+            // Refuse unsupported native inputs (e.g. response.append) before sending
+            // the rewritten request that other providers receive (#28).
+            if !supported {
+                let error = cpa_exec::codex::CodexExecutor::refused_native(websocket, &request.body);
+                lease.complete(Outcome::Neutral(error.clone()));
+                return Attempt::Stop(Fault { error, bootstrap: None });
+            }
         }
         if let Some(request) = &call.native {
             request.mark(native.is_some());
@@ -2099,22 +2107,31 @@ async fn attempt(
             })
         };
         let mut tracker = start(&lease.credential, &mut req);
-        let session = session.as_ref();
+        let pick = pick.as_ref();
         let execute = |credential: Arc<cpa_core::credential::Credential>, req: ExecRequest| async move {
             let credential = rt.for_executor(&credential);
-            match (session, call.media.as_ref().map(|m| m.kind)) {
-                (Some(session), _) => rt.executors.execute_in_session(&credential, req, cfg, session).await,
-                (None, Some(MediaKind::Images)) => {
-                    let path = req.request_path.clone();
-                    let on_format = call.media.as_ref().and_then(|m| m.on_format.as_deref());
-                    rt.executors.images(&credential, req, &path, cfg, on_format).await
+            match &call.mode {
+                CallMode::Ordinary => rt.executors.execute(&credential, req, cfg).await,
+                CallMode::SessionTurn(turn) => {
+                    let session = cpa_core::exec::ExecSession {
+                        lease: pick.map(crate::home_session::Pick::lease),
+                        ..turn.session.clone()
+                    };
+                    rt.executors.execute_in_session(&credential, req, cfg, &session).await
                 }
-                (None, Some(MediaKind::Videos)) => {
-                    let path = req.request_path.clone();
-                    rt.executors.videos(&credential, req, &path, cfg).await
-                }
-                (None, Some(MediaKind::Speech)) => rt.executors.speech(&credential, req, cfg).await,
-                (None, None) => rt.executors.execute(&credential, req, cfg).await,
+                CallMode::Media(media) => match media.kind {
+                    MediaKind::Images => {
+                        let path = req.request_path.clone();
+                        rt.executors
+                            .images(&credential, req, &path, cfg, media.on_format.as_deref())
+                            .await
+                    }
+                    MediaKind::Videos => {
+                        let path = req.request_path.clone();
+                        rt.executors.videos(&credential, req, &path, cfg).await
+                    }
+                    MediaKind::Speech => rt.executors.speech(&credential, req, cfg).await,
+                },
             }
         };
         tracing::trace!(target: "cpa_latency", stage = "selected");
@@ -2309,7 +2326,11 @@ fn usage_client(
         // Session turns arrive on the WebSocket upgrade (a GET).
         endpoint: format!(
             "{} {}",
-            if call.turn.is_some() { "GET" } else { "POST" },
+            if matches!(call.mode, CallMode::SessionTurn(_)) {
+                "GET"
+            } else {
+                "POST"
+            },
             call.request_path
         ),
         api_key,
@@ -2759,8 +2780,7 @@ mod tests {
             request_path: String::new(),
             peer: None,
             native: None,
-            turn: None,
-            media: None,
+            mode: CallMode::Ordinary,
         };
         let failure = || ExecError::local(503, cpa_core::exec::FailureScope::Credential, "read failed");
         // What the stream does on its first poll, after it omitted a frame or not.
@@ -2863,8 +2883,7 @@ mod tests {
             request_path: String::new(),
             peer: None,
             native: None,
-            turn: None,
-            media: None,
+            mode: CallMode::Ordinary,
         };
         let cfg = |yaml: &str| Config::parse(yaml).unwrap();
         let on = cfg("requests:\n  nonstream-keepalive-interval: 3\n");
@@ -2874,6 +2893,20 @@ mod tests {
         );
         assert_eq!(nonstream_keepalive(&call(Operation::Generate, true), &on), None);
         assert_eq!(nonstream_keepalive(&call(Operation::CountTokens, false), &on), None);
+        // A keep-alive newline would corrupt the audio bytes.
+        let speech = Call {
+            mode: CallMode::Media(Arc::new(Media {
+                kind: MediaKind::Speech,
+                pinned: None,
+                on_selected: None,
+                sse: false,
+                disallow_free: false,
+                original: None,
+                on_format: None,
+            })),
+            ..call(Operation::Generate, false)
+        };
+        assert_eq!(nonstream_keepalive(&speech, &on), None);
         for off in [
             "{}\n",
             "requests:\n  nonstream-keepalive-interval: 0\n",

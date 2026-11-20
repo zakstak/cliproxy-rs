@@ -1376,8 +1376,7 @@ async fn session_turns_honour_pin_callback_and_session() {
         request_path: "/v1/responses".into(),
         peer: None,
         native: None,
-        turn: Some(turn),
-        media: None,
+        mode: dispatch::CallMode::SessionTurn(turn),
     };
     let tokens = || -> Vec<String> { p.seen.requests.lock().unwrap().drain(..).map(|r| r.0).collect() };
 
@@ -1407,4 +1406,5 @@ async fn session_turns_honour_pin_callback_and_session() {
         error.failure.text()
     );
     assert!(tokens().is_empty());
+    assert_eq!(*selected.lock().unwrap(), ["a.json"]);
 }

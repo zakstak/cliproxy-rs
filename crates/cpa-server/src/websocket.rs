@@ -1577,8 +1577,7 @@ impl Connection {
             request_path: self.request_path.clone(),
             peer: self.peer,
             native: Some(native.clone()),
-            turn: Some(turn),
-            media: None,
+            mode: dispatch::CallMode::SessionTurn(turn),
         };
         // The upgrade's log captures every turn's upstream traffic under its request ID.
         let trace = dispatch::Trace::with_request_id(self.request_id.clone()).with_capture(self.capture.clone());

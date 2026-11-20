@@ -710,8 +710,7 @@ where
         request_path: r.path.clone(),
         peer: r.peer,
         native: None,
-        turn: None,
-        media: Some(Arc::new(Media {
+        mode: dispatch::CallMode::Media(Arc::new(Media {
             kind: MediaKind::Videos,
             pinned,
             on_selected: Some(Box::new(move |c| {
