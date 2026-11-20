@@ -230,9 +230,9 @@ impl AuthTab {
                 self.editing = false;
                 self.input.blur();
                 let parsed: Value = if field == "priority" {
-                    match super::config::atoi(&value) {
-                        Some(p) => p.into(),
-                        None => {
+                    match value.parse::<i64>() {
+                        Ok(p) => p.into(),
+                        Err(_) => {
                             let err = format!("{}: {value}", t("invalid_int"));
                             return self.act(async move { Err(err) });
                         }

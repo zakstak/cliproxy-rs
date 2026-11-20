@@ -176,8 +176,7 @@ async fn default_rules_fill_only_what_the_client_left_out() {
     );
 }
 
-/// An edit the client sent without `response_format` takes the `default` rule's, as
-/// JSON and as a multipart form.
+/// A JSON edit without `response_format` takes the default rule's value.
 #[tokio::test]
 async fn default_rules_fill_an_edits_response_format() {
     let (up, seen) = upstream().await;
@@ -196,7 +195,12 @@ async fn default_rules_fill_an_edits_response_format() {
     let (path, sent) = seen.lock().unwrap().last().unwrap().clone();
     assert!(path.ends_with("/images/edits"), "{path}");
     assert_eq!(sent["response_format"], "url", "{sent}");
+}
 
+#[tokio::test]
+async fn multipart_edits_forward_positive_counts_and_apply_format_defaults() {
+    let (up, seen) = upstream().await;
+    let p = proxy(&[("", &up)], DEFAULTS).await;
     let boundary = "fakeboundary";
     let mut form = format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngrok-imagine-image\r\n\
@@ -205,17 +209,31 @@ async fn default_rules_fill_an_edits_response_format() {
     )
     .into_bytes();
     form.extend_from_slice(b"\x89PNG\r\n");
-    form.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    let (status, body) = send(
-        &p.addr,
-        "/v1/images/edits",
-        &format!("multipart/form-data; boundary={boundary}"),
-        &form,
-    )
-    .await;
-    let out = json_body(status, &body);
-    assert_eq!(out["data"][0]["url"], "https://imgen.x.ai/fake.png", "{out}");
-    assert_eq!(seen.lock().unwrap().last().unwrap().1["response_format"], "url");
+    for (raw, expected) in [
+        (" +002 ", Some(2)),
+        ("-3", None),
+        ("", None),
+        ("1_2", None),
+        ("9223372036854775808", None),
+    ] {
+        let mut body = form.clone();
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"n\"\r\n\r\n{raw}\r\n--{boundary}--\r\n")
+                .as_bytes(),
+        );
+        let (status, body) = send(
+            &p.addr,
+            "/v1/images/edits",
+            &format!("multipart/form-data; boundary={boundary}"),
+            &body,
+        )
+        .await;
+        let out = json_body(status, &body);
+        assert_eq!(out["data"][0]["url"], "https://imgen.x.ai/fake.png", "{out}");
+        let sent = seen.lock().unwrap().last().unwrap().1.clone();
+        assert_eq!(sent["response_format"], "url");
+        assert_eq!(sent.get("n"), expected.map(Value::from).as_ref(), "{raw:?}");
+    }
 }
 
 /// An `override` rule's format decides what the client gets back, buffered and as the

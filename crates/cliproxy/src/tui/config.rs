@@ -144,15 +144,6 @@ fn section(path: &str) -> &'static str {
     }
 }
 
-/// Go `strconv.Atoi`: optional sign, ASCII digits, no spaces.
-pub fn atoi(s: &str) -> Option<i64> {
-    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
-}
-
 pub struct ConfigTab {
     client: Arc<Client>,
     pub vp: Viewport,
@@ -277,9 +268,9 @@ impl ConfigTab {
                 };
                 let raw = self.input.value();
                 match field.kind {
-                    Kind::Int => match atoi(&raw) {
-                        Some(n) => vec![self.put(field.path, Value::from(n))],
-                        None => {
+                    Kind::Int => match raw.parse::<i64>() {
+                        Ok(n) => vec![self.put(field.path, Value::from(n))],
+                        Err(_) => {
                             let err = format!("{}: {raw}", t("invalid_int"));
                             let path = field.path.to_owned();
                             vec![cmd(async move {
@@ -395,20 +386,5 @@ impl ConfigTab {
             doc.0.push(line);
         }
         doc
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn integer_input_accepts_decimal_signs_and_refuses_overflow() {
-        assert_eq!(atoi("12"), Some(12));
-        assert_eq!(atoi("-3"), Some(-3));
-        assert_eq!(atoi("+4"), Some(4));
-        for bad in ["", " 1", "1.0", "x", "-", "99999999999999999999"] {
-            assert_eq!(atoi(bad), None, "{bad:?}");
-        }
     }
 }

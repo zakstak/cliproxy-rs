@@ -156,6 +156,25 @@ async fn drive() {
     keys(&mut app, &["enter"]).await;
     assert_eq!(app.config.fields[debug].value, "true");
     assert!(joined(&app.config.vp.text()).contains("✓ Updated successfully"));
+    let retry = app
+        .config
+        .fields
+        .iter()
+        .position(|f| f.path == "request-retry")
+        .unwrap();
+    app.config.cursor = retry;
+    keys(&mut app, &["enter"]).await;
+    app.config.input.set_value("+004");
+    keys(&mut app, &["enter"]).await;
+    assert_eq!(app.config.fields[retry].value, "4");
+    for bad in ["", " 5", "5 ", "1.0", "x", "-", "１２", "9223372036854775808"] {
+        keys(&mut app, &["enter"]).await;
+        app.config.input.set_value(bad);
+        keys(&mut app, &["enter"]).await;
+        assert!(joined(&app.config.vp.text()).contains(&format!("✗ invalid integer: {bad}")));
+        assert_eq!(app.config.fields[retry].value, "4");
+    }
+
     // Turning logging-to-file on brings the logs tab back.
     let logging = app
         .config
@@ -163,7 +182,7 @@ async fn drive() {
         .iter()
         .position(|f| f.path == "logging-to-file")
         .unwrap();
-    for _ in debug..logging {
+    for _ in retry..logging {
         keys(&mut app, &["down"]).await;
     }
     keys(&mut app, &["enter"]).await;
@@ -205,6 +224,15 @@ async fn drive() {
         auth.contains("▸ ○ claude-fake.json") && auth.contains(" disabled"),
         "{auth}"
     );
+
+    keys(&mut app, &["3"]).await;
+    app.auth.input.set_value("-3");
+    keys(&mut app, &["enter"]).await;
+    assert_eq!(app.auth.files[0]["priority"], -3);
+    keys(&mut app, &["3"]).await;
+    app.auth.input.set_value(" +5");
+    let action = app.key("enter").cmds.pop().unwrap().await;
+    assert!(matches!(action, super::Msg::AuthAction(Err(e)) if e == "invalid integer:  +5"));
 
     // OAuth: the four retained providers, and none of the removed ones (issue #49).
     keys(&mut app, &["tab", "tab"]).await;

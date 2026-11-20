@@ -176,22 +176,13 @@ fn now_unix() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// `strconv.ParseInt(s, 10, 64)`.
-fn parse_int(s: &str) -> Option<i64> {
-    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
-}
-
 /// `normalizeXAIVideosSeconds`: an integer clamped to 1..=15.
 fn seconds(raw: &str) -> Result<i64, String> {
     let mut s = raw.trim();
     if s.is_empty() {
         s = DEFAULT_SECONDS;
     }
-    let duration = parse_int(s).ok_or("seconds must be an integer")?;
+    let duration = s.parse::<i64>().map_err(|_| "seconds must be an integer")?;
     Ok(duration.clamp(1, 15))
 }
 

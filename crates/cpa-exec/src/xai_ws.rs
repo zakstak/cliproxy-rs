@@ -599,11 +599,9 @@ fn ws_error(payload: &[u8]) -> Option<ExecError> {
 /// `xaiBareWebsocketErrorStatus`.
 fn bare_error_status(payload: &[u8]) -> i64 {
     for path in ["error.code", "error.status", "code"] {
-        let raw = text(&gj::get(payload, path)).trim().to_owned();
-        if raw.is_empty() {
-            continue;
-        }
-        if let Some(status) = go_atoi(&raw).filter(|s| *s > 0) {
+        if let Ok(status) = text(&gj::get(payload, path)).trim().parse::<i64>()
+            && status > 0
+        {
             return status;
         }
     }
@@ -612,15 +610,6 @@ fn bare_error_status(payload: &[u8]) -> i64 {
         return 400;
     }
     500
-}
-
-/// `strconv.Atoi`.
-fn go_atoi(s: &str) -> Option<i64> {
-    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
 }
 
 /// A socket failure from the shared pool, as Go's xAI executor reports it: a close 1009
