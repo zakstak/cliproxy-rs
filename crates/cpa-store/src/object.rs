@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::mirror::{self, FileIo};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::future::BoxFuture;
 use tokio::sync::{Mutex, OnceCell};
+use tokio_util::context::RuntimeExt;
 
 use crate::sigv4;
 
@@ -70,7 +72,8 @@ pub struct ObjectStore {
     config_path: PathBuf,
     auth_dir: PathBuf,
     region: OnceCell<String>,
-    lock: Mutex<()>,
+    io: &'static tokio::runtime::Runtime,
+    lock: Arc<Mutex<()>>,
 }
 
 /// An S3 error reply.
@@ -273,7 +276,8 @@ impl ObjectStore {
             config_path: config_dir.join("config.yaml"),
             auth_dir,
             region: OnceCell::new(),
-            lock: Mutex::new(()),
+            io: mirror::runtime()?,
+            lock: Arc::default(),
         })
     }
 
@@ -342,7 +346,11 @@ impl ObjectStore {
         for (name, value) in headers {
             builder = builder.header(name, value);
         }
-        let response = builder.body(body).send().await.map_err(|e| anyhow!("{e}"))?;
+        let response = self
+            .io
+            .wrap(async { builder.body(body).send().await })
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
         let status = response.status().as_u16();
         let header = |name: &str| {
             response
@@ -491,18 +499,24 @@ impl ObjectStore {
                     .call("GET", Some(&key), &[], Vec::new(), None)
                     .await
                     .context("object store: fetch config")?;
-                write_file(&self.config_path, &normalize_line_endings(&data)).context("object store: write config")?;
+                let path = self.config_path();
+                crate::blocking(move || write_file(&path, &normalize_line_endings(&data)))
+                    .await
+                    .context("object store: write config")?;
             }
             Err(error) if not_found(&error) => {
-                if !self.config_path.exists() {
-                    seed_config(example, &self.config_path).context("object store: copy example config")?;
-                }
-                // Seed the bucket with the file the startup load leaves behind, so a
-                // plaintext management secret never reaches it. Fail instead of skipping:
-                // the startup load could turn a refused file into one a later start uploads.
-                cpa_core::config::prepare_for_upload(&self.config_path)
-                    .context("object store: prepare local config for seeding")?;
-                let data = std::fs::read(&self.config_path).context("object store: read local config")?;
+                let path = self.config_path();
+                let example = example.to_path_buf();
+                let data = crate::blocking(move || {
+                    if !path.exists() {
+                        seed_config(&example, &path).context("object store: copy example config")?;
+                    }
+                    // A refused config must stop bootstrap before it can upload a plaintext secret.
+                    cpa_core::config::prepare_for_upload(&path)
+                        .context("object store: prepare local config for seeding")?;
+                    std::fs::read(path).context("object store: read local config")
+                })
+                .await?;
                 if !data.is_empty() {
                     self.put(CONFIG_KEY, &data, "application/x-yaml").await?;
                 }
@@ -515,7 +529,10 @@ impl ObjectStore {
     /// Go `syncAuthFromBucket`: incremental, never wipes the mirror (a wipe would turn
     /// into remote deletions through the watcher).
     async fn sync_auth(&self) -> Result<()> {
-        mkdir_0700(&self.auth_dir).context("object store: create auth directory")?;
+        let auth_dir = self.auth_dir();
+        crate::blocking(move || mkdir_0700(&auth_dir))
+            .await
+            .context("object store: create auth directory")?;
         let prefix = Self::prefixed(&format!("{AUTH_PREFIX}/"));
         let mut token: Option<String> = None;
         loop {
@@ -546,13 +563,19 @@ impl ObjectStore {
                 }
                 let local = self.auth_dir.join(crate::clean(rel_path));
                 if let Some(parent) = local.parent() {
-                    mkdir_0700(parent).context("object store: prepare auth subdir")?;
+                    let parent = parent.to_owned();
+                    crate::blocking(move || mkdir_0700(&parent))
+                        .await
+                        .context("object store: prepare auth subdir")?;
                 }
                 let data = self
                     .call("GET", Some(&key), &[], Vec::new(), None)
                     .await
                     .with_context(|| format!("object store: download auth {key}"))?;
-                write_file(&local, &data).with_context(|| format!("object store: write auth {}", local.display()))?;
+                crate::blocking(move || {
+                    write_file(&local, &data).with_context(|| format!("object store: write auth {}", local.display()))
+                })
+                .await?;
             }
             let truncated = xml_text(&text, "IsTruncated").is_some_and(|t| t == "true");
             token = xml_text(&text, "NextContinuationToken").filter(|t| !t.is_empty());
@@ -576,9 +599,9 @@ impl ObjectStore {
     }
 
     /// Go `uploadAuth`: a missing or empty file deletes the object.
-    async fn upload_auth(&self, path: &Path) -> Result<()> {
+    async fn upload_auth(&self, path: &Path, io: FileIo) -> Result<()> {
         let key = self.auth_key(path)?;
-        match std::fs::read(path) {
+        match io.read(path).await {
             Ok(data) if !data.is_empty() => self.put(&key, &data, "application/json").await,
             Ok(_) => self.remove(&key).await,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.remove(&key).await,
@@ -588,9 +611,13 @@ impl ObjectStore {
 
     /// Go `PersistAuthFiles`.
     pub async fn persist_auth_files(&self, paths: &[PathBuf]) -> Result<()> {
+        self.persist_files(paths, FileIo::Async(self.io)).await
+    }
+
+    async fn persist_files(&self, paths: &[PathBuf], io: FileIo) -> Result<()> {
         let _guard = self.lock.lock().await;
         for path in paths {
-            self.upload_auth(&self.resolve(path)).await?;
+            self.upload_auth(&self.resolve(path), io).await?;
         }
         Ok(())
     }
@@ -604,7 +631,7 @@ impl ObjectStore {
     /// Go `PersistConfig`.
     pub async fn persist_config(&self) -> Result<()> {
         let _guard = self.lock.lock().await;
-        match std::fs::read(&self.config_path) {
+        match FileIo::Async(self.io).read(&self.config_path).await {
             Ok(data) if !data.is_empty() => self.put(CONFIG_KEY, &data, "application/x-yaml").await,
             Ok(_) => self.remove(CONFIG_KEY).await,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.remove(CONFIG_KEY).await,
@@ -614,14 +641,17 @@ impl ObjectStore {
 
     /// Go `Delete`.
     pub async fn delete(&self, path: &Path) -> Result<()> {
-        let path = &self.resolve(path);
-        let _guard = self.lock.lock().await;
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => bail!("object store: delete auth file: {e}"),
-        }
-        let key = self.auth_key(path)?;
+        self.delete_file(path, FileIo::Async(self.io)).await
+    }
+
+    async fn delete_file(&self, path: &Path, io: FileIo) -> Result<()> {
+        let path = self.resolve(path);
+        let guard = self.lock.clone().lock_owned().await;
+        let _guard = io
+            .remove(path.clone(), guard)
+            .await
+            .map_err(|e| anyhow!("object store: delete auth file: {e}"))?;
+        let key = self.auth_key(&path)?;
         self.remove(&key).await
     }
 }
@@ -638,8 +668,13 @@ impl cpa_server::persist::StorePersister for ObjectPersister {
     }
 
     fn delete_auth(&self, path: PathBuf) -> Result<()> {
-        // The request runs on the runtime's reactor; this thread only waits for it.
-        tokio::runtime::Handle::current().block_on(self.0.delete(&path))
+        self.0.io.block_on(self.0.delete_file(&path, FileIo::Inline))
+    }
+
+    fn save_auth(&self, write: cpa_server::persist::SaveFn<'_>) -> Result<Option<PathBuf>> {
+        mirror::save_auth(write, |paths| {
+            self.0.io.block_on(self.0.persist_files(paths, FileIo::Inline))
+        })
     }
 
     fn auth_dir(&self) -> PathBuf {
@@ -884,6 +919,99 @@ mod tests {
         let outside = dir.join("outside.json");
         std::fs::write(&outside, b"{}").unwrap();
         assert!(store.persist_auth_files(&[outside]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pending_auth_read_yields_to_the_reactor() {
+        let s3 = FakeS3::start("us-east-1", Location::Answer, 1000).await;
+        s3.put("tokens", "auths/a.json", b"old");
+        let store = store(&s3, &scratch("obj-pending-read"));
+        let pipe = store.auth_dir().join("a.json");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&pipe)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (resume, reactor) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            // Release the reader even if it blocked the only runtime thread.
+            let yielded = reactor.recv_timeout(Duration::from_secs(5)).is_ok();
+            std::fs::write(pipe, b"new").unwrap();
+            yielded
+        });
+        let paths = [PathBuf::from("a.json")];
+        let (upload, ()) = tokio::join!(biased; store.persist_auth_files(&paths), async { let _ = resume.send(()); });
+        upload.unwrap();
+        assert!(writer.join().unwrap(), "the file read blocked the reactor");
+        assert_eq!(s3.object("tokens", "auths/a.json").unwrap(), b"new");
+    }
+
+    #[test]
+    fn management_and_watcher_finish_with_one_server_blocking_thread() {
+        use cpa_server::persist::StorePersister;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async {
+            let s3 = FakeS3::start("us-east-1", Location::Answer, 1000).await;
+            s3.put("tokens", "auths/watched.json", b"old");
+            let mut store = store(&s3, &scratch("obj-management"));
+            // Force a DNS lookup on the first upload, with the server pool occupied.
+            store.cfg.endpoint = format!("localhost:{}", s3.addr.port());
+            let store = Arc::new(store);
+            let paths = [store.auth_dir().join("watched.json")];
+            std::fs::write(&paths[0], b"new").unwrap();
+            let managed = store.auth_dir().join("managed.json");
+            let persister = ObjectPersister(store.clone());
+            let (occupied, ready) = tokio::sync::oneshot::channel();
+            let (resume, wait) = std::sync::mpsc::channel();
+            let management = tokio::task::spawn_blocking(move || {
+                occupied.send(()).unwrap();
+                wait.recv().unwrap();
+                let saved = persister
+                    .save_auth(Box::new(|| {
+                        std::fs::write(&managed, b"managed")?;
+                        Ok(Some(managed.clone()))
+                    }))
+                    .unwrap();
+                assert_eq!(saved.as_ref(), Some(&managed));
+                persister.delete_auth(managed.clone()).unwrap();
+                assert!(!managed.exists());
+            });
+            ready.await.unwrap();
+            let upload = store.persist_auth_files(&paths);
+            tokio::pin!(upload);
+            assert!(futures_util::poll!(&mut upload).is_pending());
+            assert!(store.lock.try_lock().is_err());
+            resume.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                upload.await.unwrap();
+                management.await.unwrap();
+            })
+            .await?;
+            let log = s3.state.log.lock().unwrap();
+            let mutations: Vec<_> = log
+                .iter()
+                .filter(|l| l.starts_with("PUT ") || l.starts_with("DELETE "))
+                .collect();
+            assert_eq!(
+                mutations,
+                [
+                    "PUT /tokens/auths/watched.json",
+                    "PUT /tokens/auths/managed.json",
+                    "DELETE /tokens/auths/managed.json"
+                ]
+            );
+            assert_eq!(s3.object("tokens", "auths/watched.json").unwrap(), b"new");
+            Ok::<_, tokio::time::error::Elapsed>(())
+        });
+        rt.shutdown_background();
+        result.expect("watcher or management hook waited on the occupied server pool");
     }
 
     /// minio-go maps the legacy `EU` location to eu-west-1 for signing.

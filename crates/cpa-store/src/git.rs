@@ -12,6 +12,7 @@
 //! container needs `git` installed. Any failure to read HEAD's objects counts as
 //! corruption; go-git tells a missing object from other read errors, the CLI does not.
 
+use crate::blocking;
 use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -1012,12 +1013,6 @@ impl cpa_server::persist::StorePersister for GitPersister {
     fn auth_dir(&self) -> PathBuf {
         self.0.auth_dir()
     }
-}
-
-pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| anyhow!("store task failed: {e}"))?
 }
 
 // Local git remotes and file modes: Unix only, like tests/git.rs.

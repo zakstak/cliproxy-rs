@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use crate::mirror::{self, FileIo};
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use cpa_server::cooldown_store::Record;
@@ -42,7 +43,8 @@ pub struct PostgresStore {
     spool_root: PathBuf,
     config_path: PathBuf,
     auth_dir: PathBuf,
-    lock: Mutex<()>,
+    io: &'static tokio::runtime::Runtime,
+    lock: Arc<Mutex<()>>,
 }
 
 /// Go `quoteIdentifier`.
@@ -61,10 +63,25 @@ fn db_error(context: &str, error: tokio_postgres::Error) -> anyhow::Error {
 impl PostgresStore {
     /// Go `NewPostgresStore`: spool directories, then a connection that answers.
     pub async fn connect(cfg: PostgresConfig) -> Result<Self> {
-        Self::connect_with_env(cfg, &|key| std::env::var(key).ok()).await
+        let store = crate::blocking(move || Self::open(cfg)).await?;
+        let ping = store.pg.run(|client| async move {
+            client.simple_query("").await.map_err(|e| db_error("", e))?;
+            Ok(())
+        });
+        match tokio::time::timeout(PING_TIMEOUT, ping).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                bail!(
+                    "postgres store: ping database: {}",
+                    error.to_string().trim_start_matches(": ")
+                )
+            }
+            Err(_) => bail!("postgres store: ping database: context deadline exceeded"),
+        }
+        Ok(store)
     }
 
-    pub(crate) async fn connect_with_env(cfg: PostgresConfig, env: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
+    fn open(cfg: PostgresConfig) -> Result<Self> {
         let dsn = cfg.dsn.trim();
         if dsn.is_empty() {
             bail!("postgres store: DSN is required");
@@ -82,22 +99,9 @@ impl PostgresStore {
         let auth_dir = spool_root.join("auths");
         mkdir_0700(&config_dir).map_err(|e| anyhow!("postgres store: create config directory: {e}"))?;
         mkdir_0700(&auth_dir).map_err(|e| anyhow!("postgres store: create auth directory: {e}"))?;
-        let dsn = Dsn::parse(dsn, env).map_err(|e| anyhow!("postgres store: open database connection: {e}"))?;
+        let dsn = Dsn::parse(dsn, &|key| std::env::var(key).ok())
+            .map_err(|e| anyhow!("postgres store: open database connection: {e}"))?;
         let pg = Pg::start(dsn).map_err(|e| anyhow!("postgres store: open database connection: {e}"))?;
-        let ping = pg.run(|client| async move {
-            client.simple_query("").await.map_err(|e| db_error("", e))?;
-            Ok(())
-        });
-        match tokio::time::timeout(PING_TIMEOUT, ping).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                bail!(
-                    "postgres store: ping database: {}",
-                    error.to_string().trim_start_matches(": ")
-                )
-            }
-            Err(_) => bail!("postgres store: ping database: context deadline exceeded"),
-        }
         let schema = cfg.schema.clone();
         let table = |name: &str| {
             if schema.trim().is_empty() {
@@ -115,7 +119,8 @@ impl PostgresStore {
             spool_root,
             config_path: config_dir.join("config.yaml"),
             auth_dir,
-            lock: Mutex::new(()),
+            io: mirror::runtime()?,
+            lock: Arc::default(),
         })
     }
 
@@ -212,33 +217,35 @@ impl PostgresStore {
                 Ok(row.map(|row| row.get(0)))
             })
             .await?;
-        match content {
-            None => {
-                if !self.config_path.exists() {
-                    if example.as_os_str().is_empty() {
-                        mkdir_0700(self.config_path.parent().unwrap_or(&self.spool_root))
-                            .map_err(|e| anyhow!("postgres store: prepare config directory: {e}"))?;
-                        write_file(&self.config_path, b"")
-                            .map_err(|e| anyhow!("postgres store: create empty config: {e}"))?;
-                    } else {
-                        seed_config(example, &self.config_path)
-                            .map_err(|e| anyhow!("postgres store: copy example config: {e:#}"))?;
-                    }
+        let path = self.config_path();
+        let example = example.to_path_buf();
+        let seed = crate::blocking(move || {
+            let parent = path.parent().expect("config path has a spool directory");
+            if let Some(content) = content {
+                mkdir_0700(parent).map_err(|e| anyhow!("postgres store: prepare config directory: {e}"))?;
+                write_file(&path, &normalize_line_endings(content.as_bytes()))
+                    .map_err(|e| anyhow!("postgres store: write config to spool: {e}"))?;
+                return Ok(None);
+            }
+            if !path.exists() {
+                if example.as_os_str().is_empty() {
+                    mkdir_0700(parent).map_err(|e| anyhow!("postgres store: prepare config directory: {e}"))?;
+                    write_file(&path, b"").map_err(|e| anyhow!("postgres store: create empty config: {e}"))?;
+                } else {
+                    seed_config(&example, &path).map_err(|e| anyhow!("postgres store: copy example config: {e:#}"))?;
                 }
-                // As the object store: never seed a plaintext management secret.
-                cpa_core::config::prepare_for_upload(&self.config_path)
-                    .map_err(|e| anyhow!("postgres store: prepare local config for seeding: {e:#}"))?;
-                let data =
-                    std::fs::read(&self.config_path).map_err(|e| anyhow!("postgres store: read local config: {e}"))?;
-                self.upsert_config(&data).await
             }
-            Some(content) => {
-                mkdir_0700(self.config_path.parent().unwrap_or(&self.spool_root))
-                    .map_err(|e| anyhow!("postgres store: prepare config directory: {e}"))?;
-                write_file(&self.config_path, &normalize_line_endings(content.as_bytes()))
-                    .map_err(|e| anyhow!("postgres store: write config to spool: {e}"))
-            }
+            // Never seed a plaintext management secret.
+            cpa_core::config::prepare_for_upload(&path)
+                .map_err(|e| anyhow!("postgres store: prepare local config for seeding: {e:#}"))?;
+            let data = std::fs::read(path).map_err(|e| anyhow!("postgres store: read local config: {e}"))?;
+            Ok(Some(data))
+        })
+        .await?;
+        if let Some(data) = seed {
+            self.upsert_config(&data).await?;
         }
+        Ok(())
     }
 
     /// Go `syncAuthFromDatabase`: the mirror is replaced by the table.
@@ -254,14 +261,19 @@ impl PostgresStore {
                 Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
             })
             .await?;
-        match std::fs::remove_dir_all(&self.auth_dir) {
+        let auth_dir = self.auth_dir();
+        crate::blocking(move || Self::rebuild_auth_mirror(&auth_dir, rows)).await
+    }
+
+    fn rebuild_auth_mirror(auth_dir: &Path, rows: Vec<(String, String)>) -> Result<()> {
+        match std::fs::remove_dir_all(auth_dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => bail!("postgres store: reset auth directory: {e}"),
         }
-        mkdir_0700(&self.auth_dir).map_err(|e| anyhow!("postgres store: recreate auth directory: {e}"))?;
+        mkdir_0700(auth_dir).map_err(|e| anyhow!("postgres store: recreate auth directory: {e}"))?;
         for (id, payload) in rows {
-            let path = match self.absolute_auth_path(&id) {
+            let path = match Self::absolute_auth_path(auth_dir, &id) {
                 Ok(path) => path,
                 Err(error) => {
                     tracing::warn!("postgres store: skipping auth {id} outside spool: {error}");
@@ -278,6 +290,10 @@ impl PostgresStore {
 
     /// Go `PersistAuthFiles`.
     pub async fn persist_auth_files(&self, paths: &[PathBuf]) -> Result<()> {
+        self.persist_files(paths, FileIo::Async(self.io)).await
+    }
+
+    async fn persist_files(&self, paths: &[PathBuf], io: FileIo) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
@@ -298,14 +314,14 @@ impl PostgresStore {
             } else {
                 self.auth_dir.join(path)
             };
-            self.sync_auth_file(rel, &abs).await?;
+            self.sync_auth_file(rel, &abs, io).await?;
         }
         Ok(())
     }
 
     /// Go `syncAuthFile`: a missing or empty file deletes the row.
-    async fn sync_auth_file(&self, rel: String, path: &Path) -> Result<()> {
-        match std::fs::read(path) {
+    async fn sync_auth_file(&self, rel: String, path: &Path, io: FileIo) -> Result<()> {
+        match io.read(path).await {
             Ok(data) if !data.is_empty() => self.upsert_auth(rel, data).await,
             Ok(_) => self.delete_auth_record(rel).await,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.delete_auth_record(rel).await,
@@ -353,7 +369,7 @@ impl PostgresStore {
     /// Go `PersistConfig`.
     pub async fn persist_config(&self) -> Result<()> {
         let _guard = self.lock.lock().await;
-        match std::fs::read(&self.config_path) {
+        match FileIo::Async(self.io).read(&self.config_path).await {
             Ok(data) => self.upsert_config(&data).await,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let sql = format!("DELETE FROM {} WHERE id = $1", self.config_table);
@@ -396,6 +412,10 @@ impl PostgresStore {
 
     /// Go `Delete` with the file path the server removed.
     pub async fn delete(&self, path: &Path) -> Result<()> {
+        self.delete_file(path, FileIo::Async(self.io)).await
+    }
+
+    async fn delete_file(&self, path: &Path, io: FileIo) -> Result<()> {
         if path.as_os_str().is_empty() {
             bail!("postgres store: id is empty");
         }
@@ -404,12 +424,11 @@ impl PostgresStore {
         } else {
             self.auth_dir.join(path)
         };
-        let _guard = self.lock.lock().await;
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => bail!("postgres store: delete auth file: {e}"),
-        }
+        let guard = self.lock.clone().lock_owned().await;
+        let _guard = io
+            .remove(path.clone(), guard)
+            .await
+            .map_err(|e| anyhow!("postgres store: delete auth file: {e}"))?;
         let rel = self.relative_auth_id(&path)?;
         self.delete_auth_record(rel).await
     }
@@ -434,15 +453,15 @@ impl PostgresStore {
     }
 
     /// Go `absoluteAuthPath`.
-    fn absolute_auth_path(&self, id: &str) -> Result<PathBuf> {
+    fn absolute_auth_path(auth_dir: &Path, id: &str) -> Result<PathBuf> {
         let cleaned = clean(Path::new(id));
         let text = cleaned.to_string_lossy();
         if text.starts_with("..") {
             bail!("postgres store: invalid auth identifier {id}");
         }
         // Go `filepath.Join` appends even an absolute identifier.
-        let path = clean(&self.auth_dir.join(text.trim_start_matches('/')));
-        if !path.starts_with(&self.auth_dir) || path == self.auth_dir {
+        let path = clean(&auth_dir.join(text.trim_start_matches('/')));
+        if !path.starts_with(auth_dir) || path == auth_dir {
             bail!("postgres store: resolved auth path escapes auth directory");
         }
         Ok(path)
@@ -621,8 +640,13 @@ impl cpa_server::persist::StorePersister for PostgresPersister {
     }
 
     fn delete_auth(&self, path: PathBuf) -> Result<()> {
-        // The request runs on the runtime's reactor; this thread only waits for it.
-        tokio::runtime::Handle::current().block_on(self.0.delete(&path))
+        self.0.io.block_on(self.0.delete_file(&path, FileIo::Inline))
+    }
+
+    fn save_auth(&self, write: cpa_server::persist::SaveFn<'_>) -> Result<Option<PathBuf>> {
+        mirror::save_auth(write, |paths| {
+            self.0.io.block_on(self.0.persist_files(paths, FileIo::Inline))
+        })
     }
 
     fn auth_dir(&self) -> PathBuf {

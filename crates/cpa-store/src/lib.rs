@@ -7,12 +7,14 @@
 #[cfg(test)]
 mod fake_s3;
 mod git;
+mod mirror;
 mod object;
 mod pgconn;
 mod postgres;
 mod private_fs;
 mod sigv4;
 
+use anyhow::{Result as AnyResult, anyhow};
 use cpa_core::gostr::GoStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -145,6 +147,12 @@ pub struct Store {
     pub enabled: String,
 }
 
+pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> AnyResult<T> + Send + 'static) -> AnyResult<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| anyhow!("store task failed: {e}"))?
+}
+
 async fn bounded<T>(work: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     tokio::time::timeout(SETUP_TIMEOUT, work)
         .await
@@ -195,7 +203,9 @@ pub async fn bootstrap(selection: Selection, wd: &Path) -> Result<Store, String>
                 local_root: root,
                 use_ssl,
             };
-            let store = ObjectStore::new(cfg).map_err(|e| format!("failed to initialize object token store: {e:#}"))?;
+            let store = blocking(move || ObjectStore::new(cfg))
+                .await
+                .map_err(|e| format!("failed to initialize object token store: {e:#}"))?;
             bounded(store.bootstrap(&example))
                 .await
                 .map_err(|e| format!("failed to bootstrap object-backed config: {e:#}"))?;
@@ -218,7 +228,7 @@ pub async fn bootstrap(selection: Selection, wd: &Path) -> Result<Store, String>
             let store = Arc::new(GitStore::new(&url, &username, &token, &branch, &root));
             let config_path = store.config_path();
             let prepared = store.clone();
-            git::blocking(move || prepared.ensure_repository())
+            blocking(move || prepared.ensure_repository())
                 .await
                 .map_err(|e| format!("failed to prepare git token store: {e:#}"))?;
             match std::fs::metadata(&config_path) {
@@ -238,7 +248,7 @@ pub async fn bootstrap(selection: Selection, wd: &Path) -> Result<Store, String>
                         ));
                     }
                     let committing = store.clone();
-                    git::blocking(move || committing.persist_config())
+                    blocking(move || committing.persist_config())
                         .await
                         .map_err(|e| format!("failed to commit initial git-backed config: {e:#}"))?;
                     tracing::info!("git-backed config initialized from template: {}", config_path.display());
