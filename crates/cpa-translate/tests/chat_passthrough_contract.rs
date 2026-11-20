@@ -45,6 +45,7 @@ fn every_unambiguous_chat_request_keeps_all_fields_except_the_selected_model() {
         let model = case["model"].as_str().unwrap();
         expected["model"] = json!(model);
         let ctx = RequestCtx {
+            registry: None,
             model,
             stream: case["stream"].as_bool().unwrap_or(false),
             tool_search: false,
@@ -118,6 +119,7 @@ fn streaming_chat_payloads_are_opaque_until_the_first_done_marker() {
 #[test]
 fn a_model_noop_keeps_spacing_unknown_fields_and_numeric_spelling() {
     let ctx = RequestCtx {
+        registry: None,
         model: "chosen",
         stream: true,
         tool_search: false,

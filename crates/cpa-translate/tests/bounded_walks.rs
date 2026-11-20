@@ -217,6 +217,7 @@ fn translate_all(depth: usize, code_events: usize) -> Vec<(String, bool, usize, 
         let body = &requests.iter().find(|(f, _)| *f == client).unwrap().1;
         for stream in [false, true] {
             let ctx = RequestCtx {
+                registry: None,
                 model: "m",
                 stream,
                 tool_search: false,
@@ -237,6 +238,7 @@ fn translate_all(depth: usize, code_events: usize) -> Vec<(String, bool, usize, 
             ));
         }
         let codex_ctx = RequestCtx {
+            registry: None,
             model: "m",
             stream: true,
             system_turns: false,
@@ -354,6 +356,7 @@ fn schema_normalization_stops_at_the_walk_limit() {
             r#"{{"model":"m","max_tokens":8,"tools":[{{"name":"t","input_schema":{schema}}}],"messages":[{{"role":"user","content":"hi"}}]}}"#
         );
         let ctx = RequestCtx {
+            registry: None,
             model: "m",
             system_turns: false,
             stream: false,

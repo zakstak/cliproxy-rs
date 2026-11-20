@@ -398,6 +398,7 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
             req.source_format,
             Format::Codex,
             &RequestCtx {
+                registry: req.registry.as_deref(),
                 model: &base_model,
                 stream,
                 tool_search: false,
@@ -419,6 +420,7 @@ fn prepare(req: &ExecRequest, cfg: &Config, stream: bool) -> Result<Prepared, Ex
     // Go `cliproxyauth.ResolvedModelInfo`: capabilities bound to this attempt.
     let caps = req.resolved_model.as_ref().map(|r| ModelCaps::from(&r.info));
     let thinking = apply_request_thinking(&RequestThinking {
+        registry: req.registry.as_deref(),
         body: &body,
         payload: &req.body,
         original: original(req),

@@ -1256,9 +1256,6 @@ async fn serve(
         let task = home::spawn_subscriber(home_config, rt.clone(), dispatcher, shutdown.clone());
         (shutdown, task)
     });
-    // Translators and thinking validation read model capabilities through the global
-    // overlay; without it they see only the static catalog.
-    cpa_server::install_registry(&rt);
     rt.start_auto_refresh();
     let options = cpa_server::management::Options {
         local_password: password,

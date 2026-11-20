@@ -16,11 +16,12 @@ use super::{
 };
 use crate::gostr::GoStr;
 use crate::json;
+use cpa_core::registry::dynamic::Registry;
 
 /// `ApplyThinking`: summary intent comes from the target body itself.
 pub fn apply_thinking(body: &[u8], model: &str, from: &str, to: &str, provider: &str) -> Result<Vec<u8>, Error> {
     let summary = extract_summary_config(body, to);
-    run(body, b"", model, from, to, provider, None, summary, false)
+    run(None, body, b"", model, from, to, provider, None, summary, false)
 }
 
 /// `ApplyThinkingWithSummary`.
@@ -32,7 +33,7 @@ pub fn apply_thinking_with_summary(
     provider: &str,
     summary: SummaryConfig,
 ) -> Result<Vec<u8>, Error> {
-    run(body, b"", model, from, to, provider, None, summary, false)
+    run(None, body, b"", model, from, to, provider, None, summary, false)
 }
 
 /// `ApplyThinkingWithSourceAndSummary`.
@@ -47,7 +48,18 @@ pub fn apply_thinking_with_source_and_summary(
     summary: SummaryConfig,
     updates_changed: bool,
 ) -> Result<Vec<u8>, Error> {
-    run(body, source, model, from, to, provider, None, summary, updates_changed)
+    run(
+        None,
+        body,
+        source,
+        model,
+        from,
+        to,
+        provider,
+        None,
+        summary,
+        updates_changed,
+    )
 }
 
 /// `ApplyThinkingWithModelInfo`: the exact model definition bound to this attempt.
@@ -82,6 +94,7 @@ pub fn apply_thinking_with_model_info_and_summary(
     updates_changed: bool,
 ) -> Result<Vec<u8>, Error> {
     run(
+        None,
         body,
         source,
         model,
@@ -96,6 +109,7 @@ pub fn apply_thinking_with_model_info_and_summary(
 
 /// Inputs to `helps.ApplyRequestThinking`.
 pub struct RequestThinking<'a> {
+    pub registry: Option<&'a Registry>,
     /// Translated provider body.
     pub body: &'a [u8],
     /// The request payload that was translated (`req.Payload`).
@@ -129,6 +143,7 @@ pub fn apply_request_thinking(req: &RequestThinking<'_>) -> Result<Vec<u8>, Erro
         req.payload
     };
     let summary = translated_request_summary_config(
+        req.registry,
         req.body,
         req.payload,
         original,
@@ -137,34 +152,24 @@ pub fn apply_request_thinking(req: &RequestThinking<'_>) -> Result<Vec<u8>, Erro
         req.to,
         req.has_request_transformer,
     );
-    match req.resolved {
-        Some(info) => apply_thinking_with_model_info_and_summary(
-            req.body,
-            source,
-            req.model,
-            req.from,
-            req.to,
-            req.provider,
-            info,
-            summary,
-            req.updates_changed,
-        ),
-        None => apply_thinking_with_source_and_summary(
-            req.body,
-            source,
-            req.model,
-            req.from,
-            req.to,
-            req.provider,
-            summary,
-            req.updates_changed,
-        ),
-    }
+    run(
+        req.registry,
+        req.body,
+        source,
+        req.model,
+        req.from,
+        req.to,
+        req.provider,
+        req.resolved,
+        summary,
+        req.updates_changed,
+    )
 }
 
 /// `helps.ApplyThinkingWithSourcePayload`.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_thinking_with_source_payload(
+    registry: Option<&Registry>,
     body: &[u8],
     current_source: &[u8],
     original_source: &[u8],
@@ -175,6 +180,7 @@ pub fn apply_thinking_with_source_payload(
     has_request_transformer: bool,
 ) -> Result<Vec<u8>, Error> {
     let summary = translated_request_summary_config(
+        registry,
         body,
         current_source,
         original_source,
@@ -183,13 +189,15 @@ pub fn apply_thinking_with_source_payload(
         to,
         has_request_transformer,
     );
-    apply_thinking_with_summary(body, model, from, to, provider, summary)
+    run(registry, body, b"", model, from, to, provider, None, summary, false)
 }
 
 /// `helps.translatedRequestSummaryConfig`: the translated body wins, so a normalizer can
 /// remove or rewrite the summary; the source is consulted only when the body lost the
 /// intent or cannot represent it until the model-aware pass.
+#[allow(clippy::too_many_arguments)]
 pub fn translated_request_summary_config(
+    registry: Option<&Registry>,
     body: &[u8],
     current_source: &[u8],
     original_source: &[u8],
@@ -216,7 +224,7 @@ pub fn translated_request_summary_config(
     if !has_request_transformer {
         return SummaryConfig::default();
     }
-    let candidate = apply_summary_config_for_model(body, &to, model, current.clone());
+    let candidate = apply_summary_config_for_model(registry, body, &to, model, current.clone());
     if extract_explicit_summary_config(&candidate, &to).mode != SummaryMode::Unspecified {
         return SummaryConfig::default();
     }
@@ -225,6 +233,7 @@ pub fn translated_request_summary_config(
 
 #[allow(clippy::too_many_arguments)]
 fn run(
+    registry: Option<&Registry>,
     body: &[u8],
     source: &[u8],
     model: &str,
@@ -254,7 +263,7 @@ fn run(
     let info: Option<&ModelCaps> = match resolved {
         Some(info) => info,
         None => {
-            looked_up = lookup_model_info(&base, &provider);
+            looked_up = lookup_model_info(registry, &base, &provider);
             looked_up.as_ref()
         }
     };
@@ -294,6 +303,7 @@ fn run(
     }
     if is_user_defined_model(info) {
         return apply_user_defined_model(
+            registry,
             &body,
             info,
             &from,
@@ -343,6 +353,7 @@ fn run(
             body = strip_inferred_claude_summary_activation(&body, Some(info));
         }
         return Ok(apply_summary_config_for_provider(
+            registry,
             &body,
             &target,
             &base,
@@ -377,6 +388,7 @@ fn run(
         };
     }
     Ok(apply_summary_config_for_provider(
+        registry,
         &applied,
         &target,
         &base,
@@ -443,6 +455,7 @@ fn parse_suffix_to_config(raw: &str) -> Config {
 
 #[allow(clippy::too_many_arguments)]
 fn apply_user_defined_model(
+    registry: Option<&Registry>,
     body: &[u8],
     info: Option<&ModelCaps>,
     from: &str,
@@ -468,7 +481,7 @@ fn apply_user_defined_model(
     };
     if !config.is_set() {
         return Ok(apply_summary_config_for_provider(
-            body, to, &model_id, provider, info, summary,
+            registry, body, to, &model_id, provider, info, summary,
         ));
     }
     let Some(apply_fn) = applier(to) else {
@@ -480,7 +493,7 @@ fn apply_user_defined_model(
         return Ok(applied);
     }
     Ok(apply_summary_config_for_provider(
-        &applied, to, &model_id, provider, info, summary,
+        registry, &applied, to, &model_id, provider, info, summary,
     ))
 }
 

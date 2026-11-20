@@ -89,6 +89,7 @@ fn supported_translation_pairs_preserve_multiturn_text_tool_identity_and_targete
                         is_compat: compat,
                     };
                     let ctx = RequestCtx {
+                        registry: None,
                         model: "routed-model",
                         stream: true,
                         tool_search: false,

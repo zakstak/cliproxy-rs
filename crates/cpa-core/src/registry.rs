@@ -654,83 +654,16 @@ pub fn refresh_catalog(json: &str) -> Result<Vec<String>, String> {
     Ok(changed)
 }
 
-/// The server's dynamic registry, consulted before the pinned catalog.
-pub trait Overlay: Send + Sync {
-    /// A registered model by public ID, preferring `provider`'s registration.
-    fn lookup(&self, id: &str, provider: Option<&str>) -> Option<ModelInfo>;
-    /// The model one credential registered under `model` (config model entries carry
-    /// display names, context limits, thinking and `is_compat`).
-    fn for_credential(&self, credential_id: &str, model: &str) -> Option<ModelInfo>;
-    /// Go `GetAvailableModelsByProvider`: the models `provider`'s credentials currently
-    /// serve (translators read Antigravity's `supports_web_search` from them). Defaults
-    /// to none.
-    fn available_by_provider(&self, _provider: &str) -> Vec<ModelInfo> {
-        Vec::new()
-    }
-    /// Go `GetAvailableModels("openai")`: every model some credential can serve now, in
-    /// registry order (Codex `spawn_agent` descriptions list them). Defaults to none.
-    fn available(&self) -> Vec<ModelInfo> {
-        Vec::new()
-    }
-    /// Go `GetModelProviders`: the providers that registered exactly `model`, most
-    /// registrations first. Defaults to none.
-    fn model_providers(&self, _model: &str) -> Vec<String> {
-        Vec::new()
-    }
-}
-
-static OVERLAY: std::sync::RwLock<Option<std::sync::Arc<dyn Overlay>>> = std::sync::RwLock::new(None);
-
-/// Installs (or removes) the dynamic registry. Wired once at startup.
-pub fn install_overlay(overlay: Option<std::sync::Arc<dyn Overlay>>) {
-    *OVERLAY.write().unwrap_or_else(std::sync::PoisonError::into_inner) = overlay;
-}
-
-fn overlay() -> Option<std::sync::Arc<dyn Overlay>> {
-    OVERLAY
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
-
-/// Go `registry.LookupModelInfo`: registered models first, then the pinned catalog.
-pub fn lookup_model(id: &str, provider: Option<&str>) -> Option<ModelInfo> {
+/// Look up a public model in the request's registrations, then in the pinned catalog.
+pub fn lookup_model(registry: Option<&dynamic::Registry>, id: &str, provider: Option<&str>) -> Option<ModelInfo> {
     let id = id.trim();
     if id.is_empty() {
         return None;
     }
-    overlay()
-        .and_then(|o| o.lookup(id, provider))
+    registry
+        .and_then(|registry| registry.info(id, provider))
+        .map(|spec| spec.to_info())
         .or_else(|| pinned().lookup(id).cloned())
-}
-
-/// Go `GetGlobalRegistry().GetModelProviders(id)`; empty without an installed registry.
-pub fn model_providers(id: &str) -> Vec<String> {
-    overlay().map(|o| o.model_providers(id)).unwrap_or_default()
-}
-
-/// Go `GetGlobalRegistry().GetModelInfo(id, provider)`: registered models only, without
-/// the pinned catalog fallback of [`lookup_model`].
-pub fn registered_model(id: &str, provider: Option<&str>) -> Option<ModelInfo> {
-    overlay().and_then(|o| o.lookup(id, provider))
-}
-
-/// Go `GetGlobalRegistry().GetAvailableModelsByProvider(provider)`; empty without an
-/// installed registry.
-pub fn available_models_by_provider(provider: &str) -> Vec<ModelInfo> {
-    overlay().map(|o| o.available_by_provider(provider)).unwrap_or_default()
-}
-
-/// Go `GetGlobalRegistry().GetAvailableModels("openai")`; empty without an installed
-/// registry.
-pub fn available_models() -> Vec<ModelInfo> {
-    overlay().map(|o| o.available()).unwrap_or_default()
-}
-
-/// The model info resolved for one credential and model (Go attaches this to the
-/// execution request), when the registry is installed and the credential registered it.
-pub fn credential_model(credential_id: &str, model: &str) -> Option<ModelInfo> {
-    overlay().and_then(|o| o.for_credential(credential_id, model))
 }
 
 #[cfg(test)]

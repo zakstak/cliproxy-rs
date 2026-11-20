@@ -85,6 +85,7 @@ fn chat_stream(held: Vec<Step>, rest: Option<Steps>) -> (ExecStream, std::sync::
         headers: HeaderMap::new(),
         execution_session: None,
         derived_session: None,
+        registry: None,
         resolved_model: None,
         usage: UsageSink::new(settled.clone()),
         request_path: "/v1/chat/completions".into(),

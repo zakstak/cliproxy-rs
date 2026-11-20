@@ -147,6 +147,8 @@ impl std::error::Error for Error {}
 
 /// Request-scoped inputs available to request transforms.
 pub struct RequestCtx<'a> {
+    /// Registrations from the dispatching runtime, if any.
+    pub registry: Option<&'a cpa_core::registry::dynamic::Registry>,
     pub model: &'a str,
     pub stream: bool,
     /// `upstream.claude.tool-search` as pinned for this request (Go
@@ -305,7 +307,9 @@ pub fn codex_request(client: Format, ctx: &RequestCtx<'_>, body: &[u8]) -> Optio
         codex_strict::controls(client, body, &mut out)?;
         Ok(out)
     });
-    Some(converted.map(|out| thinking::apply_summary_for_model(out, upstream.as_str(), ctx.model, summary)))
+    Some(converted.map(|out| {
+        cpa_common::thinking::apply_summary_config_for_model(ctx.registry, &out, upstream.as_str(), ctx.model, summary)
+    }))
 }
 
 /// The Codex translated route's response translators for a `client` answered from Codex:
@@ -329,8 +333,9 @@ fn translate_registered(
 ) -> Result<Vec<u8>, Error> {
     let summary = thinking::extract_translated_summary(body, client.as_str(), upstream.as_str());
     let out = native(body)?;
-    Ok(thinking::apply_summary_for_model(
-        out,
+    Ok(cpa_common::thinking::apply_summary_config_for_model(
+        ctx.registry,
+        &out,
         upstream.as_str(),
         ctx.model,
         summary,

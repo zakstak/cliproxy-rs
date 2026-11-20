@@ -19,9 +19,6 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// `install_registry` sets the process-wide registry the routes read: one test at a time.
-static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Requests one mock received: method, path, JSON body and the body's bytes as sent.
 type Seen = Arc<Mutex<Vec<(String, String, Value, Vec<u8>)>>>;
 
@@ -118,7 +115,6 @@ async fn proxy(upstreams: &[&str]) -> Proxy {
         xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
-    cpa_server::install_registry(&rt);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let app = cpa_server::router(rt.clone());
@@ -176,7 +172,6 @@ type Case = (&'static str, Value, Result<(&'static str, &'static str), &'static 
 /// (model, resolution); `Err(message)` a 400 that names the documented limit.
 #[tokio::test]
 async fn openai_route_resolutions_follow_each_model() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream("a", json!({})).await;
     let p = proxy(&[&up]).await;
     let image = json!({"image_url": CAT});
@@ -355,7 +350,6 @@ async fn openai_route_resolutions_follow_each_model() {
 /// canonical model: its resolution, image, unknown fields and an `upscale` member alike.
 #[tokio::test]
 async fn native_route_forwards_lite_requests_unchanged() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream("n", json!({})).await;
     let p = proxy(&[&up]).await;
     for model in ["grok-imagine-video-1.5-lite", "x-ai/grok-imagine-video-1.5-lite"] {
@@ -382,7 +376,6 @@ async fn native_route_forwards_lite_requests_unchanged() {
 /// classic model.
 #[tokio::test]
 async fn lite_jobs_poll_their_credential_and_keep_their_model() {
-    let _registry = REGISTRY.lock().await;
     let failed = json!({"status": "failed", "error": {"code": "failed_precondition", "message": "unsupported"}});
     let (a, seen_a) = upstream("a", failed.clone()).await;
     let (b, seen_b) = upstream("b", failed).await;
@@ -415,7 +408,6 @@ async fn lite_jobs_poll_their_credential_and_keep_their_model() {
 /// omits it) and, like the other video models, hidden from Codex clients.
 #[tokio::test]
 async fn lite_is_listed_and_hidden_from_codex_clients() {
-    let _registry = REGISTRY.lock().await;
     let (up, _) = upstream("m", json!({})).await;
     let p = proxy(&[&up]).await;
     let (status, out) = send(&p.addr, "GET", "/v1/models", None).await;
@@ -449,7 +441,6 @@ async fn lite_is_listed_and_hidden_from_codex_clients() {
 /// routes, and nothing reaches the xAI upstream.
 #[tokio::test]
 async fn other_video_models_stay_refused() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream("r", json!({})).await;
     let p = proxy(&[&up]).await;
     for model in [
@@ -486,7 +477,6 @@ async fn send_raw(addr: &str, path: &str, payload: &str) -> u16 {
 /// `reference_images` all pass unchanged, on every native path and vendor prefix.
 #[tokio::test]
 async fn native_routes_forward_bodies_byte_for_byte() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream("b", json!({})).await;
     let p = proxy(&[&up]).await;
     let models = [
@@ -526,7 +516,6 @@ async fn native_routes_forward_bodies_byte_for_byte() {
 /// `reference_images[].url`) from its OpenAI-style inputs.
 #[tokio::test]
 async fn compatibility_route_still_builds_url_references() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream("c", json!({})).await;
     let p = proxy(&[&up]).await;
     let image =

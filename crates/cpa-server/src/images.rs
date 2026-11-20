@@ -26,6 +26,7 @@ use cpa_exec::multipart::{self as multipart, Form, MediaType};
 
 use crate::claude::read_failed;
 use crate::dispatch::{self, Call, Done, Failure, Media, MediaKind, SseError};
+use crate::registry::Registry;
 use crate::respond::{self, Writer};
 use crate::{Runtime, errors};
 
@@ -70,13 +71,14 @@ fn is_xai_vendor_alias(prefix: &str) -> bool {
 
 /// `registeredXAIImagesModel`: `model`, or its lowercase, as an xAI credential
 /// registered it (with that credential's `prefix/`).
-fn registered_xai_model(model: &str) -> Option<String> {
+fn registered_xai_model(registry: &Registry, model: &str) -> Option<String> {
     let model = model.trim();
     if model.is_empty() {
         return None;
     }
     [model.to_owned(), model.go_lower()].into_iter().find(|candidate| {
-        cpa_core::registry::model_providers(candidate)
+        registry
+            .model_providers(candidate)
             .iter()
             .any(|provider| provider.trim().go_eq_fold("xai"))
     })
@@ -84,7 +86,7 @@ fn registered_xai_model(model: &str) -> Option<String> {
 
 /// `isXAIImagesModel`: an xAI image model, unprefixed, under a vendor alias, or under
 /// a prefix an xAI credential registered it with.
-fn is_xai_model(model: &str) -> bool {
+fn is_xai_model(registry: &Registry, model: &str) -> bool {
     let (prefix, base) = model_parts(model);
     let base = base.trim().go_lower();
     if ![XAI_DEFAULT_MODEL, XAI_QUALITY_MODEL, XAI_20_MODEL].contains(&base.as_str()) {
@@ -93,8 +95,8 @@ fn is_xai_model(model: &str) -> bool {
     if prefix.is_empty() || is_xai_vendor_alias(prefix) {
         return true;
     }
-    registered_xai_model(&format!("{prefix}/{}", canonical_xai_model(model))).is_some()
-        || registered_xai_model(model).is_some()
+    registered_xai_model(registry, &format!("{prefix}/{}", canonical_xai_model(model))).is_some()
+        || registered_xai_model(registry, model).is_some()
 }
 
 /// `routingXAIImagesModel` (v8.0.67, with 8a3e7622): the model the scheduler routes an
@@ -102,20 +104,21 @@ fn is_xai_model(model: &str) -> bool {
 /// it. Under `force-model-prefix` (or Home) another prefix stays, so only a credential
 /// with that prefix serves it, except a vendor alias (`xai/`, `x-ai/`, `grok/`), which
 /// names no credential and falls back to unprefixed ones.
-fn routing_xai_model(rt: &Runtime, model: &str) -> String {
+fn routing_xai_model(rt: &Runtime, registry: &Registry, model: &str) -> String {
     let canonical = canonical_xai_model(model);
     let (prefix, _) = model_parts(model);
     if prefix.is_empty() {
         return canonical.to_owned();
     }
     let prefixed = format!("{prefix}/{canonical}");
-    if let Some(resolved) = registered_xai_model(&prefixed).or_else(|| registered_xai_model(model)) {
+    if let Some(resolved) = registered_xai_model(registry, &prefixed).or_else(|| registered_xai_model(registry, model))
+    {
         return resolved;
     }
     if !is_xai_vendor_alias(prefix) && rt.config().routing.force_model_prefix {
         return prefixed;
     }
-    if rt.remote_dispatch().is_some() || registered_xai_model(canonical).is_none() {
+    if rt.remote_dispatch().is_some() || registered_xai_model(registry, canonical).is_none() {
         return prefixed;
     }
     canonical.to_owned()
@@ -127,9 +130,10 @@ fn is_codex_tool_model(model: &str) -> bool {
 }
 
 /// `isOpenAICompatImagesModel`: a registered model of type `openai-image`.
-fn is_compat_model(model: &str) -> bool {
+fn is_compat_model(registry: &Registry, model: &str) -> bool {
     let model = model.trim();
-    !model.is_empty() && cpa_core::registry::lookup_model(model, None).is_some_and(|info| info.kind == "openai-image")
+    !model.is_empty()
+        && cpa_core::registry::lookup_model(Some(registry), model, None).is_some_and(|info| info.kind == "openai-image")
 }
 
 pub(crate) fn bad_request(message: &str) -> Response {
@@ -159,8 +163,8 @@ fn codex_json_refused(body: &[u8]) -> Option<Response> {
 }
 
 /// `rejectUnsupportedImagesModel`.
-fn unsupported(model: &str) -> Option<Response> {
-    if is_codex_tool_model(model) || is_xai_model(model) || is_compat_model(model) {
+fn unsupported(registry: &Registry, model: &str) -> Option<Response> {
+    if is_codex_tool_model(model) || is_xai_model(registry, model) || is_compat_model(registry, model) {
         return None;
     }
     let codex = CODEX_TOOL_MODELS.join(", ");
@@ -814,10 +818,11 @@ pub async fn generations(
     if model.is_empty() {
         model = DEFAULT_TOOL_MODEL.into();
     }
-    if let Some(rejected) = unsupported(&model) {
+    let registry = rt.registry();
+    if let Some(rejected) = unsupported(&registry, &model) {
         return rejected;
     }
-    if !is_xai_model(&model)
+    if !is_xai_model(&registry, &model)
         && let Some(rejected) = codex_json_refused(&body)
     {
         return rejected;
@@ -842,7 +847,7 @@ pub async fn generations(
         let req = compat_json_request(&body, &model, stream);
         return raw(p, &model, req, stream, true).await;
     }
-    if is_xai_model(&model) {
+    if is_xai_model(&registry, &model) {
         let req = xai_base_request(&model, &prompt, &format, &xai_json_options(&body, true));
         // `buildXAIImagesGenerationsOriginalRequest`: without the route's defaults.
         let original = xai_base_request(
@@ -851,7 +856,7 @@ pub async fn generations(
             text(&body, "response_format").trim(),
             &xai_json_options(&body, false),
         );
-        let routing = routing_xai_model(&p.rt, &model);
+        let routing = routing_xai_model(&p.rt, &registry, &model);
         return normalized(
             p,
             &routing,
@@ -964,14 +969,15 @@ async fn edits_multipart(p: Prepared, content_type: &str, body: &[u8]) -> Respon
     if model.is_empty() {
         model = DEFAULT_TOOL_MODEL.into();
     }
-    if let Some(rejected) = unsupported(&model) {
+    let registry = p.rt.registry();
+    if let Some(rejected) = unsupported(&registry, &model) {
         return rejected;
     }
     // The Codex models read `model` and `stream` under the adapter's rules, from the
     // client's form, before the rebuilt form drops them (#22): read once, as UTF-8, and
     // `stream` as a boolean spelling. Go reads the first value lossily and any other
     // `stream` text as false. xAI keeps Go's reading.
-    let codex_stream = if is_xai_model(&model) {
+    let codex_stream = if is_xai_model(&registry, &model) {
         None
     } else {
         match cpa_exec::codex_images::form_routing(&form) {
@@ -997,7 +1003,7 @@ async fn edits_multipart(p: Prepared, content_type: &str, body: &[u8]) -> Respon
         format = "b64_json".into();
     }
     let stream = codex_stream.unwrap_or_else(|| parse_bool(&form.value("stream"), false));
-    if is_xai_model(&model) {
+    if is_xai_model(&registry, &model) {
         let size = form.value("size");
         let options = XaiOptions {
             aspect_ratio: aspect_ratio_from_size(&size, &aspect_ratio(&form.value("aspect_ratio"), "")),
@@ -1007,7 +1013,7 @@ async fn edits_multipart(p: Prepared, content_type: &str, body: &[u8]) -> Respon
         };
         let req = xai_edit_request(&model, &prompt, &images, &format, &options);
         let original = edit_original(&req, &raw_format);
-        let routing = routing_xai_model(&p.rt, &model);
+        let routing = routing_xai_model(&p.rt, &registry, &model);
         return normalized(p, &routing, req, format, "image_edit", stream, Some(original)).await;
     }
     // Codex tool models and OpenAI-compatible image models forward the rebuilt form.
@@ -1041,10 +1047,11 @@ async fn edits_json(p: Prepared, body: &[u8]) -> Response {
     if model.is_empty() {
         model = DEFAULT_TOOL_MODEL.into();
     }
-    if let Some(rejected) = unsupported(&model) {
+    let registry = p.rt.registry();
+    if let Some(rejected) = unsupported(&registry, &model) {
         return rejected;
     }
-    if !is_xai_model(&model)
+    if !is_xai_model(&registry, &model)
         && let Some(rejected) = codex_json_refused(body)
     {
         return rejected;
@@ -1063,14 +1070,14 @@ async fn edits_json(p: Prepared, body: &[u8]) -> Response {
         let req = compat_json_request(body, &model, stream);
         return raw(p, &model, req, stream, true).await;
     }
-    if is_xai_model(&model) {
+    if is_xai_model(&registry, &model) {
         let images = xai_images_from_json(body);
         if images.is_empty() {
             return bad_request("Invalid request: image is required");
         }
         let req = xai_edit_request(&model, &prompt, &images, &format, &xai_json_options(body, false));
         let original = edit_original(&req, &raw_format);
-        let routing = routing_xai_model(&p.rt, &model);
+        let routing = routing_xai_model(&p.rt, &registry, &model);
         return normalized(p, &routing, req, format, "image_edit", stream, Some(original)).await;
     }
     let req = compat_json_request(body, &model, stream);

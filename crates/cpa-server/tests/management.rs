@@ -2476,7 +2476,6 @@ async fn usage_live_observes_without_taking_records_from_the_queue() {
             auth.display()
         )
     });
-    cpa_server::install_registry(&f.rt);
     // As the binary composes it, minus layers this test does not exercise.
     let app = cpa_server::observability::router(
         &f.rt,
