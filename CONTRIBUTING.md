@@ -16,7 +16,7 @@ You need Rust (stable), `cmake`, `clang` and `perl` for BoringSSL. Set `CPA_TEST
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo test -p cpa-server --features media-relay,pprof --lib --locked
+cargo test -p cliproxy-internal --features media-relay,pprof --lib --locked
 ```
 
 This fork has no GitHub Actions workflows. Run these checks locally before opening a pull request.
@@ -29,12 +29,16 @@ Tests check behaviour. Do not add benchmark scores, wall-clock speed bounds, all
 
 The dashboard lives in `ui/` (Svelte 5). `npm ci`, `npm run check`, `npm test` and `npm run build` there. See [ui/README.md](ui/README.md).
 
+## Code layout
+
+The backend is one internal library and one executable. See [Architecture](docs/ARCHITECTURE.md) for module ownership, request tracing and test targets.
+
 ## Pull requests
 
 - Keep each pull request to one change, with a test that fails without it.
 - Request bodies are forwarded byte for byte unless a ported rule rewrites them; do not re-serialize JSON just to pass it through.
 - Never log or forward credentials or client keys to the wrong side.
 - Mark a deliberate simplification with a `ponytail:` comment that names its limit and how to lift it.
-- Run the local checks above. This fork builds for Linux only; native Windows and macOS builds must stop with the Linux-only error in `crates/cpa-core/src/lib.rs`.
+- Run the local checks above. This fork builds for Linux only; native Windows and macOS builds must stop with the Linux-only error in `crates/cliproxy-internal/src/lib.rs`.
 
 By contributing you agree that your work is released under the [MIT license](LICENSE).

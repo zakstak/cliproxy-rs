@@ -40,7 +40,7 @@ All 31 core inventory entries and all 13 management inventory entries are resolv
 
 ## Management original-to-replacement accounting
 
-All replacements live in crates/cpa-server/tests/management_contracts.rs (formerly manage_go.rs).
+All replacements live in crates/cliproxy-internal/tests/gateway_management_contracts.rs (formerly manage_go.rs).
 
 | Original inventory test | Independent replacement / behavior retained |
 | --- | --- |
@@ -90,8 +90,8 @@ These cover retained behavior across credential inventory/edits, save bytes, api
 
 ## Validation
 
-- CARGO_BUILD_JOBS=2 nice -n 19 cargo test -p cpa-core --offline passed: 95 unit tests, 2 binary integration tests, 2 upload integration tests, doc tests.
-- CARGO_BUILD_JOBS=2 nice -n 19 cargo test -p cpa-server --test management_contracts --offline passed: 24 tests. Final clean rerun also passed after removing an unused import. A separate run observed a transient concurrent runtime.rs rewrite and failed before the stable rerun.
+- CARGO_BUILD_JOBS=2 nice -n 19 cargo test -p cliproxy-internal --offline passed: 95 unit tests, 2 binary integration tests, 2 upload integration tests, doc tests.
+- CARGO_BUILD_JOBS=2 nice -n 19 cargo test -p cliproxy-internal --test management_contracts --offline passed: 24 tests. Final clean rerun also passed after removing an unused import. A separate run observed a transient concurrent runtime.rs rewrite and failed before the stable rerun.
 - Focused config/credential contract run passed all 13 selected tests before deleting replay interpreters.
 - git diff --check passed for owned paths before final cleanup. Scoped rustfmt applied; no global format.
 

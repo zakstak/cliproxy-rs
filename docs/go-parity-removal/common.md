@@ -1,6 +1,6 @@
 # Common test migration
 
-Owned crate: `crates/cpa-common`. Runtime behavior is unchanged. The only non-test source changes remove replay-only test instrumentation and update module documentation. Native Codex request behavior remains governed by `docs/codex/CONTRACT.md`.
+Owned crate: `crates/cliproxy-internal`. Runtime behavior is unchanged. The only non-test source changes remove replay-only test instrumentation and update module documentation. Native Codex request behavior remains governed by `docs/codex/CONTRACT.md`.
 
 All 35 Rust entry points in the inventory are accounted for below: 31 migration/removal entries and 4 keep entries. Test-only Go recorder adapters, lookup overrides, exact fixture population requirements, error-prose normalization, and output exception tables are removed. The broad matrices now test explicit accepted operations, not another implementation's parser quirks. They do not claim exhaustive compatibility with every historical gjson/sjson API.
 
@@ -52,9 +52,9 @@ The five inventoried recorder entry points (`TestRSFixCodexCatalog`, `TestRSFixC
 
 ## Validation
 
-`CMAKE=/home/zak/.local/share/mise/installs/cmake/4.5.0/cmake-4.5.0-linux-x86_64/bin/cmake CARGO_BUILD_JOBS=2 nice -n19 cargo test --offline -p cpa-common` passed 105 tests (78 library, 7 JSON, 11 payload, 4 selector, 5 schema-ref tests), including the two added signature cases; full output is recorded in `/tmp/cliproxy-parity-migration/common-test.log`.
+`CMAKE=/home/zak/.local/share/mise/installs/cmake/4.5.0/cmake-4.5.0-linux-x86_64/bin/cmake CARGO_BUILD_JOBS=2 nice -n19 cargo test --offline -p cliproxy-internal` passed 105 tests (78 library, 7 JSON, 11 payload, 4 selector, 5 schema-ref tests), including the two added signature cases; full output is recorded in `/tmp/cliproxy-parity-migration/common-test.log`.
 
-Owned files were formatted with rustfmt edition 2024 and `git diff --check -- crates/cpa-common` was clean. No Go build, real account access, provider request, or production deployment occurred.
+Owned files were formatted with rustfmt edition 2024 and `git diff --check -- crates/cliproxy-internal` was clean. No Go build, real account access, provider request, or production deployment occurred.
 
 
 ## Independent-review coverage follow-up

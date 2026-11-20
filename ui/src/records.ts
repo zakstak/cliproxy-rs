@@ -2,7 +2,7 @@
 // Both come from the server as loose data and leave here as named types.
 import { median } from "./observe.ts";
 
-/** `[2026-11-15 14:02:11] [a1b2c3d4] [info ] message` (crates/cpa-server/src/logging.rs). */
+/** `[2026-11-15 14:02:11] [a1b2c3d4] [info ] message` (crates/cliproxy-internal/src/gateway/logging.rs). */
 export type LogLine = {
   n: number;
   raw: string;

@@ -1,0 +1,890 @@
+//! OpenAI Chat Completions request -> Codex (OpenAI Responses) request
+//! (internal/translator/codex/openai/chat-completions/codex_openai_request.go).
+
+use crate::protocol::json::{self as gj, AnyValue, Kind, Res};
+use crate::translation::{
+    Registered, apply_patch, codex_chat_response as response,
+    common::{UserTurnDrops, go_lower, sanitize, trim_space},
+    responses_controls,
+};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+
+pub static PAIR: Registered = registered!(
+    OpenAI -> Codex,
+    request: |ctx, body| convert(ctx.model, body, ctx.stream, false),
+    non_stream: response::non_stream,
+    go_stream: response::go_stream,
+    token_count: None,
+);
+
+/// The Codex translated route's pair ([`crate::translation::codex_response`]): the strict request
+/// conversion, and response translators that read the client's nested custom tools as
+/// it does ([`flatten_custom_tools`]).
+pub(crate) static STRICT: Registered = registered!(
+    OpenAI -> Codex,
+    request: codex_strict,
+    non_stream: response::strict_non_stream,
+    go_stream: response::strict_go_stream,
+    token_count: None,
+);
+
+const NAME_LIMIT: usize = 64;
+
+/// shortenNameIfNeeded: sanitized, then at most 64 bytes, keeping `mcp__` plus the last
+/// `__` segment when possible.
+pub(crate) fn shorten_name(name: &[u8]) -> Vec<u8> {
+    let sanitized = sanitize(name);
+    if sanitized.len() <= NAME_LIMIT {
+        return sanitized;
+    }
+    if sanitized.starts_with(b"mcp__")
+        && let Some(idx) = sanitized.windows(2).rposition(|w| w == b"__")
+        && idx > 0
+    {
+        let mut candidate = [&b"mcp__"[..], &sanitized[idx + 2..]].concat();
+        candidate.truncate(NAME_LIMIT);
+        return candidate;
+    }
+    sanitized[..NAME_LIMIT].to_vec()
+}
+
+/// collectRequestToolNames: declared tools, the tool choice, then assistant tool calls.
+pub(crate) fn request_tool_names(raw: &[u8]) -> Vec<Vec<u8>> {
+    let mut names: Vec<Vec<u8>> = vec![];
+    let mut add = |name: Vec<u8>| {
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    let tools = gj::get(raw, "tools");
+    if tools.is_array() {
+        for tool in tools.array() {
+            match tool.get("type").bytes().as_ref() {
+                b"function" => add(tool.get("function.name").bytes().into_owned()),
+                b"custom" => add(tool.get("name").bytes().into_owned()),
+                _ => {}
+            }
+        }
+    }
+    let choice = gj::get(raw, "tool_choice");
+    if choice.is_object() {
+        match choice.get("type").bytes().as_ref() {
+            b"function" => {
+                let mut name = choice.get("function.name").bytes().into_owned();
+                if name.is_empty() {
+                    name = choice.get("name").bytes().into_owned();
+                }
+                add(name);
+            }
+            b"custom" => add(choice.get("name").bytes().into_owned()),
+            _ => {}
+        }
+    }
+    let messages = gj::get(raw, "messages");
+    if messages.is_array() {
+        for message in messages.array() {
+            if message.get("role").bytes().as_ref() != b"assistant" {
+                continue;
+            }
+            let calls = message.get("tool_calls");
+            if calls.is_array() {
+                for call in calls.array() {
+                    let name = call.get("function.name").bytes().into_owned();
+                    if name.is_empty() {
+                        add(call.get("custom.name").bytes().into_owned());
+                    } else {
+                        add(name);
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+/// buildShortNameMap: unique short names, suffixing `_1`, `_2`, ... on collisions.
+pub(crate) fn short_name_map(names: &[Vec<u8>]) -> HashMap<Vec<u8>, Vec<u8>> {
+    let mut used: HashSet<Vec<u8>> = HashSet::new();
+    let mut map = HashMap::new();
+    for name in names {
+        let candidate = shorten_name(name);
+        let unique = if used.contains(&candidate) {
+            (1..)
+                .map(|i| {
+                    let suffix = format!("_{i}");
+                    let allowed = NAME_LIMIT.saturating_sub(suffix.len());
+                    let mut tmp = candidate[..candidate.len().min(allowed)].to_vec();
+                    tmp.extend_from_slice(suffix.as_bytes());
+                    tmp
+                })
+                .find(|tmp| !used.contains(tmp))
+                .unwrap()
+        } else {
+            candidate
+        };
+        used.insert(unique.clone());
+        map.insert(name.clone(), unique);
+    }
+    map
+}
+
+/// normalizeCodexServiceTier.
+pub(crate) fn service_tier(r: &Res<'_>) -> &'static str {
+    if r.kind != Kind::String {
+        return "";
+    }
+    match go_lower(trim_space(&r.s)).as_slice() {
+        b"fast" | b"priority" => "priority",
+        b"ultrafast" => "ultrafast",
+        _ => "",
+    }
+}
+
+struct PendingCall {
+    call_id: Vec<u8>,
+    source_id: Vec<u8>,
+    custom: bool,
+    consumed: bool,
+}
+
+/// The Codex translated route's conversion (`docs/codex/CONTRACT.md` "Translated
+/// route"): no default `instructions` or reasoning effort, the client's
+/// `parallel_tool_calls`, and a refusal for any part Codex cannot express. The
+/// registered pair, which other Responses providers share, keeps Go's conversion.
+fn codex_strict(ctx: &crate::translation::RequestCtx<'_>, body: &[u8]) -> Result<Vec<u8>, crate::translation::Error> {
+    convert(ctx.model, body, ctx.stream, true)
+}
+
+fn convert(model: &str, raw: &[u8], stream: bool, strict: bool) -> Result<Vec<u8>, crate::translation::Error> {
+    let mut drops = UserTurnDrops::default();
+    let flat = if strict {
+        flatten_custom_tools(raw, &mut drops)
+    } else {
+        Cow::Borrowed(raw)
+    };
+    let raw = &flat[..];
+    let root = gj::parse(raw);
+    let tools = root.get("tools");
+    let tool_list = tools.array();
+    // Strict: no top-level `instructions`. System messages become developer items, and
+    // the pinned client sends none either (`codex-api/src/common.rs:286-314`).
+    let mut out = if strict {
+        b"{}".to_vec()
+    } else {
+        br#"{"instructions":""}"#.to_vec()
+    };
+    gj::set_bool(&mut out, "stream", stream);
+    // The registered pair (Grok, Muse) keeps the client's output limit
+    // (crate::translation::responses_controls). Strict maps it in crate::translation::codex_strict instead.
+    if !strict
+        && let Some(limit) =
+            responses_controls::output_limit(raw, &["max_completion_tokens", "max_tokens", "max_output_tokens"])?
+    {
+        gj::set_raw(&mut out, "max_output_tokens", limit);
+    }
+    let effort = gj::get(raw, "reasoning_effort");
+    // Strict: only the client's own choice; without one the model's default applies.
+    if effort.exists() {
+        AnyValue::from_res(&effort).set(&mut out, "reasoning.effort");
+    } else if !strict {
+        gj::set_str(&mut out, "reasoning.effort", "medium");
+    }
+    let tier = service_tier(&root.get("service_tier"));
+    if !tier.is_empty() {
+        gj::set_str(&mut out, "service_tier", tier);
+    }
+    // The client's choice, else the API default (`true`). Go v8.0.35 forces `true` on
+    // the registered pair; a flag that is not a boolean is refused there
+    // (crate::translation::responses_controls).
+    if !strict {
+        responses_controls::check_bool(raw, "parallel_tool_calls")?;
+    }
+    let parallel = root.get("parallel_tool_calls");
+    gj::set_bool(&mut out, "parallel_tool_calls", parallel.kind != Kind::False);
+    gj::set_strs(&mut out, "include", &["reasoning.encrypted_content"]);
+    gj::set_str(&mut out, "model", model);
+
+    let mut custom_names: HashSet<Vec<u8>> = HashSet::new();
+    if tools.is_array() && !tool_list.is_empty() {
+        let mut function_names: HashSet<Vec<u8>> = HashSet::new();
+        for tool in &tool_list {
+            match tool.get("type").bytes().as_ref() {
+                b"function" => {
+                    function_names.insert(tool.get("function.name").bytes().into_owned());
+                }
+                b"custom" => {
+                    custom_names.insert(tool.get("name").bytes().into_owned());
+                }
+                _ => {}
+            }
+        }
+        custom_names.retain(|n| !function_names.contains(n));
+    }
+    let short_names = short_name_map(&request_tool_names(raw));
+    let short = |name: &[u8]| short_names.get(name).cloned().unwrap_or_else(|| shorten_name(name));
+
+    // (custom, name, input)
+    let resolve = |call: &Res<'_>| -> Option<(bool, Vec<u8>, Vec<u8>)> {
+        match call.get("type").bytes().as_ref() {
+            b"custom" => Some((
+                true,
+                call.get("custom.name").bytes().into_owned(),
+                call.get("custom.input").bytes().into_owned(),
+            )),
+            b"function" => {
+                let name = call.get("function.name").bytes().into_owned();
+                let custom = custom_names.contains(&name);
+                let mut input = call.get("function.arguments").bytes().into_owned();
+                if custom
+                    && trim_space(&name) == b"apply_patch"
+                    && let Some(unwrapped) = apply_patch::unwrap_input(&input)
+                {
+                    input = unwrapped.into_bytes();
+                }
+                Some((custom, name, input))
+            }
+            _ => None,
+        }
+    };
+
+    gj::set_raw(&mut out, "input", b"[]");
+    let mut items: Vec<Vec<u8>> = vec![];
+    let mut pending: Vec<PendingCall> = vec![];
+    let mut ambiguous: HashSet<Vec<u8>> = HashSet::new();
+    let messages = gj::get(raw, "messages");
+    if messages.is_array() {
+        for (i, m) in messages.array().iter().enumerate() {
+            let role = m.get("role").bytes().into_owned();
+            if role == b"tool" {
+                let tool_call_id = m.get("tool_call_id").bytes().into_owned();
+                if !tool_call_id.is_empty() && ambiguous.contains(&tool_call_id) {
+                    // Strict: a result whose call cannot be told apart is refused.
+                    if strict {
+                        drops.drop_part("tool message for a duplicated tool call id");
+                    }
+                    continue;
+                }
+                let Some(call) = pending.iter_mut().find(|c| {
+                    !c.consumed && (tool_call_id.is_empty() || c.source_id == tool_call_id || c.call_id == tool_call_id)
+                }) else {
+                    // Strict: a result without its call is refused, not dropped.
+                    if strict {
+                        drops.drop_part("tool message without a matching tool call");
+                    }
+                    continue;
+                };
+                call.consumed = true;
+                let mut output = b"{}".to_vec();
+                let kind = if call.custom {
+                    "custom_tool_call_output"
+                } else {
+                    "function_call_output"
+                };
+                gj::set_str(&mut output, "type", kind);
+                gj::set_str(&mut output, "call_id", &call.call_id);
+                if strict && m.get("content").kind == Kind::String {
+                    // Strict: string content stays the string the client sent.
+                    gj::set_str(&mut output, "output", &m.get("content").s);
+                } else {
+                    set_tool_output(&mut output, &m.get("content"));
+                }
+                items.push(output);
+                continue;
+            }
+            pending.clear();
+            ambiguous.clear();
+            let mut msg = b"{}".to_vec();
+            gj::set_str(&mut msg, "type", "message");
+            gj::set_str(
+                &mut msg,
+                "role",
+                if role == b"system" { &b"developer"[..] } else { &role },
+            );
+            let assistant = role == b"assistant";
+            let text_type = if assistant { "output_text" } else { "input_text" };
+            let user = role == b"user";
+            let mut parts = vec![];
+            // Counts the parts this user turn really sends; an empty text part does not.
+            let mut sendable = 0;
+            let content = m.get("content");
+            if content.kind == Kind::String && !content.s.is_empty() {
+                sendable += 1;
+                let mut part = b"{}".to_vec();
+                gj::set_str(&mut part, "type", text_type);
+                gj::set_str(&mut part, "text", &content.s);
+                parts.push(part);
+            } else if content.is_array() {
+                for it in content.array() {
+                    match it.get("type").bytes().as_ref() {
+                        b"text" => {
+                            let mut part = b"{}".to_vec();
+                            gj::set_str(&mut part, "type", text_type);
+                            gj::set_str(&mut part, "text", it.get("text").bytes());
+                            parts.push(part);
+                            if !it.get("text").bytes().is_empty() {
+                                sendable += 1;
+                            }
+                        }
+                        b"image_url" if user => {
+                            let mut part = b"{}".to_vec();
+                            gj::set_str(&mut part, "type", "input_image");
+                            let url = it.get("image_url.url");
+                            if url.exists() {
+                                gj::set_str(&mut part, "image_url", url.bytes());
+                            }
+                            parts.push(part);
+                            sendable += 1;
+                        }
+                        b"file" if user => match input_file_part(&it) {
+                            Some(part) => {
+                                parts.push(part);
+                                sendable += 1;
+                            }
+                            None => drops.drop_part("file"),
+                        },
+                        b"input_audio" if user => {
+                            let data = it.get("input_audio.data").bytes();
+                            let format = it.get("input_audio.format").bytes();
+                            if !data.is_empty() {
+                                let mut part = b"{}".to_vec();
+                                gj::set_str(&mut part, "type", "input_audio");
+                                gj::set_str(&mut part, "data", &data);
+                                if !format.is_empty() {
+                                    gj::set_str(&mut part, "format", &format);
+                                }
+                                parts.push(part);
+                                sendable += 1;
+                            } else {
+                                drops.drop_part("input_audio");
+                            }
+                        }
+                        // Strict: a part Codex cannot express in this role is refused.
+                        other if strict => drops.drop_part(&String::from_utf8_lossy(other)),
+                        _ => {}
+                    }
+                }
+            }
+            if user {
+                drops.end_turn(sendable);
+            }
+            if !assistant || !parts.is_empty() {
+                gj::set_raw(&mut msg, "content", gj::join(&parts));
+                items.push(msg);
+            }
+            if !assistant {
+                continue;
+            }
+            let calls = m.get("tool_calls");
+            if !calls.is_array() {
+                continue;
+            }
+            let calls = calls.array();
+            let mut counts: HashMap<Vec<u8>, usize> = HashMap::new();
+            let mut used: HashSet<Vec<u8>> = HashSet::new();
+            for call in &calls {
+                let id = call.get("id").bytes().into_owned();
+                if resolve(call).is_some() && !id.is_empty() {
+                    *counts.entry(id.clone()).or_default() += 1;
+                    used.insert(id);
+                }
+            }
+            ambiguous.extend(counts.into_iter().filter(|(_, n)| *n > 1).map(|(id, _)| id));
+            for (j, call) in calls.iter().enumerate() {
+                let Some((custom, name, input)) = resolve(call) else {
+                    if strict {
+                        let kind = String::from_utf8_lossy(&call.get("type").bytes()).into_owned();
+                        drops.drop_part(&format!("tool call of type {kind}"));
+                    }
+                    continue;
+                };
+                let source_id = call.get("id").bytes().into_owned();
+                if !source_id.is_empty() && ambiguous.contains(&source_id) {
+                    if strict {
+                        drops.drop_part("duplicated tool call id");
+                    }
+                    continue;
+                }
+                let mut call_id = source_id.clone();
+                if call_id.is_empty() {
+                    let base = format!("call_missing_{i}_{j}").into_bytes();
+                    call_id = base.clone();
+                    let mut suffix = 1;
+                    while used.contains(&call_id) {
+                        call_id = [&base[..], format!("_{suffix}").as_bytes()].concat();
+                        suffix += 1;
+                    }
+                    used.insert(call_id.clone());
+                }
+                // Go: Codex rejects call_id values longer than 64 bytes (b0debb35). No
+                // first-party or documented source states that limit, so the strict route
+                // keeps the client's ID.
+                let mut shortened = if strict {
+                    call_id.clone()
+                } else {
+                    shorten_call_id(&call_id)
+                };
+                if shortened != call_id {
+                    // Go shortens `call_id + "_N"` until the result is unused. Every candidate
+                    // keeps the same first bytes, so `call_id` is hashed once and each attempt
+                    // only feeds its `_N`: linear however many candidates a client occupies.
+                    use sha2::Digest;
+                    let prefix = sha2::Sha256::new_with_prefix(&call_id);
+                    let mut attempt = 1;
+                    while used.contains(&shortened) {
+                        let sum = prefix.clone().chain_update(format!("_{attempt}")).finalize();
+                        shortened = with_hash_suffix(&call_id, &sum);
+                        attempt += 1;
+                    }
+                    used.insert(shortened.clone());
+                    call_id = shortened;
+                }
+                pending.push(PendingCall {
+                    call_id: call_id.clone(),
+                    source_id,
+                    custom,
+                    consumed: false,
+                });
+                let mut item = b"{}".to_vec();
+                gj::set_str(
+                    &mut item,
+                    "type",
+                    if custom { "custom_tool_call" } else { "function_call" },
+                );
+                gj::set_str(&mut item, "call_id", &call_id);
+                gj::set_str(&mut item, "name", short(&name));
+                gj::set_str(&mut item, if custom { "input" } else { "arguments" }, &input);
+                items.push(item);
+            }
+        }
+    }
+    gj::set_items(&mut out, "input", &items);
+
+    let format = gj::get(raw, "response_format");
+    let text = gj::get(raw, "text");
+    if format.exists() {
+        if !gj::get(&out, "text").exists() {
+            gj::set_raw(&mut out, "text", b"{}");
+        }
+        match format.get("type").bytes().as_ref() {
+            b"text" => {
+                gj::set_str(&mut out, "text.format.type", "text");
+            }
+            b"json_schema" => {
+                let schema = format.get("json_schema");
+                if schema.exists() {
+                    gj::set_str(&mut out, "text.format.type", "json_schema");
+                    for (from, to) in [("name", "text.format.name"), ("strict", "text.format.strict")] {
+                        let v = schema.get(from);
+                        if v.exists() {
+                            AnyValue::from_res(&v).set(&mut out, to);
+                        }
+                    }
+                    let s = schema.get("schema");
+                    if s.exists() {
+                        gj::set_raw(&mut out, "text.format.schema", &s.raw);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let verbosity = text.get("verbosity");
+        if text.exists() && verbosity.exists() {
+            AnyValue::from_res(&verbosity).set(&mut out, "text.verbosity");
+        }
+    } else if text.exists() {
+        let verbosity = text.get("verbosity");
+        if verbosity.exists() {
+            if !gj::get(&out, "text").exists() {
+                gj::set_raw(&mut out, "text", b"{}");
+            }
+            AnyValue::from_res(&verbosity).set(&mut out, "text.verbosity");
+        }
+    }
+
+    if tools.is_array() && !tool_list.is_empty() {
+        let mut tool_items = vec![];
+        for t in &tool_list {
+            let kind = t.get("type").bytes().into_owned();
+            if kind == b"custom" {
+                let mut item = t.raw.to_vec();
+                gj::set_str(&mut item, "name", short(&t.get("name").bytes()));
+                tool_items.push(item);
+                continue;
+            }
+            if !kind.is_empty() && kind != b"function" && t.is_object() {
+                tool_items.push(t.raw.to_vec());
+                continue;
+            }
+            if kind != b"function" {
+                continue;
+            }
+            let mut item = b"{}".to_vec();
+            gj::set_str(&mut item, "type", "function");
+            let f = t.get("function");
+            if f.exists() {
+                let name = f.get("name");
+                if name.exists() {
+                    gj::set_str(&mut item, "name", short(&name.bytes()));
+                }
+                let description = f.get("description");
+                if description.exists() {
+                    AnyValue::from_res(&description).set(&mut item, "description");
+                }
+                let parameters = f.get("parameters");
+                if parameters.exists() {
+                    gj::set_raw(&mut item, "parameters", &parameters.raw);
+                }
+                let strict = f.get("strict");
+                if strict.exists() {
+                    AnyValue::from_res(&strict).set(&mut item, "strict");
+                } else {
+                    gj::set_bool(&mut item, "strict", false);
+                }
+            }
+            tool_items.push(item);
+        }
+        gj::set_raw(&mut out, "tools", gj::join(&tool_items));
+    }
+
+    let choice = gj::get(raw, "tool_choice");
+    if choice.kind == Kind::String {
+        gj::set_str(&mut out, "tool_choice", &choice.s);
+    } else if choice.is_object() {
+        let mut kind = choice.get("type").bytes().into_owned();
+        if kind == b"function" || kind == b"custom" {
+            let mut name = choice.get("name").bytes().into_owned();
+            if kind == b"function" {
+                name = choice.get("function.name").bytes().into_owned();
+                if custom_names.contains(&name) {
+                    kind = b"custom".to_vec();
+                }
+            }
+            if !name.is_empty() {
+                name = short(&name);
+            }
+            let mut tc = b"{}".to_vec();
+            gj::set_str(&mut tc, "type", &kind);
+            if !name.is_empty() {
+                gj::set_str(&mut tc, "name", &name);
+            }
+            gj::set_raw(&mut out, "tool_choice", tc);
+        } else if !kind.is_empty() {
+            gj::set_raw(&mut out, "tool_choice", &choice.raw);
+        }
+    }
+    gj::set_bool(&mut out, "store", false);
+    if strict {
+        drops.strict_result("Codex Responses")
+    } else {
+        drops.result()
+    }
+    .map(|()| out)
+}
+
+/// The strict route reads Chat Completions' documented nested custom tool (#170),
+/// `{"type":"custom","custom":{"name","description","format"}}`, as the Responses custom
+/// tool: the definition's members at the top level, and a grammar format's nested
+/// `grammar` members beside its `type`. A nested custom `tool_choice`,
+/// `{"type":"custom","custom":{"name"}}`, becomes `{"type":"custom","name"}`. The rest of
+/// the conversion, and the response's name map, then read one shape; the flat form passes
+/// as before. A custom tool without a name, and a nested one with members beside `type`
+/// and `custom`, are refused into `drops`. Borrowed when there is nothing to flatten;
+/// otherwise `tools` and `tool_choice` are each replaced once, so the work stays linear.
+pub(crate) fn flatten_custom_tools<'a>(raw: &'a [u8], drops: &mut UserTurnDrops) -> Cow<'a, [u8]> {
+    let root = gj::parse(raw);
+    let is_custom = |r: &Res<'_>| r.get("type").bytes().as_ref() == b"custom";
+    let tools = root.get("tools").array();
+    let mut nested = false;
+    for tool in tools.iter().filter(|t| is_custom(t)) {
+        let custom = tool.get("custom");
+        let definition = if custom.is_object() { &custom } else { tool };
+        let name = definition.get("name");
+        if name.kind != Kind::String || name.s.is_empty() {
+            drops.drop_part("custom tool without a name");
+        }
+        if custom.is_object() {
+            nested = true;
+            if tool.map().iter().any(|(key, _)| key != b"type" && key != b"custom") {
+                drops.drop_part("custom tool member beside `custom`");
+            }
+        }
+    }
+    let choice = root.get("tool_choice");
+    let choice_custom = choice.get("custom");
+    let nested_choice = is_custom(&choice) && choice_custom.is_object();
+    if !nested && !nested_choice {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = raw.to_vec();
+    if nested {
+        let flat: Vec<Vec<u8>> = tools
+            .iter()
+            .map(|tool| {
+                let custom = tool.get("custom");
+                if !is_custom(tool) || !custom.is_object() {
+                    return tool.raw.to_vec();
+                }
+                let mut item = custom.raw.to_vec();
+                gj::set_str(&mut item, "type", "custom");
+                let format = custom.get("format");
+                let grammar = format.get("grammar");
+                if format.get("type").bytes().as_ref() == b"grammar" && grammar.is_object() {
+                    let mut flat_format = grammar.raw.to_vec();
+                    gj::set_str(&mut flat_format, "type", "grammar");
+                    gj::set_raw(&mut item, "format", flat_format);
+                }
+                item
+            })
+            .collect();
+        gj::set_raw(&mut out, "tools", gj::join(&flat));
+    }
+    if nested_choice {
+        let mut flat = br#"{"type":"custom"}"#.to_vec();
+        let name = choice_custom.get("name");
+        if name.exists() {
+            gj::set_raw(&mut flat, "name", &name.raw);
+        }
+        gj::set_raw(&mut out, "tool_choice", flat);
+    }
+    Cow::Owned(out)
+}
+
+/// `shortenCodexCallIDIfNeeded`: an ID over 64 bytes keeps its first bytes (cut without
+/// regard to UTF-8, as Go slices the string) and ends in `_` plus 8 bytes of its SHA-256.
+fn shorten_call_id(id: &[u8]) -> Vec<u8> {
+    const LIMIT: usize = 64;
+    if id.len() <= LIMIT {
+        return id.to_vec();
+    }
+    use sha2::{Digest, Sha256};
+    with_hash_suffix(id, &Sha256::digest(id))
+}
+
+/// The first 47 bytes of `id` (over 64 bytes), `_` and the first 8 bytes of `sum` in hex.
+fn with_hash_suffix(id: &[u8], sum: &[u8]) -> Vec<u8> {
+    let suffix: String = std::iter::once("_".to_owned())
+        .chain(sum[..8].iter().map(|b| format!("{b:02x}")))
+        .collect();
+    [&id[..64 - suffix.len()], suffix.as_bytes()].concat()
+}
+
+/// setToolCallOutputContent.
+fn set_tool_output(output: &mut Vec<u8>, content: &Res<'_>) {
+    if content.kind == Kind::String {
+        let structured = gj::parse(&content.s).into_owned();
+        if has_image_part(&structured) {
+            return set_tool_output(output, &structured);
+        }
+        gj::set_str(output, "output", &content.s);
+    } else if content.is_array() {
+        let parts: Vec<Vec<u8>> = content.array().iter().map(output_part).collect();
+        gj::set_raw(output, "output", gj::join(&parts));
+    } else {
+        let fallback = if content.raw.is_empty() {
+            content.bytes().into_owned()
+        } else {
+            content.raw.to_vec()
+        };
+        gj::set_str(output, "output", fallback);
+    }
+}
+
+fn input_text(text: &[u8]) -> Vec<u8> {
+    let mut part = b"{}".to_vec();
+    gj::set_str(&mut part, "type", "input_text");
+    gj::set_str(&mut part, "text", text);
+    part
+}
+
+fn fallback_part(item: &Res<'_>) -> Vec<u8> {
+    let text = if item.raw.is_empty() {
+        item.bytes().into_owned()
+    } else {
+        item.raw.to_vec()
+    };
+    input_text(&text)
+}
+
+/// toolOutputContentPart.
+fn output_part(item: &Res<'_>) -> Vec<u8> {
+    let kind = item.get("type").bytes().into_owned();
+    match kind.as_slice() {
+        b"text" | b"input_text" | b"output_text" => input_text(&item.get("text").bytes()),
+        b"image_url" | b"input_image" => {
+            let input = kind == b"input_image";
+            let (url, file_id, detail) = if input {
+                (item.get("image_url"), item.get("file_id"), item.get("detail"))
+            } else {
+                (
+                    item.get("image_url.url"),
+                    item.get("image_url.file_id"),
+                    item.get("image_url.detail"),
+                )
+            };
+            let (url, file_id, detail) = (url.bytes(), file_id.bytes(), detail.bytes());
+            if url.is_empty() && file_id.is_empty() {
+                return fallback_part(item);
+            }
+            let mut part = b"{}".to_vec();
+            gj::set_str(&mut part, "type", "input_image");
+            if !url.is_empty() {
+                gj::set_str(&mut part, "image_url", &url);
+            }
+            if !file_id.is_empty() {
+                gj::set_str(&mut part, "file_id", &file_id);
+            }
+            if !detail.is_empty() {
+                gj::set_str(&mut part, "detail", &detail);
+            }
+            part
+        }
+        b"file" => input_file_part(item).unwrap_or_else(|| fallback_part(item)),
+        _ => fallback_part(item),
+    }
+}
+
+/// codexInputFilePart: a chat `file` part as an input_file, or None when it names no
+/// file_id, file_data or file_url.
+fn input_file_part(item: &Res<'_>) -> Option<Vec<u8>> {
+    let (id, data, url) = (
+        item.get("file.file_id").bytes(),
+        item.get("file.file_data").bytes(),
+        item.get("file.file_url").bytes(),
+    );
+    if id.is_empty() && data.is_empty() && url.is_empty() {
+        return None;
+    }
+    let mut part = b"{}".to_vec();
+    gj::set_str(&mut part, "type", "input_file");
+    for (key, value) in [("file_id", &id), ("file_data", &data), ("file_url", &url)] {
+        if !value.is_empty() {
+            gj::set_str(&mut part, key, value.as_ref());
+        }
+    }
+    let filename = item.get("file.filename").bytes();
+    if !filename.is_empty() {
+        gj::set_str(&mut part, "filename", &filename);
+    }
+    Some(part)
+}
+
+/// hasToolOutputImagePart.
+fn has_image_part(content: &Res<'_>) -> bool {
+    content.is_array()
+        && content
+            .array()
+            .iter()
+            .any(|item| match item.get("type").bytes().as_ref() {
+                b"image_url" => {
+                    !item.get("image_url.url").bytes().is_empty() || !item.get("image_url.file_id").bytes().is_empty()
+                }
+                b"input_image" => !item.get("image_url").bytes().is_empty() || !item.get("file_id").bytes().is_empty(),
+                _ => false,
+            })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn long_call_ids_are_bounded_distinct_and_keep_multiturn_references() {
+        let prefix = "a".repeat(80);
+        let ids = [format!("{prefix}-one"), format!("{prefix}-two")];
+        let body = json!({"model":"old", "messages":[
+            {"role":"assistant", "tool_calls": [
+                {"id":ids[0],"type":"function","function":{"name":"first","arguments":"{}"}},
+                {"id":ids[1],"type":"function","function":{"name":"second","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":ids[0],"content":"one"},
+            {"role":"tool","tool_call_id":ids[1],"content":"two"},
+            {"role":"user","content":"continue"}
+        ]});
+        let out = convert("gpt-test", &serde_json::to_vec(&body).unwrap(), false, false).unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        let input = out["input"].as_array().unwrap();
+        let calls: Vec<&Value> = input.iter().filter(|v| v["type"] == "function_call").collect();
+        let results: Vec<&Value> = input.iter().filter(|v| v["type"] == "function_call_output").collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(results.len(), 2);
+        let first = calls[0]["call_id"].as_str().unwrap();
+        let second = calls[1]["call_id"].as_str().unwrap();
+        assert!(first.len() <= 64 && second.len() <= 64);
+        assert_ne!(first, second);
+        for (call, result) in calls.iter().zip(&results) {
+            assert_eq!(call["call_id"], result["call_id"]);
+        }
+        assert_eq!(results[0]["output"], "one");
+        assert_eq!(results[1]["output"], "two");
+        for id in [b"".as_slice(), b"call_short", &[b'x'; 64]] {
+            assert_eq!(shorten_call_id(id), id);
+        }
+    }
+    #[test]
+    fn call_identity_survives_collisions_missing_ids_and_unicode() {
+        use sha2::{Digest, Sha256};
+        let long = "z".repeat(90);
+        // Occupy the adapter's first two shortened candidates. These are adversarial
+        // inputs, not expected output: only uniqueness and references are asserted.
+        let occupied = shorten_call_id(long.as_bytes());
+        let next_sum = Sha256::new_with_prefix(long.as_bytes()).chain_update("_1").finalize();
+        let next_occupied = with_hash_suffix(long.as_bytes(), &next_sum);
+        let ids = [
+            Some(long.clone()),
+            Some(String::from_utf8(occupied).unwrap()),
+            Some(String::from_utf8(next_occupied).unwrap()),
+            Some("é".repeat(60)),
+            None,
+            None,
+        ];
+        let calls: Vec<Value> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let mut call = json!({"type":"function","function":{"name":format!("tool_{i}"),"arguments":"{}"}});
+                if let Some(id) = id {
+                    call["id"] = json!(id);
+                }
+                call
+            })
+            .collect();
+        let mut messages = vec![json!({"role":"assistant","tool_calls":calls})];
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(id) = id {
+                messages.push(json!({"role":"tool","tool_call_id":id,"content":format!("result-{i}")}));
+            }
+        }
+        let body = json!({"messages":messages});
+        let out: Value =
+            serde_json::from_slice(&convert("gpt-test", &serde_json::to_vec(&body).unwrap(), false, false).unwrap())
+                .unwrap();
+        let input = out["input"].as_array().unwrap();
+        let calls: Vec<&Value> = input.iter().filter(|v| v["type"] == "function_call").collect();
+        assert_eq!(calls.len(), 6);
+        let unique: std::collections::HashSet<&str> = calls.iter().map(|v| v["call_id"].as_str().unwrap()).collect();
+        assert_eq!(unique.len(), 6);
+        assert!(unique.iter().all(|id| !id.is_empty()));
+        let results: Vec<&Value> = input.iter().filter(|v| v["type"] == "function_call_output").collect();
+        assert_eq!(results.len(), 4);
+        for (call, result) in calls.iter().zip(results) {
+            assert_eq!(call["call_id"], result["call_id"]);
+        }
+        let duplicated = json!({"messages":[{"role":"assistant","tool_calls":[
+            {"id":long,"type":"function","function":{"name":"one","arguments":"{}"}},
+            {"id":long,"type":"function","function":{"name":"two","arguments":"{}"}}
+        ]}]});
+        let out: Value = serde_json::from_slice(
+            &convert("gpt-test", &serde_json::to_vec(&duplicated).unwrap(), false, false).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !out["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["type"] == "function_call")
+        );
+    }
+}

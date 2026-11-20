@@ -2,7 +2,7 @@
 
 If you are an agent installing cliproxy-rs for a user rather than developing it, stop here and follow [docs/AI-SETUP.md](docs/AI-SETUP.md).
 
-A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI), compatible with its `config.yaml`, auth JSON files in `auth-dir`, HTTP routes and response shapes and v8 Management API for the providers it keeps. This fork has four built-in upstreams: Claude (`claude`), Codex (`codex`), Grok (`xai`) and Muse (`meta`). Clients use Anthropic Messages, OpenAI Chat Completions or OpenAI Responses. Kimi, Devin, Gemini, Gemini Interactions, Vertex AI, AI Studio, Antigravity and the generic OpenAI-compatible upstreams were removed (issue #49); their settings, routes, logins and imports fail with a migration error (`cpa_core::removed`), and their saved logins stay on disk unread. Do not add them back, migrate their code or keep compatibility layers for them.
+A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI), compatible with its `config.yaml`, auth JSON files in `auth-dir`, HTTP routes and response shapes and v8 Management API for the providers it keeps. This fork has four built-in upstreams: Claude (`claude`), Codex (`codex`), Grok (`xai`) and Muse (`meta`). Clients use Anthropic Messages, OpenAI Chat Completions or OpenAI Responses. Kimi, Devin, Gemini, Gemini Interactions, Vertex AI, AI Studio, Antigravity and the generic OpenAI-compatible upstreams were removed (issue #49); their settings, routes, logins and imports fail with a migration error (`cliproxy_internal::removed`), and their saved logins stay on disk unread. Do not add them back, migrate their code or keep compatibility layers for them.
 
 ## Compatibility
 
@@ -15,26 +15,36 @@ A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI), co
 
 ## Layout
 
-- `crates/cpa-core`: config and credential file formats. No networking.
-- `crates/cpa-common`: helpers shared by translators and executors, such as JSON reading and editing that keeps untouched bytes, payload rules, thinking and signature handling, session identity and the Codex request-body boundary.
-- `crates/cpa-translate`: format translation between the Anthropic Messages, OpenAI Chat Completions and OpenAI Responses (Codex) formats.
-- `crates/cpa-exec`: one module group per upstream provider (Claude, Codex, xAI, Meta: wire format, auth headers, HTTP client profile), with shared helpers in provider-neutral modules (`helpers`, `login`, `openai_http`, `openai_payload`, `multipart`, `compaction_capsule`, `claude_input_tokens`).
-- `crates/cpa-server`: axum routes, client auth, credential selection, management API.
-- `crates/cpa-store`, `crates/cpa-home`: the remote config and auth stores, and Home mode. There is no native plugin host: Go's plugin model is removed (#47, `docs/DIFFERENCES-FROM-GO.md` "Native plugins"); add a capability as a built-in Rust feature, and choose any future extension mechanism separately.
-- `crates/cliproxy`: the binary. Go-style single-dash flags are accepted.
-- `ui/` is the dashboard. Retired Go comparisons and benchmark results are available in Git history.
+The backend has one internal library, `crates/cliproxy-internal`, and one executable,
+`crates/cliproxy`. Use modules for internal boundaries. Add a crate only when an
+independent build target or an actual external consumer requires one.
+
+- `crates/cliproxy-internal/src/gateway`: axum routes, client auth, management API and HTTP response handling.
+- `crates/cliproxy-internal/src/runtime`: credential selection, scheduling, refresh, model registration and request lifecycle.
+- `crates/cliproxy-internal/src/providers`: Claude, Codex, xAI and Meta upstream I/O, authentication and provider profiles.
+- `crates/cliproxy-internal/src/translation`: format conversion and the client-rewrite entry point in `client.rs`.
+- `crates/cliproxy-internal/src/protocol`: byte-preserving JSON, payload rules, thinking, signatures and session identity.
+- `crates/cliproxy-internal/src/persistence`: config/auth persistence and cooldown contracts. `storage` implements PostgreSQL, object storage and Git; `home` implements the Home control-plane protocol.
+- `crates/cliproxy-internal/src/{config,credential,execution,format,catalog}`: shared data contracts and model catalogs. These modules perform no provider networking.
+- `crates/cliproxy`: flags, startup, integration assembly and TUI. Go-style single-dash flags are accepted.
+- `ui/`: the dashboard, with separate browser build targets.
+
+Keep traits beside their consumers or in the relevant shared-contract module. Implement
+them on the owning types directly. Do not add facade modules or compatibility crates
+for the retired `cpa-*` packages. There is no native plugin host (#47).
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the request path and test locations.
 
 ## Rules
 
-- The full test suite is slow and memory-heavy (the BoringSSL build and the release link). While iterating, run the affected crate or a filter, for example `cargo test -p cpa-exec xai`. Run fmt, `clippy -D warnings` and the whole suite locally before merging (see `CONTRIBUTING.md`). On a shared or small machine, add `CARGO_BUILD_JOBS=2 nice -n 19`.
+- The full test suite is slow and memory-heavy (the BoringSSL build and the release link). While iterating, run the affected crate or a filter, for example `cargo test -p cliproxy-internal providers::xai`. Run fmt, `clippy -D warnings` and the whole suite locally before merging (see `CONTRIBUTING.md`). On a shared or small machine, add `CARGO_BUILD_JOBS=2 nice -n 19`.
 - The PostgreSQL store tests run only when `CPA_TEST_PG_BIN` names a PostgreSQL `bin` directory; with `CPA_TEST_NO_SKIP=1`, a missing cluster fails instead of skipping. Run the suite with external network access blocked and loopback available.
 - Choose case handling from the input's contract. Use Rust's Unicode case conversion for Unicode text and ASCII methods for protocol tokens or an explicitly ASCII comparison. Existing simple-case adapters remain where configuration, saved credentials, or shared identities depend on their behavior; Go's case tables are not a reason to require them for new code. Do not change an existing identity or trust comparison without checking its callers and compatibility requirements.
 - Request bodies are forwarded byte for byte unless a ported rule rewrites them. Never re-serialize JSON just to pass it through.
 - Upstream credentials and client keys must never be logged or forwarded to the wrong side.
-- Upstream request and response capture goes through the shared sink in `crates/cpa-server/src/request_logging.rs`. It redacts `Cookie` and `Set-Cookie` values, credentials in URLs and short keys, and spools large sections to disk. Don't format or log captured bytes anywhere else.
-- Keep request preparation linear in the body size. Coding agents send bodies from 100 KB to several MB, so walk a JSON body once and edit by path (see `crates/cpa-exec/src/claude/signals.rs`) instead of searching it again from the start for each element.
+- Upstream request and response capture goes through the shared sink in `crates/cliproxy-internal/src/gateway/request_logging.rs`. It redacts `Cookie` and `Set-Cookie` values, credentials in URLs and short keys, and spools large sections to disk. Don't format or log captured bytes anywhere else.
+- Keep request preparation linear in the body size. Coding agents send bodies from 100 KB to several MB, so walk a JSON body once and edit by path (see `crates/cliproxy-internal/src/providers/claude/signals.rs`) instead of searching it again from the start for each element.
 - Tests check behaviour, not speed or memory use. Do not add wall-clock speed bounds, allocation counts, RSS limits or benchmark scores as test assertions or CI gates. Tests of a configured timeout, cancellation or deadline, and of a resource limit that protects the server (a body, line or decompression cap), are behaviour and stay. A generous timeout that only stops a broken test from hanging is fine.
-- Tests use local mock upstreams and never send traffic to real provider accounts. Give every test a private `auth-dir`: without one, credential loading falls back to `~/.cli-proxy-api`, where real logins live. Build test runtimes with `cpa_server::testing::runtime`.
+- Tests use local mock upstreams and never send traffic to real provider accounts. Give every test a private `auth-dir`: without one, credential loading falls back to `~/.cli-proxy-api`, where real logins live. Build test runtimes with `cliproxy_internal::gateway::testing::runtime`.
 - Mark deliberate simplifications with a `ponytail:` comment naming the ceiling and the upgrade path.
 - Prompt-cache changes must keep request semantics and stable prefixes, and show cache-read and cache-write usage for warm, changed-context and idle continuations before merge. Run that check manually against a live Claude login. Never add inference keepalive pings.
 

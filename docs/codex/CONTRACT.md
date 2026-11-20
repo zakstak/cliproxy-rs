@@ -44,7 +44,7 @@ The following rules decide how to use the sources:
   evidence covers.
 - When no source covers an endpoint, the entry says "unknown". Unknown is not
   "unsupported". A later PR may not fill an unknown with Go behaviour.
-- Go v8.0.35 recordings (`crates/cpa-exec/tests/fixtures/codex_go*.json` and the other
+- Go v8.0.35 recordings (`crates/cliproxy-internal/tests/providers/fixtures/codex_go*.json` and the other
   `*_go.json` Codex files) stay labelled with their original versions. They are
   historical regression evidence for behaviour not yet migrated. They never define the
   Codex contract.
@@ -57,7 +57,7 @@ Other providers follow the provider-first functional compatibility rule in
 ## Endpoint profiles
 
 A Codex credential resolves to one of four endpoint profiles.
-`crates/cpa-exec/src/codex_request.rs` `View::new` picks the profile from the credential.
+`crates/cliproxy-internal/src/providers/codex_request.rs` `View::new` picks the profile from the credential.
 
 | Profile | Base URL | Upstream credential | First-party evidence |
 | --- | --- | --- | --- |
@@ -162,7 +162,7 @@ The proxy does not enforce these rules. The native route forwards the client's b
 the upstream judges them. The proxy never strips a field, tool or input to force a request
 through, and never adds `store` or `stream`
 (`siwc_documented_and_unsupported_requests_pass_unchanged` in
-`crates/cpa-server/tests/codex_qualify.rs`). The translated route's conversion is the same
+`crates/cliproxy-internal/tests/gateway_codex_qualify.rs`). The translated route's conversion is the same
 on every profile. A converted request can still carry a field or tool this profile refuses,
 and the upstream's error then reaches the client. Whether to refuse those conversions
 before dispatch belongs to #27 and #79.
@@ -191,7 +191,7 @@ Connection-local continuation holds because one client socket uses one upstream 
 one account ([WebSocket state](#websocket-state);
 `siwc_websocket_continuation_stays_on_its_connection`).
 
-The `siwc-*` fixtures in `crates/cpa-exec/tests/fixtures/codex_contract/` are
+The `siwc-*` fixtures in `crates/cliproxy-internal/tests/providers/fixtures/codex_contract/` are
 `provider-docs` evidence written from these pages, with placeholder text where the pages
 give no value (error messages; no `error.type` is documented).
 
@@ -259,7 +259,7 @@ discretionary mutation, and a migrated route must not perform it.
 | Send `stream: true` upstream for a buffered client, then build the client's response from the upstream `response.completed` object | `chatgpt`, while `stream: false` acceptance stays unknown | Transport adaptation. The aggregate carries the provider's response object, usage and errors. It does not authorize changes to streamed events. On `api-key`, forward `stream: false` unchanged. |
 | Decode the client's `Content-Encoding` to read routing fields | All profiles | Transport. Forward the original bytes, or the decoded bytes when re-encoding is not possible. Never re-serialize the JSON. |
 | Convert Chat Completions or Claude Messages requests into Responses, and the responses back | Registered cross-API routes into Codex | Cross-API purpose. [Translated route](#translated-route) lists each retained conversion and its evidence. A conversion that cannot keep the caller's meaning fails with an error before the upstream send. |
-| Redact credentials in captured request logs | The capture sink in `crates/cpa-server/src/request_logging.rs` | Credential safety. Redaction changes logs only, never forwarded bytes. |
+| Redact credentials in captured request logs | The capture sink in `crates/cliproxy-internal/src/gateway/request_logging.rs` | Credential safety. Redaction changes logs only, never forwarded bytes. |
 | Deliver the backend's status-less context-window `error` event to a Codex client as `response.failed` | `chatgpt`, a Codex client (#5) | First-party classification: the pinned client ignores the `error` event (`sse/responses.rs:375-385`) and compacts only on `response.failed` with `context_length_exceeded`. `response.error` is the upstream `error` object byte for byte. |
 | Answer a client's `response.interrupt` that no upstream socket can take with a local `response.interrupt.accepted`, and, when it stops a running turn, a local interrupted `response.incomplete` | A WebSocket turn served over HTTP ([WebSocket HTTP fallback](#websocket-http-fallback)) (#1) | First-party cancel handshake. After a cancel, the pinned client waits for both events before its deadline (`responses_websocket.rs:310-333`, 824-839, 886-913). The proxy stops that response itself by cancelling the HTTP request. Both events are local transport answers, not provider output: see the fallback section for their content. |
 | Write an SSE comment (`: keep-alive`) while a stream is idle | Streams with `requests.streaming.keepalive-seconds` | Transport framing. Clients ignore comments; no event changes. The comment is written only at an event boundary, never inside a line or event the upstream left unfinished (#105). |
@@ -332,8 +332,8 @@ below spell out what that means for the fields Codex sends.
 
 ## Request boundary
 
-`cpa_common::codex_body::CodexBody::parse` is the one parser for Codex request bodies
-([#22](https://github.com/zakstak/cliproxy-rs/issues/22)). It lives in `cpa-common` so
+`protocol::codex_body::CodexBody::parse` is the one parser for Codex request bodies
+([#22](https://github.com/zakstak/cliproxy-rs/issues/22)). It lives in the shared `protocol` module so
 that executor, server and translator code all reach the same policy. It reads the body
 once, in place, and returns the top-level members as slices of the caller's bytes. It
 never copies the body, never builds a value tree and never re-serializes. It checks
@@ -358,7 +358,7 @@ content. Any other member, at any depth, passes as long as it is valid JSON.
 
 The size row is the boundary's own limit. Through the server, a body never reaches it:
 the server reads every client request under the shared 64 MiB limit
-(`cpa_server::MAX_REQUEST_BYTES`, the same number) before it knows the provider, and a
+(`gateway::MAX_REQUEST_BYTES`, the same number) before it knows the provider, and a
 WebSocket message under the same limit. A larger HTTP body gets the server's answer for
 every provider: 400 with `Invalid request: Failed to buffer the request body: length limit
 exceeded`, or 413 with `http: request body too large` under a smaller
@@ -391,9 +391,9 @@ compares it with one by its decimal digits: `1`, `1.0` and `1e0` are one, and
 `1.0000000000000001`, which a float rounds to one, is refused as an `n` the tool cannot
 express. The boundary does not apply to the Responses body that the tool path generates.
 
-The shared Images handler (`cpa_server::images`) rewrites `model` and `stream` before the
+The shared Images handler (`gateway::images`) rewrites `model` and `stream` before the
 adapter sees the request. For a model Codex serves, it first applies the adapter's rules
-to the client's original bytes (`cpa_exec::codex_images::check_json` and `form_routing`),
+to the client's original bytes (`providers::codex_images::check_json` and `form_routing`),
 so its rewrite cannot erase a fault: `{"stream":false,"stream":true}` is refused, in
 either order, rather than reaching the adapter with one `stream` left. xAI models keep
 Go's ingress, and a repeated `model` cannot move a request between providers: Go's first
@@ -422,7 +422,7 @@ Image and mask files are binary and are never read as text. The OpenAI Images AP
 Whether the ChatGPT backend, or a Sign in with ChatGPT credential's tool path, accepts a
 given value is unknown; the proxy refuses only what it cannot represent.
 
-The shared ingress parser `cpa_server::claude::peek` reads `model` and `stream` for
+The shared ingress parser `gateway::claude::peek` reads `model` and `stream` for
 every provider before a credential is chosen. It keeps its Go behaviour: it already fails
 on trailing content and on a repeated top-level `model` or `stream`, and such a body
 never reaches the Codex boundary.
@@ -434,29 +434,29 @@ header observation borrows raw fields without changing the body.
 #28 deleted the last request rewrites (`shape` and its helpers, the payload finalizer,
 the Sign in with ChatGPT body rules and the Codex executor's multi-agent optimization),
 so no Codex request path edits a body through the Go helpers. The callers below read,
-or rewrite only for other providers. They read through `crates/cpa-common/src/json.rs`, the
+or rewrite only for other providers. They read through `crates/cliproxy-internal/src/protocol/json.rs`, the
 shared byte-preserving reader and editor, directly or through its `&str` facade
-`cpa_common::rawjson`; the third-party Rust gjson crate and its vendored copy are removed.
-[`rawjson.rs`](../../crates/cpa-common/src/rawjson.rs) documents and tests the reader
+`protocol::rawjson`; the third-party Rust gjson crate and its vendored copy are removed.
+[`rawjson.rs`](../../crates/cliproxy-internal/src/protocol/rawjson.rs) documents and tests the reader
 semantics, including duplicate-key lookup, coercion, and raw number spelling.
 
 | Code | What it parses | Status |
 | --- | --- | --- |
-| `crates/cpa-exec/src/codex_request.rs` `routing_hint`, `is_lite`, `prompt_cache_id` | `service_tier` for `x-codex-routing-hint`, the Responses Lite marker, the prompt-cache identity for handshake headers | Migrated to borrowed serde `RawValue` fields, without applying the native boundary to translated schemas. Only a string cache key supplies header identity; no body changes. The Lite marker is matched as an ASCII token: ASCII white space and case only |
-| `crates/cpa-exec/src/codex_json.rs` | The `String` facade over sjson edits: the translated route's routed `model` and `stream` and its response normalization, the Images tool request it builds, OAuth and SIWC token files | Retained for those callers; the bodies it edits are generated, so the native boundary does not apply. #27 owns the translated route |
-| `crates/cpa-translate/src/codex_responses.rs` | The same-family converter. No Codex route calls it; the registered Responses-to-Codex pair keeps it for the providers that share it | Other providers |
-| `crates/cpa-translate/src/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs` | Cross-API translation. The translated route calls their strict mode (`cpa_translate::codex_request`) and the response translators; the registered pairs keep Go's conversion for the other Responses providers that share them (meta, xAI) | Retained; #27, [Translated route](#translated-route) |
-| `crates/cpa-common/src/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration, for other providers; `context_window_failure_event` and `is_codex_responses_client` for #5 and #6 | No Codex request reaches the rewrites; other providers keep them |
-| `crates/cpa-exec/src/codex_images.rs` | The Images API adapter, with no payload rules, input-ID rewrite or prompt-cache key | The client's JSON goes through the boundary and typed member reads ([Request boundary](#request-boundary)). The direct path edits only `model` and `stream`, preserving every unrelated raw span; generated member placement is incidental. The upstream events and the Images response read through `rawjson` (#25); #33 owns image model IDs |
-| `crates/cpa-server/src/images.rs` | The shared Images ingress for xAI and Codex models: `json.Valid`, the routing `model`, `prompt` and `stream`, and the rebuilt request | xAI keeps Go's ingress. A Codex model's original JSON and form pass the adapter's rules before the handler reads `prompt` or rewrites `model` and `stream`; the handler's Go reads then see a body without repeated keys and with typed routing members |
-| `crates/cpa-exec/src/codex.rs` `count_tokens` and `crates/cpa-exec/src/codex_tokens.rs` | The local token count, over the body the request would send, marked `x-cliproxy-token-count: local-estimate` | A Responses body passes the boundary first and is read in place. The counter's text reads stay on `cpa_common::json` over that validated body or the strict conversion; they read each item in place, never from the root |
-| `crates/cpa-exec/src/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. The native routes classify a copy of each event; the translated route's `Processor` scans the events it translates | Reads; #25 |
-| `crates/cpa-exec/src/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. Every client frame is checked with `CodexBody` and forwarded; duplex client-frame routing reads its fields from that boundary. `cpa_common::rawjson` reads upstream event types and response IDs for bookkeeping, from a copy. `model_kept` compares the client's and the routed `model` through `cpa_common::json`, after both passed the boundary | Upstream observation remains (#25). A native turn sends the routed frame's bytes without copying them. A steering connection still copies each later client frame into its `String` queue. The copy keeps the client's bytes, and the work stays linear in the frame size |
-| `crates/cpa-server/src/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers. A Codex attempt gets the client's frame from `NativeRequest`; the transcript, tool and prewarm handling build only the frame for other providers | Other providers |
-| `crates/cpa-server/src/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact. A Codex attempt gets the client's bytes from `NativeRequest` instead | Other providers |
-| `crates/cpa-server/src/openai.rs` `ResponsesSse` | The streamed response framer. A native answer goes through `NativeSse`, which writes events unchanged | Other providers |
-| `crates/cpa-exec/src/codex_live.rs`, `codex.rs` `alpha_search`, `crates/cpa-server/src/codex_alpha.rs`, `codex_models.rs`, `crates/cpa-common/src/codex_catalog.rs` | Realtime calls, Alpha Search and model catalogs | Outside this native payload contract; follow provider documentation and preserve supported client behavior. Go output does not decide correctness |
-| `crates/cpa-exec/src/codex_oauth.rs`, `codex_refresh.rs`, `codex_siwc.rs`, `codex_siwc_bind.rs` | Token endpoints and credential files | Outside this native payload contract; follow the provider-first rule and documented differences. SIWC reauthorization reuses the saved issued client on both the CLI and Management API (#91), as required by OpenAI's account guide. Refresh refusals are classified per token set (#92): the outer ChatGPT OAuth refresh as first-party codex-rs does at this pin (`request_chatgpt_token_refresh`), the SIWC refresh by OpenAI's documented unusable-token codes. The SIWC token answer is read at the boundary as the token reference documents it: the access token and a replacement refresh token are required. A refresh answer's other fields never discard that token set: an absent or unreadable `scope` keeps the stored grant (the refresh form omits it to keep the grant), and an `expires_in` that is not a positive JSON integer, or whose expiry cannot be stored as RFC 3339, leaves the expiry unknown, so the access token's JWT `exp` schedules the next refresh. A 200 without a usable token set, or whose body could not be read, is not resent in the same refresh. A stored grant that names scopes without `chatgpt.tokens.use.direct` disables ChatGPT plan usage: requests are refused locally with a 403 and the SIWC status reads `invalid`, while the sign-in keeps renewing. Unknown: the meaning, format and scheduling of the SIWC token response's `earliest_refresh_at`, which the token reference names but does not specify; it is not enforced or persisted |
+| `crates/cliproxy-internal/src/providers/codex_request.rs` `routing_hint`, `is_lite`, `prompt_cache_id` | `service_tier` for `x-codex-routing-hint`, the Responses Lite marker, the prompt-cache identity for handshake headers | Migrated to borrowed serde `RawValue` fields, without applying the native boundary to translated schemas. Only a string cache key supplies header identity; no body changes. The Lite marker is matched as an ASCII token: ASCII white space and case only |
+| `crates/cliproxy-internal/src/providers/codex_json.rs` | The `String` facade over sjson edits: the translated route's routed `model` and `stream` and its response normalization, the Images tool request it builds, OAuth and SIWC token files | Retained for those callers; the bodies it edits are generated, so the native boundary does not apply. #27 owns the translated route |
+| `crates/cliproxy-internal/src/translation/codex_responses.rs` | The same-family converter. No Codex route calls it; the registered Responses-to-Codex pair keeps it for the providers that share it | Other providers |
+| `crates/cliproxy-internal/src/translation/codex_chat_request.rs`, `codex_chat_response.rs`, `codex_claude.rs`, `codex_claude_response.rs` | Cross-API translation. The translated route calls their strict mode (`translation::codex_request`) and the response translators; the registered pairs keep Go's conversion for the other Responses providers that share them (meta, xAI) | Retained; #27, [Translated route](#translated-route) |
+| `crates/cliproxy-internal/src/protocol/codex_client.rs` | Multi-agent tools, orphan delegation, namespace changes and their response restoration, for other providers; `context_window_failure_event` and `is_codex_responses_client` for #5 and #6 | No Codex request reaches the rewrites; other providers keep them |
+| `crates/cliproxy-internal/src/providers/codex_images.rs` | The Images API adapter, with no payload rules, input-ID rewrite or prompt-cache key | The client's JSON goes through the boundary and typed member reads ([Request boundary](#request-boundary)). The direct path edits only `model` and `stream`, preserving every unrelated raw span; generated member placement is incidental. The upstream events and the Images response read through `rawjson` (#25); #33 owns image model IDs |
+| `crates/cliproxy-internal/src/gateway/images.rs` | The shared Images ingress for xAI and Codex models: `json.Valid`, the routing `model`, `prompt` and `stream`, and the rebuilt request | xAI keeps Go's ingress. A Codex model's original JSON and form pass the adapter's rules before the handler reads `prompt` or rewrites `model` and `stream`; the handler's Go reads then see a body without repeated keys and with typed routing members |
+| `crates/cliproxy-internal/src/providers/codex.rs` `count_tokens` and `crates/cliproxy-internal/src/providers/codex_tokens.rs` | The local token count, over the body the request would send, marked `x-cliproxy-token-count: local-estimate` | A Responses body passes the boundary first and is read in place. The counter's text reads stay on `protocol::json` over that validated body or the strict conversion; they read each item in place, never from the root |
+| `crates/cliproxy-internal/src/providers/codex_response.rs`, `codex_sse.rs`, `codex_quota.rs` | Upstream errors, events, usage and rate limits. The native routes classify a copy of each event; the translated route's `Processor` scans the events it translates | Reads; #25 |
+| `crates/cliproxy-internal/src/providers/codex_ws.rs`, `codex_duplex.rs` | Turn routing, socket ownership, failure classification and the duplex queue. Every client frame is checked with `CodexBody` and forwarded; duplex client-frame routing reads its fields from that boundary. `protocol::rawjson` reads upstream event types and response IDs for bookkeeping, from a copy. `model_kept` compares the client's and the routed `model` through `protocol::json`, after both passed the boundary | Upstream observation remains (#25). A native turn sends the routed frame's bytes without copying them. A steering connection still copies each later client frame into its `String` queue. The copy keeps the client's bytes, and the work stays linear in the frame size |
+| `crates/cliproxy-internal/src/gateway/websocket.rs`, `websocket_requests.rs`, `websocket_tools.rs`, `websocket_limit.rs` | Client WebSocket frames, shared with other providers. A Codex attempt gets the client's frame from `NativeRequest`; the transcript, tool and prewarm handling build only the frame for other providers | Other providers |
+| `crates/cliproxy-internal/src/gateway/openai.rs` `responses` and `compact` | `peek`, `prepare_responses_request`, the `stream` deletion on compact. A Codex attempt gets the client's bytes from `NativeRequest` instead | Other providers |
+| `crates/cliproxy-internal/src/gateway/openai.rs` `ResponsesSse` | The streamed response framer. A native answer goes through `NativeSse`, which writes events unchanged | Other providers |
+| `crates/cliproxy-internal/src/providers/codex_live.rs`, `codex.rs` `alpha_search`, `crates/cliproxy-internal/src/gateway/codex_alpha.rs`, `codex_models.rs`, `crates/cliproxy-internal/src/protocol/codex_catalog.rs` | Realtime calls, Alpha Search and model catalogs | Outside this native payload contract; follow provider documentation and preserve supported client behavior. Go output does not decide correctness |
+| `crates/cliproxy-internal/src/providers/codex_oauth.rs`, `codex_refresh.rs`, `codex_siwc.rs`, `codex_siwc_bind.rs` | Token endpoints and credential files | Outside this native payload contract; follow the provider-first rule and documented differences. SIWC reauthorization reuses the saved issued client on both the CLI and Management API (#91), as required by OpenAI's account guide. Refresh refusals are classified per token set (#92): the outer ChatGPT OAuth refresh as first-party codex-rs does at this pin (`request_chatgpt_token_refresh`), the SIWC refresh by OpenAI's documented unusable-token codes. The SIWC token answer is read at the boundary as the token reference documents it: the access token and a replacement refresh token are required. A refresh answer's other fields never discard that token set: an absent or unreadable `scope` keeps the stored grant (the refresh form omits it to keep the grant), and an `expires_in` that is not a positive JSON integer, or whose expiry cannot be stored as RFC 3339, leaves the expiry unknown, so the access token's JWT `exp` schedules the next refresh. A 200 without a usable token set, or whose body could not be read, is not resent in the same refresh. A stored grant that names scopes without `chatgpt.tokens.use.direct` disables ChatGPT plan usage: requests are refused locally with a 403 and the SIWC status reads `invalid`, while the sign-in keeps renewing. Unknown: the meaning, format and scheduling of the SIWC token response's `earliest_refresh_at`, which the token reference names but does not specify; it is not enforced or persisted |
 
 ## Native HTTP route
 
@@ -544,7 +544,7 @@ The response reaches the client as the upstream sent it:
   `$serde_json::private::Number` or `$serde_json::private::RawValue` token as a number
   or as JSON text, and refuses it unless it has that one member holding exactly one
   JSON number, or JSON text that itself decodes. The token is an ordinary key anywhere
-  else, and in unknown members. `crates/cpa-exec/src/codex_event.rs` makes the same
+  else, and in unknown members. `crates/cliproxy-internal/src/providers/codex_event.rs` makes the same
   decision with the same serde-derived shape and a one-pass check of each known
   `Value` member for nesting, surrogate escapes and those tokens; the proxy's own
   serde_json features stay unchanged. Only a decoded event ends the response, fails
@@ -566,7 +566,7 @@ The response reaches the client as the upstream sent it:
   `response.incomplete`, and a content-filter `response.incomplete`. The SSE reader
   records it and reads on (lines 677-690); the WebSocket reader returns it, ending the
   turn and retiring its socket (`endpoint/responses_websocket.rs:968-978`, 387-395).
-  `crates/cpa-exec/src/codex_event.rs` reads `ResponseCompleted` with the pinned
+  `crates/cliproxy-internal/src/providers/codex_event.rs` reads `ResponseCompleted` with the pinned
   struct's shape (positional arrays, missing `Option`s and defaults included), the last
   of a repeated key and the first-party `Value`'s private tokens; a 355-case
   differential against the pinned code built with serde_json 1.0.149 and its features
@@ -593,7 +593,7 @@ The response reaches the client as the upstream sent it:
   a repeated key, compared after unescaping, and a member value that is serde_json's
   private number or raw value is the number or the JSON text it holds, read the same way
   (`value/de.rs` `visit_map` at serde_json 1.0.149;
-  `crates/cpa-exec/src/codex_event.rs` `pinned_view`). That reading decides the status, scope,
+  `crates/cliproxy-internal/src/providers/codex_event.rs` `pinned_view`). That reading decides the status, scope,
   retry hint, usage-limit, capacity and overload checks, the #5 context-window
   conversion and the account-failure boundary. The client still receives the event's
   own bytes; #5's converted event embeds the upstream `error` object as sent.
@@ -917,7 +917,7 @@ built from the bytes of its members.
   `status_code`, `error`, `code`, `message`, `error_type`, `response.error`, and the
   `type`, `code`, `status`, `status_code` and `message` of either error object), every
   other occurrence too, since a reader that acts on members as they stream past can
-  take any of them (`crates/cpa-exec/src/codex_ambiguous.rs`), and the frame's `param`,
+  take any of them (`crates/cliproxy-internal/src/providers/codex_ambiguous.rs`), and the frame's `param`,
   which a status-less reading copies. A member repeats when its path does: the same key
   twice in one object, or inside a repeated ancestor such as the frame's `response`.
   `error.type` and `response.error.type`, once each, repeat nothing. Each occurrence is checked on its own, in one pass,
@@ -1161,7 +1161,7 @@ upgrade, and the proxy's downstream upgrade has already succeeded.
 An upstream can write the authentication value it received into its answer: an error
 message that quotes the bearer token, a close reason, a header. The native routes deliver
 the upstream's own bytes, so they check every delivery against the values the request
-that produced it actually carried (`crates/cpa-exec/src/codex_secret.rs`, #25 acceptance
+that produced it actually carried (`crates/cliproxy-internal/src/providers/codex_secret.rs`, #25 acceptance
 criterion 7). This is a backstop for the selected credential. It is not the #6 account
 reading above, which decides by what a failure means.
 
@@ -1223,9 +1223,9 @@ reading above, which decides by what a failure means.
     acknowledgement that carries one is not delivered.
 - **What stays.** A frame without such a value keeps every byte: spacing, number
   spellings, duplicate members, unknown fields and opaque arrays.
-- **Logs and records.** The request log (`crates/cpa-server/src/request_logging.rs`) and
+- **Logs and records.** The request log (`crates/cliproxy-internal/src/gateway/request_logging.rs`) and
   the usage record keep what the upstream answered scrubbed of the same values
-  (`cpa_core::sent::SentCredentials::scrub`): each value as written becomes `[REDACTED]`,
+  (`sent::SentCredentials::scrub`): each value as written becomes `[REDACTED]`,
   and an entry that still carries one in an escaped spelling keeps only its length. This
   covers every log section and its spool file, the `api.websocket.*` events, the
   WebSocket timeline's disconnect entry, and every text of the upstream's answer a record
@@ -1240,7 +1240,7 @@ reading above, which decides by what a failure means.
 - **The translated route (#27).** The same guard checks what the translated route
   hands its client, against the values its upstream request carried: an error's body,
   each translated stream frame and a buffered answer, with the outcomes above
-  (`crates/cpa-exec/src/codex_translated.rs`). Its request log and usage record are
+  (`crates/cliproxy-internal/src/providers/codex_translated.rs`). Its request log and usage record are
   scrubbed of them too. Test: `codex_translated.rs`
   `the_selected_credential_never_reaches_a_translated_client`.
 - **What it does not cover.** Other providers have no such guard.
@@ -1263,8 +1263,8 @@ no profile-specific rule is added.
 ### Requests
 
 The request is converted by its pair's built-in converter in strict mode
-(`cpa_translate::codex_request`). The request's own fields are then checked by
-`cpa_translate::codex_strict`. Nothing else edits it:
+(`translation::codex_request`). The request's own fields are then checked by
+`translation::codex_strict`. Nothing else edits it:
 
 - No payload rule runs.
 - Nothing is synthesized: no prompt-cache key, no default `instructions` (the pinned
@@ -1305,7 +1305,7 @@ The strict mode is the Codex route's alone.
 | Generation controls map to their Responses fields: `max_tokens`, `max_completion_tokens`, `maxOutputTokens` and `max_output_tokens` become `max_output_tokens`; `temperature`, `top_p`/`topP`, Chat `user`, `safety_identifier`, `metadata`, `prompt_cache_key`, `prompt_cache_retention` and `verbosity` map unchanged | All | The Responses fields of the same name and meaning. The ChatGPT backend's acceptance of each is the upstream's to judge |
 | A control at its API default needs nothing: an empty `stop`/`stop_sequences`/`stopSequences`, zero penalties, `n` or `candidateCount` of 1, `logprobs: false`, text-only modalities, `store: false`, Gemini `responseMimeType: text/plain` | All | The default means the same in both APIs |
 | Claude `metadata` (an end-user identifier for abuse detection) and Chat `stream_options` are not sent | Claude, Chat | Neither changes the generation. The ChatGPT backend takes no `safety_identifier` (Go removes it from every Codex request), and Responses always reports usage |
-| The client's thinking becomes `reasoning.effort`: a Claude budget, adaptive thinking with `output_config.effort`, or disabled thinking; Chat `reasoning_effort`; a Gemini `thinkingLevel` or budget; Interactions reasoning settings; a model suffix | All | Responses `reasoning.effort`. The budget-to-level table is Go's (`cpa_common::thinking`), and with no thinking setting nothing is sent |
+| The client's thinking becomes `reasoning.effort`: a Claude budget, adaptive thinking with `output_config.effort`, or disabled thinking; Chat `reasoning_effort`; a Gemini `thinkingLevel` or budget; Interactions reasoning settings; a model suffix | All | Responses `reasoning.effort`. The budget-to-level table is Go's (`protocol::thinking`), and with no thinking setting nothing is sent |
 | A Claude thinking block whose signature is Codex encrypted content becomes a `reasoning` item with that `encrypted_content`, unchanged; the response's `encrypted_content` becomes the thinking signature. An empty thinking block with no signature carries nothing and is not sent | Claude | Opaque round trip. First-party `include: ["reasoning.encrypted_content"]` |
 | `store: false` and `include: ["reasoning.encrypted_content"]` | All | First-party request fields (`common.rs:298-302`), needed for the round trip above |
 | `parallel_tool_calls`: Claude `disable_parallel_tool_use` becomes `false`, Chat keeps the client's value, otherwise `true` (the API default) | Claude, Chat, Gemini | Responses `parallel_tool_calls` defaults to `true` |
@@ -1374,7 +1374,7 @@ equivalent; remove it or send the request to a provider that accepts it`.
 
 The same pair's built-in response translator converts the upstream's events, without
 namespace restoration. For a Chat client it reads nested custom declarations as the
-strict conversion does (`cpa_translate::codex_response`), so a custom call returns under
+strict conversion does (`translation::codex_response`), so a custom call returns under
 the client's name; the registered pair that xAI and Meta use is unchanged. A buffered client receives
 the translation of the aggregated terminal event. Usage is the provider's. A Claude
 client's `message_start` carries what the translator knows (zero input tokens before
@@ -1495,7 +1495,7 @@ request silently, and none of them turns a rewrite back on.
 | Client headers (`User-Agent`, `originator`, `x-openai-subagent`, Responses Lite) | Client | Change no Codex body. They select only #5 and #6 failure delivery for official Codex clients, the identity policy, and, with session affinity, the account of a Guardian reviewer (`x-openai-subagent: guardian` with `x-codex-parent-thread-id`, as `core/src/client.rs` and `core/src/responses_metadata.rs` send them): it inherits its parent's account (#113) | Go used them to choose the multi-agent, `parallel_tool_calls`, `include` and tier rewrites, which are deleted |
 | Codex-client response handling of the legacy path: namespace restoration, completed-output repair, usage-detail filling, `response.done` rename, Grok Build keepalive comments | Client headers | Deleted with the legacy path; every Codex answer passes unchanged | Response mutation |
 
-The tests in `crates/cpa-server/tests/codex_settings.rs` send one request with every
+The tests in `crates/cliproxy-internal/tests/gateway_codex_settings.rs` send one request with every
 control above turned on, from three client header sets, to every Codex route, and check
 the bytes the upstream received; an OpenAI-compatible provider under the same config
 still receives the payload rules.
@@ -1562,7 +1562,7 @@ Passive accounting reads a copy and changes nothing.
   the code pairs with); a wrapped status frame or an upgrade refusal with its status.
   `context_length_exceeded` is a context-window failure only without a status or with
   400. Frames reach the client as sent, except that a 403 is withheld from a native
-  WebSocket client (#6). `cpa_exec::codex_terminal` holds the rules and
+  WebSocket client (#6). `providers::codex_terminal` holds the rules and
   `ExecError::sourced` carries them to the scheduler. The source at researched main
   is `codex-api/src/error.rs:92-162`, `api_bridge.rs:130-312,342-354`,
   `endpoint/responses_websocket.rs:747-806,906-925`, and
@@ -1611,7 +1611,7 @@ Passive accounting reads a copy and changes nothing.
 
 ## Contract fixtures and test helpers
 
-`crates/cpa-exec/tests/fixtures/codex_contract/` holds small hand-authored payloads.
+`crates/cliproxy-internal/tests/providers/fixtures/codex_contract/` holds small hand-authored payloads.
 `manifest.json` records, for each one, the transport, the direction, the endpoint
 profiles, the kind of evidence, the exact sources and the contract it shows. The
 kinds of evidence are `first-party-source`, `first-party-test`, `provider-docs` and
@@ -1634,11 +1634,11 @@ Follow these rules when you add a fixture:
 
 The test helpers are:
 
-- `cpa_exec::codex_contract`, behind the `cpa-exec` feature `test-support`, which
-  `cpa-server` enables for its tests. `fixture(name)` returns a fixture, `bytes()`
+- `cliproxy_internal::providers::codex_contract`, behind the library feature
+  `test-support`, which integration tests enable. `fixture(name)` returns a fixture, `bytes()`
   returns its stored bytes, and `frames()` returns each WebSocket frame or SSE `data`
   payload as a slice of those bytes.
-- `cpa_server::testing::codex_capture::CaptureUpstream`, a loopback upstream for route
+- `gateway::testing::codex_capture::CaptureUpstream`, a loopback upstream for route
   tests. It records each HTTP request body and each WebSocket text frame exactly as
   received, and answers from a `Script`.
 
@@ -1648,13 +1648,13 @@ The regression suites use capturing loopback upstreams, fake tokens, and private
 `auth-dir`s. Expected native bytes come from hand-authored fixtures or client input,
 with permitted edits applied explicitly.
 
-- `crates/cpa-server/tests/codex_qualify.rs` covers HTTP streaming, buffered replies,
+- `crates/cliproxy-internal/tests/gateway_codex_qualify.rs` covers HTTP streaming, buffered replies,
   WebSocket turns on sockets and over HTTP, compaction, aliases, and failures across
   the endpoint profiles a loopback mock can represent.
-- `crates/cpa-server/tests/codex_native_request.rs` and `codex_native_ws.rs` cover
+- `crates/cliproxy-internal/tests/gateway_codex_native_request.rs` and `codex_native_ws.rs` cover
   native route behaviour, credential isolation, cancellation, and socket ownership.
-- `crates/cpa-server/tests/codex_translated.rs` covers cross-API conversion.
-- `crates/cpa-exec/src/codex_identity_tests.rs` and `codex_tls_tests.rs` cover header
+- `crates/cliproxy-internal/tests/gateway_codex_translated.rs` covers cross-API conversion.
+- `crates/cliproxy-internal/src/providers/codex_identity_tests.rs` and `codex_tls_tests.rs` cover header
   policy and the production TLS client's local ClientHello.
 
 These tests cannot establish live endpoint acceptance of forwarded options, steering,

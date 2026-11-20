@@ -1,7 +1,7 @@
 //! Go's management API client (internal/tui/client.go): the v0 routes, a 10 s
 //! timeout, the Bearer key, Go's environment proxy rules and redirect limit, and Go's
 //! error texts (`HTTP <code>: <body>`).
-use cpa_common::gostr::{GoStr, query_escape};
+use cliproxy_internal::text::{GoStr, query_escape};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -48,7 +48,7 @@ impl Client {
         Client {
             base_url: normalize_base_url(base_url),
             secret: Mutex::new(secret.trim().to_owned()),
-            http: cpa_exec::proxy::default_client(),
+            http: cliproxy_internal::providers::proxy::default_client(),
         }
     }
 
@@ -73,7 +73,7 @@ impl Client {
         let mut op = method.as_str().go_lower();
         op[..1].make_ascii_uppercase();
         // Go's url.Error names the request that failed (its password shown as ***).
-        let fail_at = |at: &str, cause: &str| format!("{op} {}: {cause}", cpa_common::gostr::quote(at));
+        let fail_at = |at: &str, cause: &str| format!("{op} {}: {cause}", cliproxy_internal::text::quote(at));
         let secret = self
             .secret
             .lock()
@@ -123,7 +123,7 @@ impl Client {
                     break res;
                 }
                 let next = current.join(&location).map_err(|e| {
-                    let quoted = cpa_common::gostr::quote(&location);
+                    let quoted = cliproxy_internal::text::quote(&location);
                     fail_at(&shown, &format!("failed to parse Location header {quoted}: {e}"))
                 })?;
                 if sent >= 10 {
@@ -190,7 +190,7 @@ impl Client {
     async fn checked(&self, method: wreq::Method, path: &str, body: Option<String>) -> Result<Vec<u8>, String> {
         let (code, data) = self.request(method, path, body).await?;
         if code >= 400 {
-            let text = String::from_utf8_lossy(cpa_common::gostr::trim_space(&data)).into_owned();
+            let text = String::from_utf8_lossy(cliproxy_internal::text::trim_space(&data)).into_owned();
             return Err(format!("HTTP {code}: {text}"));
         }
         Ok(data)
@@ -404,7 +404,7 @@ fn quote_char(b: u8) -> String {
         b'\'' => "'\\''".into(),
         b'"' => "'\"'".into(),
         b => {
-            let q = cpa_common::gostr::quote(char::from(b).to_string());
+            let q = cliproxy_internal::text::quote(char::from(b).to_string());
             format!("'{}'", &q[1..q.len() - 1])
         }
     }

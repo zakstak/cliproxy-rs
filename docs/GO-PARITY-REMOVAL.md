@@ -131,6 +131,6 @@ schema, Codex and OAuth fixes. PRs #197 and #202 had already removed `harness/`,
 in effect. Earlier scope receipts describe the original migration baseline; archived
 material and the unsupported-target script they mention are available in Git history.
 The Claude OAuth first-party evidence remains at
-[`crates/cpa-exec/tests/reference/claude/oauth.md`](../crates/cpa-exec/tests/reference/claude/oauth.md).
+[`crates/cliproxy-internal/tests/providers/reference/claude/oauth.md`](../crates/cliproxy-internal/tests/providers/reference/claude/oauth.md).
 
 Post-rebase validation is recorded in the landing PR.

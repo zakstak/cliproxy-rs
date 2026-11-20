@@ -6,7 +6,7 @@
 //
 // Config writes are compare-and-swap. A config read carries an ETag (the SHA-256 of
 // config.yaml), and a write with If-Match fails with 412 when the file changed since that
-// read (crates/cpa-server/src/management.rs `config_sync`, under the server's disk lock).
+// read (crates/cliproxy-internal/src/gateway/management.rs `config_sync`, under the server's disk lock).
 // A write rereads its value, compares it with what the user was shown and sends the ETag of
 // that read; a 412 caused by a change elsewhere in the file repeats the read and comparison.
 // Covered by server.test.ts with an in-memory transport.

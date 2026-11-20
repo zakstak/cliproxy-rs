@@ -2,7 +2,7 @@ import { credName, label, mask, provider, type Data } from "./core.ts";
 
 /**
  * A provider API key as the server lists it among credentials: account_type "api_key", the
- * key as `account`, its group's name as `label` (crates/cpa-server/src/management/auth_files.rs).
+ * key as `account`, its group's name as `label` (crates/cliproxy-internal/src/gateway/management/auth_files.rs).
  */
 export const isApiKey = (a: Data) => a.account_type === "api_key" || (a.runtime_only && typeof a.account === "string");
 

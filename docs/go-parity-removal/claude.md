@@ -4,7 +4,7 @@ No production or provider/cache semantics changed. Every original inventory entr
 
 The new independent tests use explicit Rust inputs, semantic JSON equality, raw untouched-span checks, local HTTP/SSE peers, fake Home CAS transcripts, and the existing first-party Claude Code 2.1.325 evidence. File names and Home keys/values preserve saved-file and shared-state contracts. No Go or Rust proxy output was regenerated as an oracle.
 
-Validation: network-denied namespace with loopback enabled, `CARGO_BUILD_JOBS=2 nice -n19 cargo test -p cpa-exec --lib claude --offline`. Before retiring broad replay consumers: 150 passed, 0 failed. After retiring runners and strengthening negative Chat/Responses completion assertions: 119 passed, 0 failed, 0 ignored. Final prose/login assertion cleanup also passed the same 119-test filter, with no warnings. `git diff --check` passed.
+Validation: network-denied namespace with loopback enabled, `CARGO_BUILD_JOBS=2 nice -n19 cargo test -p cliproxy-internal --lib claude --offline`. Before retiring broad replay consumers: 150 passed, 0 failed. After retiring runners and strengthening negative Chat/Responses completion assertions: 119 passed, 0 failed, 0 ignored. Final prose/login assertion cleanup also passed the same 119-test filter, with no warnings. `git diff --check` passed.
 
 | Original inventory entry | Current disposition / replacement | Useful value from inventory |
 | --- | --- | --- |
