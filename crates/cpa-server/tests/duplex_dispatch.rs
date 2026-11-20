@@ -222,7 +222,7 @@ impl Conductor {
             request_path: "/v1/responses".into(),
             peer: None,
             native: Some(native),
-            turn: Some(Arc::new(SessionTurn {
+            mode: dispatch::CallMode::SessionTurn(Arc::new(SessionTurn {
                 session: ExecSession {
                     id: self.session.clone(),
                     continuation: false,
@@ -232,7 +232,6 @@ impl Conductor {
                 on_selected: None,
                 home: None,
             })),
-            media: None,
         };
         let done = dispatch::run_with_bootstrap_retries(&self.rt, call, &dispatch::Trace::default())
             .await

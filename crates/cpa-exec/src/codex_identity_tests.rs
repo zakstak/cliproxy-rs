@@ -215,9 +215,8 @@ async fn http_identity_follows_the_policy_and_never_borrows_caller_credentials()
 /// reaches no request.
 #[tokio::test]
 async fn the_model_catalog_cannot_set_identity() {
-    let info = cpa_core::registry::pinned()
-        .lookup("gpt-5.6-luna")
-        .expect("pinned model");
+    let catalog = cpa_core::registry::pinned();
+    let info = catalog.lookup("gpt-5.6-luna").expect("pinned model");
     let overrides = &info.raw["config"]["override_header"];
     assert!(
         overrides["user-agent"]

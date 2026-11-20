@@ -77,12 +77,7 @@ fn responses_client(client: Format) -> bool {
 #[derive(Default)]
 pub struct ResponsesFramer {
     pending: Vec<u8>,
-}
-
-fn has_field(chunk: &[u8], prefix: &[u8]) -> bool {
-    chunk
-        .split(|&c| c == b'\n')
-        .any(|line| crate::common::trim_space(line).starts_with(prefix))
+    repair: PendingRepair,
 }
 
 /// responsesSSEDataLinesValid: no data, `[DONE]`, or one valid JSON payload.
@@ -111,22 +106,6 @@ fn data_payload_valid(payload: Option<Vec<u8>>) -> bool {
     payload.is_empty() || payload == b"[DONE]" || cpa_common::json::std_valid(payload)
 }
 
-fn starts_new_data_frame(pending: &[u8], chunk: &[u8]) -> bool {
-    let trimmed = crate::common::trim_space(pending);
-    if trimmed.is_empty()
-        || has_field(trimmed, b"event:")
-        || !has_field(trimmed, b"data:")
-        || !data_lines_valid(trimmed)
-    {
-        return false;
-    }
-    let start = chunk
-        .iter()
-        .position(|c| !matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
-        .unwrap_or(chunk.len());
-    chunk[start..].starts_with(b"data:")
-}
-
 /// responsesSSENeedsLineBreak: a field line appended to an unterminated line.
 fn needs_line_break(pending: &[u8], chunk: &[u8]) -> bool {
     if pending.is_empty() || chunk.is_empty() || pending.ends_with(b"\n") || pending.ends_with(b"\r") {
@@ -146,49 +125,148 @@ fn needs_line_break(pending: &[u8], chunk: &[u8]) -> bool {
             .any(|p| trimmed.starts_with(p))
 }
 
-fn frame_len(chunk: &[u8]) -> usize {
-    let lf = chunk.windows(2).position(|w| w == b"\n\n");
-    let crlf = chunk.windows(4).position(|w| w == b"\r\n\r\n");
-    match (lf, crlf) {
-        (None, None) => 0,
-        (None, Some(c)) => c + 4,
-        (Some(l), None) => l + 2,
-        (Some(l), Some(c)) => {
-            if l < c {
-                l + 2
-            } else {
-                c + 4
+/// Delimited events need no repair. For the unterminated tail, remember which fields
+/// arrived and when the joined data could end a JSON value. Only the existing payload
+/// validator decides whether to emit it.
+#[derive(Default)]
+struct PendingRepair {
+    scanned: usize,
+    nonblank: bool,
+    line: Field,
+    has_data: bool,
+    has_event: bool,
+    payload: PayloadEnd,
+}
+
+#[derive(Default)]
+enum Field {
+    #[default]
+    Prefix,
+    Data,
+    Other,
+}
+
+impl PendingRepair {
+    fn scan(&mut self, pending: &[u8]) {
+        while let Some(&byte) = pending.get(self.scanned) {
+            let rest = &pending[self.scanned..];
+            let (rune, width) = cpa_common::json::decode_rune(rest);
+            // A split UTF-8 whitespace rune may still disappear under trim_space.
+            if rune.is_none() && rest.len() < 4 && std::str::from_utf8(rest).is_err_and(|e| e.error_len().is_none()) {
+                break;
             }
+            if byte == b'\n' {
+                self.line = Field::Prefix;
+            } else if !rune.is_some_and(char::is_whitespace) {
+                self.nonblank = true;
+                match self.line {
+                    Field::Prefix if rest.starts_with(b"data:") => {
+                        self.has_data = true;
+                        self.line = Field::Data;
+                        self.scanned += b"data:".len();
+                        continue;
+                    }
+                    Field::Prefix if rest.starts_with(b"event:") => {
+                        self.has_event = true;
+                        self.line = Field::Other;
+                    }
+                    Field::Prefix if b"data:".starts_with(rest) || b"event:".starts_with(rest) => break,
+                    Field::Prefix => self.line = Field::Other,
+                    Field::Data => self.payload.push(byte),
+                    Field::Other => {}
+                }
+            }
+            self.scanned += width;
         }
     }
+
+    fn valid_data(&mut self, pending: &[u8]) -> bool {
+        if !self.has_data || (matches!(self.line, Field::Data) && self.scanned < pending.len()) {
+            return false;
+        }
+        if !self.payload.can_end() {
+            return false;
+        }
+        if data_lines_valid(pending) {
+            return true;
+        }
+        // A closed string/container, a literal at its last letter, or a number ending
+        // in a digit cannot repair an earlier syntax error by appending more data.
+        self.payload = PayloadEnd::Invalid;
+        false
+    }
 }
 
-fn can_emit_without_delimiter(chunk: &[u8]) -> bool {
-    let trimmed = crate::common::trim_space(chunk);
-    let needs_more_data = has_field(trimmed, b"event:") && !has_field(trimmed, b"data:");
-    !trimmed.is_empty()
-        && !needs_more_data
-        && has_field(trimmed, b"event:")
-        && has_field(trimmed, b"data:")
-        && data_lines_valid(trimmed)
+#[derive(Default)]
+enum PayloadEnd {
+    #[default]
+    Empty,
+    QuotedOrNested {
+        depth: usize,
+        quoted: bool,
+        escaped: bool,
+    },
+    Literal(&'static [u8]),
+    Number {
+        ends_in_digit: bool,
+    },
+    Closed,
+    Invalid,
 }
 
-/// writeResponsesSSEChunk: the frame, then whatever completes its blank line.
-fn terminated(frame: &[u8]) -> Option<Vec<u8>> {
-    if frame.is_empty() {
-        return None;
+impl PayloadEnd {
+    // Whitespace cannot open or close a JSON value. data_lines_valid still checks its
+    // exact spelling, including the newlines inserted between data fields.
+    fn push(&mut self, byte: u8) {
+        match self {
+            Self::Empty => {
+                *self = match byte {
+                    b'{' | b'[' | b'"' => Self::QuotedOrNested {
+                        depth: usize::from(byte != b'"'),
+                        quoted: byte == b'"',
+                        escaped: false,
+                    },
+                    b't' => Self::Literal(b"rue"),
+                    b'f' => Self::Literal(b"alse"),
+                    b'n' => Self::Literal(b"ull"),
+                    b'-' | b'0'..=b'9' => Self::Number {
+                        ends_in_digit: byte != b'-',
+                    },
+                    _ => Self::Invalid,
+                }
+            }
+            Self::QuotedOrNested { depth, quoted, escaped } => {
+                if *escaped {
+                    *escaped = false;
+                } else {
+                    match byte {
+                        b'\\' if *quoted => *escaped = true,
+                        b'"' => *quoted = !*quoted,
+                        b'{' | b'[' if !*quoted => *depth += 1,
+                        b'}' | b']' if !*quoted => *depth -= 1,
+                        _ => {}
+                    }
+                }
+                if *depth == 0 && !*quoted {
+                    *self = Self::Closed;
+                }
+            }
+            Self::Literal(remaining) => {
+                *self = match remaining.strip_prefix(&[byte]) {
+                    Some([]) => Self::Closed,
+                    Some(tail) => Self::Literal(tail),
+                    None => Self::Invalid,
+                };
+            }
+            Self::Number { ends_in_digit } => *ends_in_digit = byte.is_ascii_digit(),
+            Self::Closed => *self = Self::Invalid,
+            Self::Invalid => {}
+        }
     }
-    let mut out = frame.to_vec();
-    if !(frame.ends_with(b"\n\n") || frame.ends_with(b"\r\n\r\n")) {
-        out.extend_from_slice(if frame.ends_with(b"\r\n") {
-            b"\r\n"
-        } else if frame.ends_with(b"\n") {
-            b"\n"
-        } else {
-            b"\n\n"
-        });
+
+    fn can_end(&self) -> bool {
+        matches!(self, Self::Empty | Self::Closed | Self::Number { ends_in_digit: true })
     }
-    Some(out)
 }
 
 impl ResponsesFramer {
@@ -210,37 +288,61 @@ impl ResponsesFramer {
         if chunk.is_empty() {
             return;
         }
-        if starts_new_data_frame(&self.pending, chunk) {
-            out.extend(terminated(&self.pending));
-            self.pending.clear();
+        if self.repair.has_data && !self.repair.has_event {
+            let start = chunk.iter().position(|c| !matches!(c, b' ' | b'\t' | b'\r' | b'\n'));
+            if start.is_some_and(|i| chunk[i..].starts_with(b"data:")) && self.repair.valid_data(&self.pending) {
+                out.push(self.take_terminated());
+            }
         }
+
+        // Only a newly appended LF can complete a delimiter, including one split over
+        // writes. Look behind within the current frame so two delimiters cannot overlap.
+        let appended = self.pending.len();
         if needs_line_break(&self.pending, chunk) {
             self.pending.push(b'\n');
         }
         self.pending.extend_from_slice(chunk);
-        loop {
-            let n = frame_len(&self.pending);
-            if n == 0 {
-                break;
+        let mut start = 0;
+        for end in appended..self.pending.len() {
+            if self.pending[end] == b'\n' {
+                let frame = &self.pending[start..=end];
+                if frame.ends_with(b"\n\n") || frame.ends_with(b"\r\n\r\n") {
+                    out.push(frame.to_vec());
+                    start = end + 1;
+                }
             }
-            out.extend(terminated(&self.pending[..n]));
-            self.pending.drain(..n);
         }
-        if crate::common::trim_space(&self.pending).is_empty() {
-            self.pending.clear();
-            return;
+        if start > 0 {
+            self.pending.drain(..start);
+            self.repair = PendingRepair::default();
         }
-        if can_emit_without_delimiter(&self.pending) {
-            out.extend(terminated(&self.pending));
+        self.repair.scan(&self.pending);
+        if !self.repair.nonblank && self.repair.scanned == self.pending.len() {
             self.pending.clear();
+            self.repair = PendingRepair::default();
+        } else if self.repair.has_event && self.repair.valid_data(&self.pending) {
+            out.push(self.take_terminated());
         }
     }
 
+    /// Complete the blank line of a valid, undelimited frame.
+    fn take_terminated(&mut self) -> Vec<u8> {
+        let mut frame = std::mem::take(self).pending;
+        frame.extend_from_slice(if frame.ends_with(b"\r\n") {
+            b"\r\n"
+        } else if frame.ends_with(b"\n") {
+            b"\n"
+        } else {
+            b"\n\n"
+        });
+        frame
+    }
+
     fn flush_into(&mut self, out: &mut Vec<Vec<u8>>) {
-        let pending = std::mem::take(&mut self.pending);
-        let trimmed = crate::common::trim_space(&pending);
-        if !trimmed.is_empty() && has_field(trimmed, b"data:") && data_lines_valid(trimmed) {
-            out.extend(terminated(&pending));
+        if self.repair.valid_data(&self.pending) {
+            out.push(self.take_terminated());
+        } else {
+            *self = Self::default();
         }
     }
 }
@@ -508,6 +610,99 @@ mod tests {
         assert!(responses(&[b"", b"  "]).is_empty());
         assert_eq!(responses(&[b"data: x\r\n"]), Vec::<Vec<u8>>::new());
         assert_eq!(responses(&[b"data: [DONE]"]), [b"data: [DONE]\n\n".to_vec()]);
+    }
+
+    #[test]
+    fn responses_framer_preserves_batched_and_split_delimiters() {
+        // Split each delimiter at every offset. A delimited frame is opaque, even
+        // when its data is invalid. Only the unterminated tail needs validation.
+        for delimiter in [&b"\n\n"[..], b"\r\n\r\n"] {
+            let first = [b"data: \xff", delimiter].concat();
+            for split in 0..delimiter.len() {
+                let mut framer = ResponsesFramer::default();
+                let cut = first.len() - delimiter.len() + split;
+                assert!(framer.write(&first[..cut]).is_empty());
+                let rest = [&first[cut..], b": a\r\n\n: b\r\n\r\n\n\ndata: [DONE]\r\n"].concat();
+                assert_eq!(
+                    framer.write(&rest),
+                    [first.as_slice(), b": a\r\n\n", b": b\r\n\r\n", b"\n\n"]
+                );
+                assert_eq!(framer.flush(), [b"data: [DONE]\r\n\r\n".as_slice()]);
+                assert!(framer.flush().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn responses_framer_repairs_on_the_write_that_completes_the_payload() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"nul", b"l"),
+            (b"fal", b"se"),
+            (b"tr", b"ue"),
+            (b"-1.25e+", b"3"),
+            (br#""escaped \" [}"#, b"\""),
+            (br#"[[{"x":"}"}]"#, b"]"),
+            (b"[DON", b"E]"),
+        ];
+        for &(prefix, end) in cases {
+            let mut framer = ResponsesFramer::default();
+            assert!(framer.write(b"event: delta").is_empty());
+            // The whole data field prefix arrives with an unfinished value. Subsequent
+            // fragments must not close the event until its value is valid.
+            let data = [b"data: ", prefix].concat();
+            assert!(framer.write(&data).is_empty());
+            for byte in &end[..end.len() - 1] {
+                assert!(framer.write(&[*byte]).is_empty());
+            }
+            let expected = [b"event: delta\n", data.as_slice(), end, b"\n\n"].concat();
+            assert_eq!(framer.write(&end[end.len() - 1..]), [expected]);
+            assert!(framer.flush().is_empty());
+        }
+    }
+
+    #[test]
+    fn responses_framer_tracks_split_fields_and_unicode_space() {
+        let mut framer = ResponsesFramer::default();
+        for chunk in [
+            &b"\xe3"[..],
+            b"\x80",
+            b"\x80",
+            b"ev",
+            b"ent: x\n\xc2",
+            b"\xa0da",
+            b"ta: [1,",
+        ] {
+            assert!(framer.write(chunk).is_empty());
+        }
+        assert_eq!(
+            framer.write(b"data: 2]"),
+            [b"event: x\n\xc2\xa0data: [1,\ndata: 2]\n\n".as_slice()]
+        );
+        // An incomplete rune after a valid value can become trailing whitespace.
+        assert!(framer.write(b"event: x\ndata: {}\xe3").is_empty());
+        assert!(framer.write(b"\x80").is_empty());
+        assert_eq!(
+            framer.write(b"\x80"),
+            [b"event: x\ndata: {}\xe3\x80\x80\n\n".as_slice()]
+        );
+        assert!(framer.write(b"data: {}\xff").is_empty());
+        assert!(framer.flush().is_empty());
+    }
+
+    #[test]
+    fn responses_framer_waits_for_a_delimiter_after_invalid_joined_data() {
+        let mut framer = ResponsesFramer::default();
+        assert!(framer.write(b"event: x\ndata: [bogus]").is_empty());
+        assert!(framer.write(b"data: {}").is_empty());
+        assert_eq!(
+            framer.write(b"\n\n"),
+            [b"event: x\ndata: [bogus]\ndata: {}\n\n".as_slice()]
+        );
+        assert!(framer.write(b"data: 1e").is_empty());
+        assert!(framer.flush().is_empty());
+        assert!(framer.write(b"data: {}").is_empty());
+        assert_eq!(framer.write(b" \r\n data: []"), [b"data: {}\n\n".as_slice()]);
+        assert_eq!(framer.flush(), [b" \r\n data: []\n\n".as_slice()]);
     }
 
     #[test]

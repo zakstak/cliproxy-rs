@@ -9,7 +9,7 @@
 //! these definitions (internal/registry/model_registry.go); that overlay belongs to the
 //! server runtime.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 pub mod dynamic;
 
@@ -526,22 +526,18 @@ pub(crate) fn claude_family_ids(id: &str) -> Vec<&str> {
     candidates
 }
 
-/// The static catalog in effect (Go `getModels()`): the embedded models.json until a
-/// remote refresh ([`refresh_catalog`]) replaces it.
-pub fn pinned() -> &'static Catalog {
-    static EMBEDDED: LazyLock<Catalog> =
-        LazyLock::new(|| Catalog::parse(MODELS_JSON).expect("embedded models.json is valid"));
+/// A snapshot of the current static catalog. Readers can keep it across a refresh.
+pub fn pinned() -> Arc<Catalog> {
     CURRENT
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .unwrap_or(&EMBEDDED)
+        .clone()
 }
 
-/// The refreshed catalog, once one replaced the embedded copy.
-// ponytail: `pinned()` hands out `'static` borrows, so a replaced catalog is kept alive
-// (leaked) rather than freed: about half a megabyte per upstream catalog change, which
-// happens a few times a month. Switch callers to an `Arc` snapshot to reclaim it.
-static CURRENT: std::sync::RwLock<Option<&'static Catalog>> = std::sync::RwLock::new(None);
+static CURRENT: LazyLock<RwLock<Arc<Catalog>>> = LazyLock::new(|| {
+    let embedded = Catalog::parse(MODELS_JSON).expect("embedded models.json is valid");
+    RwLock::new(Arc::new(embedded))
+});
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Bumped whenever [`refresh_catalog`] swaps in a different catalog; caches derived from
@@ -629,7 +625,11 @@ fn checked_catalog(json: &str) -> Result<Map<String, Value>, String> {
 /// keeps the current `meta` section when the remote one is empty, and swaps it in when
 /// it differs. Returns the changed providers (Go's refresh callback argument).
 pub fn refresh_catalog(json: &str) -> Result<Vec<String>, String> {
+    // Serialize refreshes so the Meta fallback and comparison use the catalog we replace.
+    // Readers can still pin that catalog while we prepare its successor.
+    static REFRESH: Mutex<()> = Mutex::new(());
     let mut root = checked_catalog(json)?;
+    let _refresh = REFRESH.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let old = pinned();
     if root.get("meta").and_then(Value::as_array).is_none_or(Vec::is_empty) && !old.channel("meta").is_empty() {
         let meta = old
@@ -640,14 +640,15 @@ pub fn refresh_catalog(json: &str) -> Result<Vec<String>, String> {
         root.insert("meta".into(), Value::Array(meta));
     }
     let new = Catalog::from_root(root).map_err(|e| e.to_string())?;
-    let changed = changed_providers(old, &new);
+    let changed = changed_providers(&old, &new);
     let same =
         old.channels.len() == new.channels.len()
             && old.channels.iter().zip(&new.channels).all(|((a, am), (b, bm))| {
                 a == b && am.len() == bm.len() && am.iter().zip(bm).all(|(x, y)| x.raw == y.raw)
             });
     if !same {
-        *CURRENT.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::leak(Box::new(new)));
+        let mut current = CURRENT.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *current = Arc::new(new);
         GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
     Ok(changed)
@@ -849,7 +850,8 @@ mod tests {
 
     #[test]
     fn raw_definition_preserves_model_fields_and_thinking_metadata() {
-        let haiku = &pinned().channel("claude")[0];
+        let catalog = pinned();
+        let haiku = &catalog.channel("claude")[0];
         for key in ["id", "object", "created", "owned_by"] {
             assert!(haiku.raw.contains_key(key), "missing {key}");
         }

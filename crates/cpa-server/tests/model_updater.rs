@@ -291,8 +291,11 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
     assert!(registered(&rt));
 
     // The same content again changes nothing.
+    let reader = pinned();
+    let previous = Arc::downgrade(&reader);
     cpa_server::model_updater::refresh(&urls(&["modified"])).await;
     assert_eq!(catalog_generation(), generation + 1);
+    assert!(Arc::ptr_eq(&reader, &pinned()));
 
     // An empty remote `meta` section keeps the current one.
     cpa_server::model_updater::refresh(&urls(&["no-meta"])).await;
@@ -311,8 +314,13 @@ async fn refresh_skips_failing_sources_and_swaps_a_changed_catalog() {
             ..Default::default()
         })
     };
-    let model = pinned().lookup("g-lenient").unwrap();
+    let current = pinned();
+    let model = current.lookup("g-lenient").unwrap();
     assert_eq!(model.thinking, thinking(0, 1024));
+    assert!(reader.lookup("g-lenient").is_none());
+    assert!(reader.lookup("claude-refreshed-1").is_some());
+    drop(reader);
+    assert!(previous.upgrade().is_none(), "the replaced catalog still has an owner");
     let spec = rt.registry().client_model(&meta_id, "g-lenient").expect("registered");
     assert_eq!(
         (spec.owned_by.as_str(), spec.context_length, spec.thinking.clone()),
