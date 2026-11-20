@@ -199,7 +199,6 @@ async fn default_rules_fill_an_edits_response_format() {
 
 #[tokio::test]
 async fn multipart_edits_forward_positive_counts_and_apply_format_defaults() {
-    let _registry = REGISTRY.lock().await;
     let (up, seen) = upstream().await;
     let p = proxy(&[("", &up)], DEFAULTS).await;
     let boundary = "fakeboundary";
