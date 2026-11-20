@@ -238,6 +238,29 @@ async fn postgres_store_round_trips_config_auth_and_cooldowns() {
         .collect();
     assert_eq!(ids, vec!["a.json", "team/b.json"]);
 
+    // A management save and delete each finish the database change before returning.
+    let managed = auth.join("managed.json");
+    let (persister, managed) = tokio::task::spawn_blocking(move || {
+        let saved = persister
+            .save_auth(Box::new(|| {
+                std::fs::write(&managed, r#"{"managed":true}"#)?;
+                Ok(Some(managed.clone()))
+            }))
+            .unwrap();
+        assert_eq!(saved.as_ref(), Some(&managed));
+        (persister, managed)
+    })
+    .await
+    .unwrap();
+    let lookup = r#"SELECT content::text FROM "cpa ""tenant"""."auth_store" WHERE id = 'managed.json'"#;
+    let saved: String = sql.query_one(lookup, &[]).await.unwrap().get(0);
+    assert_eq!(saved, r#"{"managed": true}"#);
+    tokio::task::spawn_blocking(move || persister.delete_auth(managed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sql.query_opt(lookup, &[]).await.unwrap().is_none());
+
     // A second node mirrors the table and replaces whatever its auth dir held.
     // The spool path has a `..` segment (PGSTORE_LOCAL_PATH=../state): Go's
     // filepath.Abs cleans it, so rows still land inside the mirror.
@@ -259,7 +282,10 @@ async fn postgres_store_round_trips_config_auth_and_cooldowns() {
         r#"{"type": "codex"}"#
     );
     assert!(!mirrored.join("stale.json").exists());
+    assert_eq!(mode(&mirrored), 0o700);
+    assert_eq!(mode(&mirrored.join("team")), 0o700);
     assert_eq!(mode(&mirrored.join("a.json")), 0o600);
+    assert_eq!(mode(&second.config_path()), 0o600);
     assert_eq!(
         std::fs::read(second.config_path()).unwrap(),
         b"port: 8317\nauth-dir: x\n"
