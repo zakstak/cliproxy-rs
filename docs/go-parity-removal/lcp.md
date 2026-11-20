@@ -1,6 +1,6 @@
 # Server LCP migration
 
-Owned files: `crates/cpa-server/src/lcp_tests.rs` and new `lcp_model_tests.rs`. Production `lcp.rs` is unchanged. No provider-wire claim is made: conversation matching, leases and deterministic identity are local proxy policy.
+Owned files: `crates/cliproxy-internal/src/gateway/lcp_tests.rs` and new `lcp_model_tests.rs`. Production `lcp.rs` is unchanged. No provider-wire claim is made: conversation matching, leases and deterministic identity are local proxy policy.
 
 | Original inventory entry | Disposition and independently specified replacement |
 | --- | --- |
@@ -15,11 +15,11 @@ Owned files: `crates/cpa-server/src/lcp_tests.rs` and new `lcp_model_tests.rs`. 
 ## Evidence
 
 All 22 final LCP tests passed in a user/network namespace with only loopback enabled:
-`unshare --user --map-root-user --net sh -c 'ip link set lo up && CMAKE=/home/zak/.local/share/mise/installs/cmake/4.5.0/cmake-4.5.0-linux-x86_64/bin/cmake CARGO_BUILD_JOBS=2 nice -n19 cargo test --offline -p cpa-server lcp::tests --lib'`
+`unshare --user --map-root-user --net sh -c 'ip link set lo up && CMAKE=/home/zak/.local/share/mise/installs/cmake/4.5.0/cmake-4.5.0-linux-x86_64/bin/cmake CARGO_BUILD_JOBS=2 nice -n19 cargo test --offline -p cliproxy-internal lcp::tests --lib'`
 Log: `/tmp/cliproxy-parity-migration/lcp-final.log`.
 
 Before oracle retirement, the replacements and both original replay suites passed together (23 tests at that point). Added final tool permutations/long-candidate coverage passed after retirement.
 
 Sensitivity control: temporarily reversed production longest-trajectory preference (`>` to `<` in `newest_matching`). The reference model failed at seed 1/step 41 with a concrete fork/session/parent mismatch, log `/tmp/cliproxy-parity-migration/lcp-mutant.log`. Exact original `lcp.rs` content was restored and subsequent checks passed. This is an assertion failure after compilation, not a build-failure control.
 
-Obsolete fixture/recorder eligible for parent removal: `crates/cpa-server/tests/fixtures/lcp_go.jsonl.zst`, `crates/cpa-server/tests/reference/lcp/`. No Go build was used.
+Obsolete fixture/recorder eligible for parent removal: `crates/cliproxy-internal/tests/gateway/fixtures/lcp_go.jsonl.zst`, `crates/cliproxy-internal/tests/gateway/reference/lcp/`. No Go build was used.

@@ -42,7 +42,7 @@ mkdir -p ~/.local/bin
 install -m 0755 target/release/cliproxy ~/.local/bin/cliproxy
 ```
 
-The WebRTC media relay is an optional feature and is disabled in default builds and the Docker image. To include it, build with `cargo build --release -p cliproxy --features cpa-server/media-relay`.
+The WebRTC media relay is an optional feature and is disabled in default builds and the Docker image. To include it, build with `cargo build --release -p cliproxy --features cliproxy-internal/media-relay`.
 
 The dashboard in `ui/dist` is committed, so Node is not needed for a normal build. To change the dashboard, see [ui/README.md](../ui/README.md); rebuild the UI before building the binary.
 

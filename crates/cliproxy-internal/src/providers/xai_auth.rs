@@ -1,0 +1,1277 @@
+//! xAI RFC 8628 device login with OIDC discovery, token refresh and credential files
+//! (internal/auth/xai, sdk/auth/xai.go, internal/runtime/executor/xai_executor_auth.go).
+//!
+//! Discovered endpoints must be HTTPS on `x.ai` or a subdomain, decided with Go's
+//! `net/url` rules (Go `ValidateOAuthEndpoint`, see xai_url.rs). The discovered token
+//! endpoint is saved with the credential and reused for refresh.
+
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
+
+use crate::config::Config;
+use crate::config::credentials::canonical_metadata_key;
+use crate::credential::{Credential, MetadataPatch};
+use crate::execution::{ExecError, FailureScope};
+use crate::protocol::json::{self as gj, GoValue, Kind};
+use crate::text::{GoStr, quote, values_encode};
+use base64::Engine;
+use bytes::Bytes;
+use chrono::{DateTime, SecondsFormat, Utc};
+use futures_util::FutureExt;
+use futures_util::future::{BoxFuture, Shared};
+use serde_json::{Value, json};
+
+use crate::providers::proxy::{GoClients, GoHeaders, Proxy};
+use crate::providers::xai_url;
+
+pub const DEFAULT_API_BASE_URL: &str = "https://api.x.ai/v1";
+pub const CLI_CHAT_PROXY_BASE_URL: &str = "https://cli-chat-proxy.grok.com/v1";
+pub const ISSUER: &str = "https://auth.x.ai";
+pub const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
+pub const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+pub const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MAX_POLL_DURATION: Duration = Duration::from_secs(30 * 60);
+/// SDK refresh lead (`xaiauth.RefreshLead`).
+pub const REFRESH_LEAD: Duration = Duration::from_secs(300);
+
+/// A control-plane failure. Messages never carry tokens.
+fn auth_error(status: u16, message: impl Into<String>) -> ExecError {
+    ExecError::local(status, FailureScope::Credential, message)
+}
+
+/// Go `time.Time.UTC().Format(time.RFC3339)`.
+fn rfc3339_utc(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// `ValidateOAuthEndpoint`: HTTPS on `x.ai` or a subdomain. Returns the trimmed input.
+pub fn validate_endpoint(raw: &str, field: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(format!("xai discovery {field} is empty"));
+    }
+    let parsed = xai_url::parse(raw).map_err(|e| format!("xai discovery {field} is invalid: {e}"))?;
+    if parsed.scheme != "https" {
+        return Err(format!("xai discovery {field} must use https: {}", quote(raw)));
+    }
+    let host = parsed.hostname.trim().go_lower();
+    if host != "x.ai" && !host.ends_with(".x.ai") {
+        return Err(format!("xai discovery {field} host {} is not on x.ai", quote(&host)));
+    }
+    Ok(raw.to_owned())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Str,
+    Int,
+}
+
+/// The result of decoding a flat Go struct of string and int fields.
+#[derive(Default)]
+struct Decoded {
+    strs: HashMap<&'static str, String>,
+    ints: HashMap<&'static str, i64>,
+}
+
+impl Decoded {
+    fn s(&self, key: &str) -> String {
+        self.strs.get(key).cloned().unwrap_or_default()
+    }
+
+    fn i(&self, key: &str) -> i64 {
+        self.ints.get(key).copied().unwrap_or_default()
+    }
+}
+
+/// `json.Unmarshal` into a struct whose fields are strings and ints: keys match the
+/// field name exactly or case-insensitively, the last occurrence wins, null leaves a
+/// field unset, and the first type mismatch is the error (Go keeps decoding, then
+/// returns it). `go_type` is the struct as Go prints it; `field_prefix` its name in
+/// field errors (empty for anonymous structs).
+// ponytail: syntax errors report a fixed text instead of Go's scanner message (for
+// example "invalid character 'o' in literal null"); only CLI login output and refresh
+// error messages differ.
+fn go_unmarshal(
+    body: &[u8],
+    fields: &[(&'static str, Field)],
+    go_type: &str,
+    field_prefix: &str,
+) -> Result<Decoded, String> {
+    if !gj::valid(body) {
+        return Err("invalid JSON input".into());
+    }
+    let root = gj::parse(body);
+    let kind_name = |r: &gj::Res<'_>| match r.kind {
+        Kind::String => "string",
+        Kind::Number => "number",
+        Kind::True | Kind::False => "bool",
+        Kind::Json if r.is_array() => "array",
+        Kind::Json => "object",
+        Kind::Null => "null",
+    };
+    match root.kind {
+        Kind::Null => return Ok(Decoded::default()),
+        Kind::Json if root.is_object() => {}
+        _ => {
+            return Err(format!(
+                "json: cannot unmarshal {} into Go value of type {go_type}",
+                kind_name(&root)
+            ));
+        }
+    }
+    let mut out = Decoded::default();
+    let mut first_error: Option<String> = None;
+    root.each(|key, value| {
+        let key = key.str();
+        let field = fields
+            .iter()
+            .find(|(name, _)| *name == key)
+            .or_else(|| fields.iter().find(|(name, _)| name.go_eq_fold(&key)));
+        let Some(&(name, kind)) = field else { return true };
+        let mismatch = |what: &str| {
+            let ty = if kind == Field::Str { "string" } else { "int" };
+            format!("json: cannot unmarshal {what} into Go struct field {field_prefix}.{name} of type {ty}")
+        };
+        match (kind, value.kind) {
+            (_, Kind::Null) => {}
+            (Field::Str, Kind::String) => {
+                out.strs.insert(name, gj::go_unquote(value.raw()).unwrap_or_default());
+            }
+            (Field::Int, Kind::Number) => match std::str::from_utf8(value.raw())
+                .ok()
+                .and_then(|n| n.parse::<i64>().ok())
+            {
+                Some(n) => {
+                    out.ints.insert(name, n);
+                }
+                // ponytail: Go quotes the number ("number 1.5 into ..."); the value is
+                // response data that reaches logs and returned errors, so the message
+                // names only its kind.
+                None => {
+                    first_error.get_or_insert_with(|| mismatch("number"));
+                }
+            },
+            _ => {
+                first_error.get_or_insert_with(|| mismatch(kind_name(&value)));
+            }
+        }
+        true
+    });
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(out),
+    }
+}
+
+const DISCOVERY_TYPE: &str = r#"struct { DeviceAuthorizationEndpoint string "json:\"device_authorization_endpoint\""; TokenEndpoint string "json:\"token_endpoint\"" }"#;
+const TOKEN_TYPE: &str = r#"struct { Error string "json:\"error\""; ErrorDescription string "json:\"error_description\""; AccessToken string "json:\"access_token\""; RefreshToken string "json:\"refresh_token\""; IDToken string "json:\"id_token\""; TokenType string "json:\"token_type\""; ExpiresIn int "json:\"expires_in\"" }"#;
+const REFRESH_TYPE: &str = r#"struct { AccessToken string "json:\"access_token\""; RefreshToken string "json:\"refresh_token\""; IDToken string "json:\"id_token\""; TokenType string "json:\"token_type\""; ExpiresIn int "json:\"expires_in\"" }"#;
+const TOKEN_FIELDS: [(&str, Field); 7] = [
+    ("error", Field::Str),
+    ("error_description", Field::Str),
+    ("access_token", Field::Str),
+    ("refresh_token", Field::Str),
+    ("id_token", Field::Str),
+    ("token_type", Field::Str),
+    ("expires_in", Field::Int),
+];
+
+/// Discovered OAuth endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovery {
+    pub device_authorization_endpoint: String,
+    pub token_endpoint: String,
+}
+
+/// RFC 8628 device authorization response, plus the token endpoint to poll.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    pub expires_in: i64,
+    pub interval: i64,
+    pub token_endpoint: String,
+}
+
+/// Go `TokenData`. `expire` is RFC 3339 UTC, empty when the server sent no lifetime.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenData {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub id_token: String,
+    pub token_type: String,
+    pub expires_in: i64,
+    pub expire: String,
+    pub email: String,
+    pub subject: String,
+}
+
+/// `parseJWTIdentity`: email and subject claims from an ID token, unverified.
+pub fn parse_jwt_identity(token: &str) -> (String, String) {
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    // base64.URLEncoding: padded, discarded bits may be non-zero, CR and LF are skipped.
+    const GO_URL_ENCODING: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(DecodePaddingMode::RequireCanonical),
+    );
+    let mut parts = token.split('.');
+    let (Some(_), Some(payload)) = (parts.next(), parts.next()) else {
+        return Default::default();
+    };
+    let padded = format!("{payload}{}", "=".repeat((4 - payload.len() % 4) % 4));
+    let padded: String = padded.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+    let Ok(raw) = GO_URL_ENCODING.decode(padded) else {
+        return Default::default();
+    };
+    let Some(Ok(claims)) = GoValue::parse_f64(&raw).map(GoValue::into_object) else {
+        return Default::default();
+    };
+    let claim = |k: &str| match claims.get(k) {
+        Some(GoValue::String(s)) => s.trim().to_owned(),
+        _ => String::new(),
+    };
+    (claim("email"), claim("sub"))
+}
+
+/// `buildTokenData`. Identity comes from the untrimmed ID token, as in Go.
+fn token_data(decoded: &Decoded, now: DateTime<Utc>) -> TokenData {
+    let (email, subject) = parse_jwt_identity(&decoded.s("id_token"));
+    let expires_in = decoded.i("expires_in");
+    // OAuth expires_in is seconds. An unrepresentable duration is an unknown
+    // expiry, never a wrapping timestamp that can put a fresh token in the past.
+    let expire = (expires_in > 0)
+        .then(|| chrono::Duration::try_seconds(expires_in))
+        .flatten()
+        .and_then(|duration| now.checked_add_signed(duration))
+        .map(rfc3339_utc);
+    TokenData {
+        access_token: decoded.s("access_token").trim().to_owned(),
+        refresh_token: decoded.s("refresh_token").trim().to_owned(),
+        id_token: decoded.s("id_token").trim().to_owned(),
+        token_type: decoded.s("token_type").trim().to_owned(),
+        expires_in,
+        expire: expire.unwrap_or_default(),
+        email,
+        subject,
+    }
+}
+
+/// Device polling respects the provider interval and the configured minimum,
+/// bounded by the maximum lifetime of the device flow.
+fn initial_interval(device_interval: i64, min_poll: Option<Duration>) -> Duration {
+    let minimum = min_poll.unwrap_or(DEFAULT_POLL_INTERVAL);
+    let interval = u64::try_from(device_interval)
+        .map(Duration::from_secs)
+        .unwrap_or_default();
+    interval.max(minimum).min(MAX_POLL_DURATION)
+}
+
+/// Nanoseconds until polling stops: the earlier of the positive device lifetime
+/// and the 30-minute protection cap. Saturation prevents a remote integer from
+/// turning a future deadline into an already expired one.
+fn poll_deadline(expires_in: i64) -> i64 {
+    let seconds = if expires_in > 0 {
+        (expires_in as u64).min(MAX_POLL_DURATION.as_secs())
+    } else {
+        MAX_POLL_DURATION.as_secs()
+    };
+    (seconds * 1_000_000_000) as i64
+}
+
+/// One xAI OAuth client.
+#[derive(Clone)]
+pub struct XaiAuth {
+    client: wreq::Client,
+    discovery_url: String,
+    min_poll_interval: Option<Duration>,
+    /// Test seam: requests to `https://auth.x.ai` go to this origin instead, after
+    /// validation.
+    issuer_origin: Option<String>,
+}
+
+impl XaiAuth {
+    pub fn new(client: wreq::Client) -> Self {
+        Self {
+            client,
+            discovery_url: DISCOVERY_URL.into(),
+            min_poll_interval: None,
+            issuer_origin: None,
+        }
+    }
+
+    pub fn with_issuer_origin(mut self, origin: &str) -> Self {
+        self.issuer_origin = Some(origin.into());
+        self
+    }
+
+    /// Where a request for `url` goes. Fails closed when the HTTP client would contact a
+    /// different host than validation read from the same string.
+    // ponytail: the request target is the WHATWG form of the URL, so dot segments and
+    // backslashes in an accepted path are normalized instead of sent as given.
+    fn target(&self, url: &str) -> Result<String, ()> {
+        if !crate::providers::xai_url::same_authority(url) {
+            return Err(());
+        }
+        Ok(match (&self.issuer_origin, url.strip_prefix(ISSUER)) {
+            (Some(origin), Some(rest)) => format!("{origin}{rest}"),
+            _ => url.to_owned(),
+        })
+    }
+
+    /// Go's `minPollInterval` test knob.
+    pub fn with_min_poll_interval(mut self, interval: Duration) -> Self {
+        self.min_poll_interval = Some(interval);
+        self
+    }
+
+    /// `http.Client.Do` of a form POST: status and the whole body.
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, Bytes), ()> {
+        let mut headers = GoHeaders::new();
+        headers.set("User-Agent", "Go-http-client/1.1");
+        headers.set("Content-Type", "application/x-www-form-urlencoded");
+        headers.set("Accept", "application/json");
+        let upstream =
+            crate::providers::proxy::send(&self.client, &self.target(url)?, headers, body, Some(HTTP_TIMEOUT))
+                .await
+                .map_err(|_| ())?;
+        let status = upstream.status;
+        let body = crate::providers::proxy::read_all(upstream.body, crate::providers::proxy::MAX_ERROR_BODY, false)
+            .await
+            .map_err(|_| ())?;
+        Ok((status, body))
+    }
+
+    /// `http.Client.Do` of the discovery GET, following redirects as Go does.
+    async fn get(&self, url: &str) -> Result<(u16, Bytes), ()> {
+        let mut headers = GoHeaders::new();
+        headers.set("User-Agent", "Go-http-client/1.1");
+        headers.set("Accept", "application/json");
+        let upstream = crate::providers::proxy::request(
+            &self.client,
+            wreq::Method::GET,
+            &self.target(url)?,
+            headers,
+            None,
+            Some(HTTP_TIMEOUT),
+        )
+        .await
+        .map_err(|_| ())?;
+        let status = upstream.status;
+        let body = crate::providers::proxy::read_all(upstream.body, crate::providers::proxy::MAX_ERROR_BODY, false)
+            .await
+            .map_err(|_| ())?;
+        Ok((status, body))
+    }
+
+    /// `Discover`.
+    pub async fn discover(&self) -> Result<Discovery, ExecError> {
+        let fail = |m: String| auth_error(502, m);
+        let (status, body) = self
+            .get(&self.discovery_url)
+            .await
+            .map_err(|_| fail("xai discovery: request failed".into()))?;
+        if status != 200 {
+            return Err(fail(format!(
+                "xai discovery failed with status {status}: {}",
+                String::from_utf8_lossy(&body).trim()
+            )));
+        }
+        let wire = go_unmarshal(
+            &body,
+            &[
+                ("device_authorization_endpoint", Field::Str),
+                ("token_endpoint", Field::Str),
+            ],
+            DISCOVERY_TYPE,
+            "",
+        )
+        .map_err(|e| fail(format!("xai discovery: parse response: {e}")))?;
+        let device = validate_endpoint(
+            &wire.s("device_authorization_endpoint"),
+            "device_authorization_endpoint",
+        )
+        .map_err(fail)?;
+        let token = validate_endpoint(&wire.s("token_endpoint"), "token_endpoint").map_err(fail)?;
+        Ok(Discovery {
+            device_authorization_endpoint: device,
+            token_endpoint: token,
+        })
+    }
+
+    /// `StartDeviceFlow`.
+    pub async fn start_device_flow(&self) -> Result<DeviceCode, ExecError> {
+        let discovery = self.discover().await?;
+        self.request_device_code(&discovery.device_authorization_endpoint, &discovery.token_endpoint)
+            .await
+    }
+
+    /// `RequestDeviceCode`.
+    pub async fn request_device_code(
+        &self,
+        device_endpoint: &str,
+        token_endpoint: &str,
+    ) -> Result<DeviceCode, ExecError> {
+        let fail = |m: String| auth_error(502, m);
+        let device_endpoint = device_endpoint.trim();
+        if device_endpoint.is_empty() {
+            return Err(fail(
+                "xai device code: device authorization endpoint is required".into(),
+            ));
+        }
+        let (status, body) = self
+            .post_form(
+                device_endpoint,
+                values_encode(&[("client_id", CLIENT_ID), ("scope", SCOPE)]),
+            )
+            .await
+            .map_err(|_| fail("xai device code request failed".into()))?;
+        if status != 200 {
+            return Err(fail(format!(
+                "xai device code request failed with status {status}: {}",
+                String::from_utf8_lossy(&body).trim()
+            )));
+        }
+        let wire = go_unmarshal(
+            &body,
+            &[
+                ("device_code", Field::Str),
+                ("user_code", Field::Str),
+                ("verification_uri", Field::Str),
+                ("verification_uri_complete", Field::Str),
+                ("expires_in", Field::Int),
+                ("interval", Field::Int),
+            ],
+            "xai.DeviceCodeResponse",
+            "DeviceCodeResponse",
+        )
+        .map_err(|e| fail(format!("xai device code: parse response: {e}")))?;
+        let code = DeviceCode {
+            device_code: wire.s("device_code"),
+            user_code: wire.s("user_code"),
+            verification_uri: wire.s("verification_uri"),
+            verification_uri_complete: wire.s("verification_uri_complete"),
+            expires_in: wire.i("expires_in"),
+            interval: wire.i("interval"),
+            token_endpoint: token_endpoint.trim().to_owned(),
+        };
+        if code.device_code.trim().is_empty() {
+            return Err(fail("xai device code: response missing device_code".into()));
+        }
+        if code.user_code.trim().is_empty() {
+            return Err(fail("xai device code: response missing user_code".into()));
+        }
+        if code.verification_uri.trim().is_empty() && code.verification_uri_complete.trim().is_empty() {
+            return Err(fail("xai device code: response missing verification URI".into()));
+        }
+        Ok(code)
+    }
+
+    /// One `exchangeDeviceCode`: `Ok(Some)` tokens, `Ok(None)` keep polling after
+    /// `interval`, `Err` stop.
+    async fn exchange(
+        &self,
+        token_endpoint: &str,
+        device_code: &str,
+        interval: &mut Duration,
+    ) -> Result<Option<TokenData>, ExecError> {
+        let fail = |m: String| auth_error(400, m);
+        let body = values_encode(&[
+            ("client_id", CLIENT_ID),
+            ("device_code", device_code.trim()),
+            ("grant_type", DEVICE_GRANT),
+        ]);
+        let (status, body) = self
+            .post_form(token_endpoint.trim(), body)
+            .await
+            .map_err(|_| auth_error(502, "xai device token request failed"))?;
+        let wire = go_unmarshal(&body, &TOKEN_FIELDS, TOKEN_TYPE, "")
+            .map_err(|e| auth_error(502, format!("xai device token: parse response: {e}")))?;
+        match wire.s("error").as_str() {
+            "" => {}
+            "authorization_pending" => return Ok(None),
+            "slow_down" => {
+                *interval = interval.saturating_add(self.min_poll_interval.unwrap_or(DEFAULT_POLL_INTERVAL));
+                return Ok(None);
+            }
+            "expired_token" => return Err(fail("xai device code expired".into())),
+            "access_denied" => return Err(auth_error(403, "xai device authorization denied")),
+            other => {
+                let description = wire.s("error_description");
+                let description = description.trim();
+                return Err(fail(if description.is_empty() {
+                    format!("xai device token error: {other}")
+                } else {
+                    format!("xai device token error: {other}: {description}")
+                }));
+            }
+        }
+        if status != 200 {
+            return Err(auth_error(
+                502,
+                format!(
+                    "xai device token request failed with status {status}: {}",
+                    String::from_utf8_lossy(&body).trim()
+                ),
+            ));
+        }
+        if wire.s("access_token").trim().is_empty() {
+            return Err(auth_error(502, "xai device token response missing access_token"));
+        }
+        Ok(Some(token_data(&wire, Utc::now())))
+    }
+
+    /// `PollForToken`: the first poll is immediate, then at the device interval (at least
+    /// 5s), slower on `slow_down`, until the code or 30 minutes expire.
+    pub async fn poll(&self, code: &DeviceCode) -> Result<TokenData, ExecError> {
+        let mut token_endpoint = code.token_endpoint.trim().to_owned();
+        if token_endpoint.is_empty() {
+            token_endpoint = self.discover().await?.token_endpoint;
+        }
+        let mut interval = initial_interval(code.interval, self.min_poll_interval);
+        let start = tokio::time::Instant::now();
+        let deadline = poll_deadline(code.expires_in);
+        let mut first = true;
+        loop {
+            if !first {
+                tokio::time::sleep(interval).await;
+                if start.elapsed().as_nanos() as i64 > deadline {
+                    return Err(auth_error(400, "xai device code expired"));
+                }
+            }
+            first = false;
+            if let Some(tokens) = self.exchange(&token_endpoint, &code.device_code, &mut interval).await? {
+                return Ok(tokens);
+            }
+        }
+    }
+
+    /// `RefreshTokens`, single-flighted per refresh token across the process
+    /// (xaiRefreshGroup). Callers that go away do not cancel it.
+    pub async fn refresh(&self, refresh_token: &str, token_endpoint: &str) -> Result<TokenData, ExecError> {
+        if refresh_token.trim().is_empty() {
+            return Err(auth_error(400, "xai token refresh: refresh token is required"));
+        }
+        let refresh_token = refresh_token.trim().to_owned();
+        let mut token_endpoint = token_endpoint.trim().to_owned();
+        if token_endpoint.is_empty() {
+            token_endpoint = self.discover().await?.token_endpoint;
+        }
+        type Flight = Shared<BoxFuture<'static, Result<TokenData, ExecError>>>;
+        static FLIGHTS: LazyLock<Mutex<HashMap<String, Flight>>> = LazyLock::new(Mutex::default);
+        let flight = {
+            let mut flights = FLIGHTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match flights.get(&refresh_token) {
+                Some(flight) => flight.clone(),
+                None => {
+                    let auth = self.clone();
+                    let key = refresh_token.clone();
+                    let task = tokio::spawn(async move {
+                        let result = auth.refresh_once(&key, &token_endpoint).await;
+                        FLIGHTS
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&key);
+                        result
+                    });
+                    let flight = async move {
+                        task.await
+                            .map_err(|_| auth_error(502, "xai token refresh task failed"))?
+                    }
+                    .boxed()
+                    .shared();
+                    flights.insert(refresh_token, flight.clone());
+                    flight
+                }
+            }
+        };
+        flight.await
+    }
+
+    /// `refreshTokensSingleFlight` + `postTokenForm`.
+    async fn refresh_once(&self, refresh_token: &str, token_endpoint: &str) -> Result<TokenData, ExecError> {
+        let body = values_encode(&[
+            ("client_id", CLIENT_ID),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ]);
+        let (status, body) = self
+            .post_form(token_endpoint, body)
+            .await
+            .map_err(|_| auth_error(502, "xai token request failed"))?;
+        if status != 200 {
+            // ponytail: Go appends the response body; it is withheld because token
+            // endpoints may echo credentials and the message reaches management clients
+            // (Go's choice for device-login refreshes).
+            return Err(auth_error(
+                status,
+                format!("xai token request failed with status {status}"),
+            ));
+        }
+        let wire = go_unmarshal(&body, &TOKEN_FIELDS[2..], REFRESH_TYPE, "")
+            .map_err(|e| auth_error(502, format!("xai token response: parse body: {e}")))?;
+        if wire.s("access_token").trim().is_empty() {
+            return Err(auth_error(502, "xai token response missing access_token"));
+        }
+        Ok(token_data(&wire, Utc::now()))
+    }
+}
+
+/// `sanitizeFileSegment`.
+fn sanitize_segment(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned()
+}
+
+/// The longest sanitized identity a file name keeps (Go: room for the prefix, hash and
+/// extension within common file name limits). Sanitized text is ASCII.
+const MAX_NAME_SEGMENT: usize = 120;
+
+/// One identity's name segment and hash: `xai-<sanitized>-<16 hex>.json`.
+fn hashed_name(kind: &str, identity: &str, sanitized: String) -> String {
+    use sha2::{Digest, Sha256};
+    let mut segment = if sanitized.is_empty() {
+        "account".to_owned()
+    } else {
+        sanitized
+    };
+    segment.truncate(MAX_NAME_SEGMENT);
+    let digest = Sha256::new()
+        .chain_update(kind.as_bytes())
+        .chain_update([0])
+        .chain_update(identity.as_bytes())
+        .finalize();
+    let hash: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("xai-{segment}-{hash}.json")
+}
+
+/// `CredentialFileName` (v8.0.67, d65840fb): a readable account name and a hash of
+/// the original identity, so distinct accounts that sanitize alike get distinct files.
+/// The email (case-folded, as emails are case-insensitive) names the file whenever it
+/// is known, so the name does not change when a later login lacks the subject.
+pub fn credential_file_name(email: &str, subject: &str, now_ms: i64) -> String {
+    let email = email.trim();
+    if !email.is_empty() {
+        let email = email.go_lower();
+        return hashed_name("email", &email, sanitize_segment(&email));
+    }
+    let subject = subject.trim();
+    if !subject.is_empty() {
+        return hashed_name("subject", subject, sanitize_segment(subject));
+    }
+    format!("xai-{now_ms}.json")
+}
+
+/// `legacyCredentialFileName`: the v8.0.35 name, without the identity hash.
+pub(crate) fn legacy_credential_file_name(email: &str, subject: &str) -> String {
+    [email, subject]
+        .iter()
+        .map(|identity| sanitize_segment(identity))
+        .find(|s| !s.is_empty())
+        .map_or_else(String::new, |s| format!("xai-{s}.json"))
+}
+
+/// `isRecognizedPredecessor`: a name the login itself would have given some subset of
+/// the stored identity: the v8.0.35 name, or a hashed name from either field.
+fn recognized_predecessor(base: &str, email: &str, subject: &str) -> bool {
+    if email.is_empty() && subject.is_empty() {
+        return false;
+    }
+    let mut names = vec![credential_file_name(email, subject, 0)];
+    if !email.is_empty() {
+        names.push(credential_file_name(email, "", 0));
+    }
+    if !subject.is_empty() {
+        names.push(credential_file_name("", subject, 0));
+        names.push(legacy_credential_file_name("", subject));
+    }
+    names.push(legacy_credential_file_name(email, subject));
+    names.iter().any(|name| !name.is_empty() && base.go_eq_fold(name))
+}
+
+/// `identityMatches`: provably the same account. One stored field matches and none
+/// conflicts; emails compare case-insensitively, subjects exactly.
+fn identity_matches(email: &str, subject: &str, candidate_email: &str, candidate_subject: &str) -> bool {
+    let both = |a: &str, b: &str| !a.is_empty() && !b.is_empty();
+    let email_matches = both(email, candidate_email) && email.go_eq_fold(candidate_email);
+    let email_conflicts = both(email, candidate_email) && !email.go_eq_fold(candidate_email);
+    let subject_matches = both(subject, candidate_subject) && subject == candidate_subject;
+    let subject_conflicts = both(subject, candidate_subject) && subject != candidate_subject;
+    (email_matches || subject_matches) && !email_conflicts && !subject_conflicts
+}
+
+/// A credential file's trimmed string member (Go `metadataString`: strings only).
+fn member(document: &serde_json::Map<String, Value>, key: &str) -> String {
+    document
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+/// A file found by [`legacy_credential`]: where it is, its bytes and its stored email.
+struct Predecessor {
+    path: PathBuf,
+    raw: Vec<u8>,
+    email: String,
+}
+
+/// `FindMatchingLegacyCredential` over the auth directory: an earlier file of the same
+/// account under a name the login would have given it before (v8.0.35's unhashed name,
+/// or the hashed name of only its email or only its subject). A name alone is
+/// ambiguous, so the file's stored identity must match `email`/`subject` and conflict
+/// with neither; the target file itself never qualifies. Only top-level files take
+/// part, as login only writes there.
+///
+/// A folder that does not exist yet holds no earlier file; one that cannot be listed
+/// fails the save, so an earlier file is never left behind unseen. An entry that
+/// cannot be read is skipped and left in place: nothing proves whose it is.
+fn legacy_credential(
+    directory: &Path,
+    target_name: &str,
+    email: &str,
+    subject: &str,
+) -> Result<Option<Predecessor>, SaveError> {
+    if (email.is_empty() && subject.is_empty()) || !target_name.go_eq_fold(&credential_file_name(email, subject, 0)) {
+        return Ok(None);
+    }
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(SaveError::Unreadable(format!(
+                "xai: cannot list the auth directory to find earlier credential files: {e}"
+            )));
+        }
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")))
+        .collect();
+    files.sort();
+    Ok(files.into_iter().find_map(|path| {
+        let base = path.file_name()?.to_str()?.to_owned();
+        if base.go_eq_fold(target_name) {
+            return None;
+        }
+        let raw = std::fs::read(&path).ok()?;
+        let document: serde_json::Map<String, Value> = serde_json::from_slice(&raw).ok()?;
+        if !member(&document, "type").go_eq_fold("xai") {
+            return None;
+        }
+        let (candidate_email, candidate_subject) = (member(&document, "email"), member(&document, "sub"));
+        (identity_matches(email, subject, &candidate_email, &candidate_subject)
+            && recognized_predecessor(&base, &candidate_email, &candidate_subject))
+        .then_some(Predecessor {
+            path,
+            raw,
+            email: candidate_email,
+        })
+    }))
+}
+
+/// The file already at a path this login would write, when it is safe to refresh: a
+/// regular file holding an xAI credential whose stored identity matches the login and
+/// conflicts with neither field (as [`legacy_credential`] requires of an earlier file).
+/// `None` when nothing is there.
+///
+/// Anything else is refused before a byte is merged or written. A hashed name can equal
+/// another account's v8.0.35 name without any hash collision (a subject that reads
+/// `dev@x.ai-<16 hex>` was saved as `xai-dev@x.ai-<16 hex>.json`), and a file without a
+/// stored identity, of another provider, or not a regular file (a symlink is not
+/// followed) cannot be proven to be this account's.
+fn owned_destination(path: &Path, email: &str, subject: &str) -> Result<Option<Vec<u8>>, SaveError> {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let conflict = |why: &str| {
+        SaveError::Conflict(format!(
+            "xai: refusing to overwrite {name} in the auth directory: {why}; move it aside and sign in again"
+        ))
+    };
+    let unreadable =
+        |e: std::io::Error| SaveError::Unreadable(format!("xai: cannot read {name} in the auth directory: {e}"));
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e)),
+        Ok(meta) if !meta.file_type().is_file() => return Err(conflict("it is not a regular file")),
+        Ok(_) => {}
+    }
+    let raw = std::fs::read(path).map_err(unreadable)?;
+    let Ok(document) = serde_json::from_slice::<serde_json::Map<String, Value>>(&raw) else {
+        return Err(conflict("it is not a credential file"));
+    };
+    if !member(&document, "type").go_eq_fold("xai") {
+        return Err(conflict("it is not an xAI credential"));
+    }
+    if !identity_matches(email, subject, &member(&document, "email"), &member(&document, "sub")) {
+        return Err(conflict("it does not store this account's identity"));
+    }
+    Ok(Some(raw))
+}
+
+/// Why [`save_login`] wrote nothing.
+#[derive(Debug)]
+pub enum SaveError {
+    /// The merged document is invalid (Go's file store refuses it).
+    Refused(String),
+    /// A file at the path this login would write is not provably this account's
+    /// ([`owned_destination`]); it was left untouched.
+    Conflict(String),
+    /// The auth directory or a file the save must check could not be read.
+    Unreadable(String),
+    /// Publishing the file failed.
+    Write(std::io::Error),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaveError::Refused(reason) | SaveError::Conflict(reason) | SaveError::Unreadable(reason) => {
+                f.write_str(reason)
+            }
+            SaveError::Write(error) => error.fmt(f),
+        }
+    }
+}
+
+/// Writes a finished login into `directory` as Go's `Manager.Login` and
+/// `saveTokenRecord` do (v8.0.67, d65840fb): under its hashed name, merged with an
+/// existing file of that name and with an earlier file of the same account
+/// ([`legacy_credential`]), whose operator settings (`disabled`, `proxy_url`,
+/// priority, prefixes and the rest) are kept. `write` publishes the bytes atomically.
+///
+/// Returns the saved path and the file the caller deletes once the save is stored; it
+/// stays in place if the save fails. A login that names only the subject keeps
+/// refreshing the earlier email-named file instead, so the account keeps its richest
+/// name, unless the subject-named file disables the credential; the subject-named file
+/// it then supersedes (left by a migration interrupted before its cleanup) is the one
+/// returned for deletion, so one credential remains.
+///
+/// Nothing is written, and nothing is returned for deletion, when a file at the path
+/// it would write is not provably this account's ([`owned_destination`]).
+pub fn save_login(
+    directory: &Path,
+    record: LoginRecord,
+    write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+) -> Result<(PathBuf, Option<PathBuf>), SaveError> {
+    let field = |key: &str| match record.metadata.get(key) {
+        Some(GoValue::String(s)) => s.trim().to_owned(),
+        _ => String::new(),
+    };
+    let (email, subject) = (field("email"), field("sub"));
+    let target = directory.join(&record.file_name);
+    let existing = owned_destination(&target, &email, &subject)?;
+    let legacy = legacy_credential(directory, &record.file_name, &email, &subject)?;
+    let target_disabled = existing
+        .as_deref()
+        .and_then(|raw| serde_json::from_slice::<serde_json::Map<String, Value>>(raw).ok())
+        .is_some_and(|doc| doc.get("disabled") == Some(&Value::Bool(true)));
+    let adopt = legacy
+        .as_ref()
+        .is_some_and(|l| email.is_empty() && !subject.is_empty() && !l.email.is_empty() && !target_disabled);
+    let document = saved_document(
+        record.metadata,
+        existing.as_deref(),
+        legacy.as_ref().map(|l| l.raw.as_slice()),
+    )
+    .map_err(SaveError::Refused)?;
+    let had_target = existing.is_some();
+    let (path, superseded) = match legacy {
+        Some(legacy) if adopt => (legacy.path, had_target.then_some(target)),
+        legacy => (target, legacy.map(|l| l.path)),
+    };
+    write(&path, &GoValue::Object(document).encode_indented()).map_err(SaveError::Write)?;
+    Ok((path, superseded))
+}
+
+/// [`save_login`] into the existing credential file `target` (a targeted re-login,
+/// #90): merged with it under its own name, with no earlier file adopted or replaced.
+/// Nothing is written unless `target` is this account's xAI credential
+/// ([`owned_destination`]).
+pub fn save_login_to(
+    target: &Path,
+    record: LoginRecord,
+    write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+) -> Result<PathBuf, SaveError> {
+    let field = |key: &str| match record.metadata.get(key) {
+        Some(GoValue::String(s)) => s.trim().to_owned(),
+        _ => String::new(),
+    };
+    let Some(existing) = owned_destination(target, &field("email"), &field("sub"))? else {
+        return Err(SaveError::Unreadable("xai: the target credential file is gone".into()));
+    };
+    let mut document = saved_document(record.metadata, Some(&existing), None).map_err(SaveError::Refused)?;
+    // The account's endpoint stays: a targeted re-login changes only the sign-in.
+    if let Some(url) = serde_json::from_slice::<serde_json::Map<String, Value>>(&existing)
+        .ok()
+        .and_then(|doc| doc.get("base_url")?.as_str().map(str::to_owned))
+        .filter(|url| !url.trim().is_empty())
+    {
+        document.insert("base_url".into(), GoValue::String(url));
+    }
+    write(target, &GoValue::Object(document).encode_indented()).map_err(SaveError::Write)?;
+    Ok(target.to_path_buf())
+}
+
+/// A finished login: file name, the saved document and label.
+pub struct LoginRecord {
+    pub file_name: String,
+    pub metadata: BTreeMap<String, GoValue>,
+    pub label: String,
+}
+
+fn go_str(s: &str) -> GoValue {
+    GoValue::String(s.to_owned())
+}
+
+/// The credential Go's login saves before any existing file is merged: `TokenStorage`
+/// fields (omitempty) overlaid by the login metadata (sdk/auth/xai.go).
+pub fn login_record(tokens: &TokenData, last_refresh: &str, token_endpoint: &str, now_ms: i64) -> LoginRecord {
+    let email = tokens.email.trim();
+    let mut out = BTreeMap::new();
+    // TokenStorage with omitempty.
+    for (k, v) in [
+        ("id_token", tokens.id_token.as_str()),
+        ("token_type", &tokens.token_type),
+        ("expired", &tokens.expire),
+        ("last_refresh", last_refresh),
+        ("email", email),
+        ("sub", &tokens.subject),
+        ("base_url", DEFAULT_API_BASE_URL),
+        ("token_endpoint", token_endpoint),
+    ] {
+        if !v.is_empty() {
+            out.insert(k.to_owned(), go_str(v));
+        }
+    }
+    if tokens.expires_in != 0 {
+        out.insert("expires_in".into(), GoValue::Number(tokens.expires_in.to_string()));
+    }
+    // Login metadata, always present.
+    for (k, v) in [
+        ("type", "xai"),
+        ("access_token", tokens.access_token.as_str()),
+        ("refresh_token", &tokens.refresh_token),
+        ("id_token", &tokens.id_token),
+        ("token_type", &tokens.token_type),
+        ("expired", &tokens.expire),
+        ("last_refresh", last_refresh),
+        ("base_url", DEFAULT_API_BASE_URL),
+        ("token_endpoint", token_endpoint),
+        ("auth_kind", "oauth"),
+    ] {
+        out.insert(k.to_owned(), go_str(v));
+    }
+    out.insert("expires_in".into(), GoValue::Number(tokens.expires_in.to_string()));
+    if !email.is_empty() {
+        out.insert("email".into(), go_str(email));
+    }
+    if !tokens.subject.is_empty() {
+        out.insert("sub".into(), go_str(&tokens.subject));
+    }
+    LoginRecord {
+        file_name: credential_file_name(email, &tokens.subject, now_ms),
+        metadata: out,
+        label: if email.is_empty() { "xAI".into() } else { email.into() },
+    }
+}
+
+/// `IsAuthTokenPayloadKey`.
+fn is_token_key(key: &str) -> bool {
+    matches!(
+        key.trim().go_lower().as_str(),
+        "access_token"
+            | "refresh_token"
+            | "id_token"
+            | "session_id"
+            | "expired"
+            | "last_refresh"
+            | "expires_in"
+            | "timestamp"
+            | "token_type"
+            | "user_code"
+            | "verification_uri"
+            | "verification_uri_complete"
+    )
+}
+
+/// `NormalizeCredentialMetadata` on one document: each legacy key takes its canonical
+/// name unless the document already has that name, which then wins.
+fn normalize_keys(document: &mut BTreeMap<String, GoValue>) {
+    let aliases: Vec<String> = document
+        .keys()
+        .filter(|k| canonical_metadata_key(k) != k.as_str())
+        .cloned()
+        .collect();
+    for key in aliases {
+        let value = document.remove(&key).expect("present");
+        document.entry(canonical_metadata_key(&key).to_owned()).or_insert(value);
+    }
+}
+
+/// The file `Manager.Login` + `FileTokenStore.Save` write: non-token fields of an
+/// existing file, then of an earlier file of the same account (`legacy`), are kept
+/// (`MergeExistingAuthMetadata`, in that order), `disabled` is the first of those
+/// files' booleans (an existing file with any `disabled` value decides) or false, and a
+/// merged `weight` must be valid (`ValidateAuthWeight`) or nothing is written.
+///
+/// Legacy keys are renamed (`NormalizeCredentialMetadata`) in each document before the
+/// merge, so the order holds for a setting whatever spelling each file uses: an
+/// existing file's `proxy-url` beats an earlier file's `proxy_url`. Go renames after
+/// merging, which lets an earlier file's canonical spelling beat the existing file's
+/// legacy one (docs/DIFFERENCES-FROM-GO.md, "xAI credential file names").
+pub fn saved_document(
+    mut record: BTreeMap<String, GoValue>,
+    existing: Option<&[u8]>,
+    legacy: Option<&[u8]>,
+) -> Result<BTreeMap<String, GoValue>, String> {
+    normalize_keys(&mut record);
+    let mut disabled = false;
+    for file in [existing, legacy] {
+        let Some(mut file) = file
+            .and_then(GoValue::parse_f64)
+            .and_then(|v| v.into_object().ok())
+            .filter(|map| !map.is_empty())
+        else {
+            continue;
+        };
+        normalize_keys(&mut file);
+        if !record.contains_key("disabled")
+            && let Some(GoValue::Bool(b)) = file.get("disabled")
+        {
+            disabled = *b;
+        }
+        for (k, v) in file {
+            if !is_token_key(&k) {
+                record.entry(k).or_insert(v);
+            }
+        }
+    }
+    if let Some(weight) = record.get("weight") {
+        let json = match weight {
+            GoValue::Number(n) => serde_json::from_str(n).unwrap_or(Value::Null),
+            GoValue::String(s) => Value::String(s.clone()),
+            _ => Value::Null,
+        };
+        crate::config::credentials::parse_weight(&json)
+            .map_err(|e| format!("auth filestore: invalid metadata weight: {e}"))?;
+    }
+    record.insert("disabled".into(), GoValue::Bool(disabled));
+    Ok(record)
+}
+
+/// `xaiMetadataString`: a metadata value as `fmt.Sprint` prints it (JSON numbers are
+/// float64 in Go's decoded auth files), trimmed; missing and null are empty.
+pub(crate) fn metadata_string(credential: &Credential, key: &str) -> String {
+    match credential.metadata.get(key) {
+        None | Some(Value::Null) => String::new(),
+        Some(value) => go_sprint(value).trim().to_owned(),
+    }
+}
+
+/// `fmt.Sprint` of a value decoded by `encoding/json` into `any`.
+fn go_sprint(value: &Value) -> String {
+    match value {
+        Value::Null => "<nil>".into(),
+        Value::Bool(b) => b.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Number(n) => go_float_v(n.as_f64().unwrap_or(f64::NAN)),
+        Value::Array(items) => format!("[{}]", items.iter().map(go_sprint).collect::<Vec<_>>().join(" ")),
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let items: Vec<String> = keys.iter().map(|k| format!("{k}:{}", go_sprint(&map[*k]))).collect();
+            format!("map[{}]", items.join(" "))
+        }
+    }
+}
+
+/// `%v` of a float64: `strconv.FormatFloat(f, 'g', -1, 64)`, the shortest digits in
+/// exponent form when the decimal exponent is below -4 or at least 6.
+pub(crate) fn go_float_v(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "+Inf".into() } else { "-Inf".into() };
+    }
+    if f == 0.0 {
+        return if f.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    let sci = format!("{f:e}");
+    let (mantissa, exp) = sci.split_once('e').expect("exponent form");
+    let exp: i32 = exp.parse().expect("exponent");
+    if !(-4..6).contains(&exp) {
+        let sign = if exp < 0 { '-' } else { '+' };
+        return format!("{mantissa}e{sign}{:02}", exp.abs());
+    }
+    format!("{f}")
+}
+
+/// Metadata change for a successful refresh (`XAIExecutor.Refresh`).
+pub fn refresh_patch(
+    credential: &Credential,
+    tokens: &TokenData,
+    token_endpoint: &str,
+    now: DateTime<Utc>,
+) -> MetadataPatch {
+    let mut patch = MetadataPatch::default();
+    let mut set = |k: &str, v: Value| {
+        patch.set.insert(k.into(), v);
+    };
+    set("type", json!("xai"));
+    set("auth_kind", json!("oauth"));
+    set("access_token", json!(tokens.access_token));
+    for (key, value) in [
+        ("refresh_token", &tokens.refresh_token),
+        ("id_token", &tokens.id_token),
+        ("token_type", &tokens.token_type),
+        ("expired", &tokens.expire),
+        ("email", &tokens.email),
+        ("sub", &tokens.subject),
+    ] {
+        if !value.is_empty() {
+            set(key, json!(value));
+        }
+    }
+    if tokens.expires_in > 0 {
+        set("expires_in", json!(tokens.expires_in));
+    }
+    if !token_endpoint.is_empty() {
+        set("token_endpoint", json!(token_endpoint));
+    }
+    if metadata_string(credential, "base_url").is_empty() {
+        set("base_url", json!(DEFAULT_API_BASE_URL));
+    }
+    set("last_refresh", json!(rfc3339_utc(now)));
+    patch
+}
+
+/// Whether the background loop should refresh: a refresh token and expiry within the
+/// SDK lead (`RefreshSoon`; requests keep the current token).
+pub fn needs_refresh(credential: &Credential, now: DateTime<Utc>) -> bool {
+    !metadata_string(credential, "refresh_token").is_empty()
+        && crate::providers::helpers::refresh_due(
+            credential,
+            Some(chrono::Duration::from_std(REFRESH_LEAD).expect("lead fits")),
+            now,
+        )
+}
+
+/// `XAIExecutor.Refresh`: nothing to do without a refresh token.
+pub async fn refresh(auth: &XaiAuth, credential: &Credential) -> Result<MetadataPatch, ExecError> {
+    let refresh_token = metadata_string(credential, "refresh_token");
+    if refresh_token.is_empty() {
+        return Ok(MetadataPatch::default());
+    }
+    let token_endpoint = metadata_string(credential, "token_endpoint");
+    let tokens = auth.refresh(&refresh_token, &token_endpoint).await?;
+    Ok(refresh_patch(credential, &tokens, &token_endpoint, Utc::now()))
+}
+
+/// `--xai-login`: device flow through `requests.proxy-url`, then the credential file.
+pub async fn login(cfg: &Config, no_browser: bool) -> Result<PathBuf, ExecError> {
+    let proxy = cfg
+        .document
+        .get("requests")
+        .and_then(|r| r.get("proxy-url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let client = GoClients::new(Default::default()).get(&Proxy::parse(proxy));
+    login_with(XaiAuth::new(client), &cfg.auth_dir, no_browser).await
+}
+
+pub(crate) async fn login_with(auth: XaiAuth, auth_dir: &Path, no_browser: bool) -> Result<PathBuf, ExecError> {
+    println!("Starting xAI authentication...");
+    let code = auth.start_device_flow().await.map_err(|e| {
+        auth_error(
+            e.status,
+            format!("xai: failed to start device flow: {}", String::from_utf8_lossy(&e.body)),
+        )
+    })?;
+    let url = if code.verification_uri_complete.trim().is_empty() {
+        code.verification_uri.trim()
+    } else {
+        code.verification_uri_complete.trim()
+    };
+    print!("\nTo authenticate, please visit:\n{url}\n\n");
+    if !code.user_code.is_empty() {
+        print!("Then enter this code: {}\n\n", code.user_code);
+    }
+    if !no_browser && crate::providers::login::open_browser(url) {
+        println!("Browser opened automatically.");
+    }
+    println!("Waiting for authorization...");
+    if code.expires_in > 0 {
+        println!("(This will timeout in {} seconds if not authorized)", code.expires_in);
+    }
+    let tokens = auth
+        .poll(&code)
+        .await
+        .map_err(|e| auth_error(e.status, format!("xai: {}", String::from_utf8_lossy(&e.body))))?;
+    if tokens.access_token.trim().is_empty() {
+        return Err(auth_error(502, "xai token storage missing access token"));
+    }
+    println!("xAI authentication successful");
+    let record = login_record(
+        &tokens,
+        &rfc3339_utc(Utc::now()),
+        &code.token_endpoint,
+        Utc::now().timestamp_millis(),
+    );
+    let label = record.label.clone();
+    let directory = auth_dir.to_owned();
+    let path = tokio::task::spawn_blocking(move || {
+        let (path, legacy) =
+            save_login(&directory, record, crate::providers::login::write_private).map_err(|e| match e {
+                SaveError::Refused(reason) | SaveError::Conflict(reason) | SaveError::Unreadable(reason) => {
+                    auth_error(500, reason)
+                }
+                SaveError::Write(_) => auth_error(500, "xai: cannot write credential file"),
+            })?;
+        // Go removes the earlier file only after the canonical one is saved.
+        if let Some(legacy) = legacy {
+            std::fs::remove_file(&legacy).map_err(|_| {
+                auth_error(
+                    500,
+                    "cliproxy auth: canonical xAI credential saved but legacy credential cleanup failed",
+                )
+            })?;
+        }
+        Ok::<_, ExecError>(path)
+    })
+    .await
+    .map_err(|_| auth_error(500, "xai: credential publication failed"))??;
+    println!("Authentication saved to {}", path.display());
+    println!("Authenticated as {label}");
+    println!("xAI authentication successful!");
+    Ok(path)
+}
+
+#[cfg(test)]
+#[path = "xai_auth_tests.rs"]
+mod tests;

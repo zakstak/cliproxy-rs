@@ -68,8 +68,8 @@ fn locate_key(src: &str) -> Result<(String, &str), String> {
                 return Err(format!(
                     "unexpected character {} in variable name near {}",
                     // Go's string(byte) is the rune U+00XX, not the raw byte.
-                    cpa_common::gostr::quote(c.to_string()),
-                    cpa_common::gostr::quote(src)
+                    cliproxy_internal::text::quote(c.to_string()),
+                    cliproxy_internal::text::quote(src)
                 ));
             }
         }

@@ -1,7 +1,7 @@
 //! Go's OAuth tab (internal/tui/oauth_tab.go): starts a provider login through the v0
 //! `*-auth-url` routes, then polls `get-auth-status`; web flows take a pasted callback
 //! URL, device flows show the user code.
-use cpa_core::gostr::GoStr;
+use cliproxy_internal::text::GoStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

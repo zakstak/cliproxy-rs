@@ -50,4 +50,4 @@ The new suites specify useful contract families rather than claiming equality wi
 
 ## Verification
 
-Network-denied `cargo test --offline -p cpa-translate` passed after retirement (49 library tests and every integration suite). The final added ordinary additional-tool precedence test passed separately, bringing request-pair tests to 12. `cargo fmt -p cpa-translate` passes. Final network-denied `cargo clippy --offline -p cpa-translate --all-targets -- -D warnings` passed. Parent owns the final workspace-wide fmt/clippy/suite gates.
+Network-denied `cargo test --offline -p cliproxy-internal` passed after retirement (49 library tests and every integration suite). The final added ordinary additional-tool precedence test passed separately, bringing request-pair tests to 12. `cargo fmt -p cliproxy-internal` passes. Final network-denied `cargo clippy --offline -p cliproxy-internal --all-targets -- -D warnings` passed. Parent owns the final workspace-wide fmt/clippy/suite gates.

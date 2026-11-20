@@ -39,7 +39,7 @@ These features differ from Go:
 
 | Go setting or feature | In cliproxy-rs |
 | --- | --- |
-| `pprof` | Optional debug listener. CPU profiling needs the `cpa-server/pprof` build feature; Go runtime profiles return `501`. See [Configuration](CONFIGURATION.md#observability). |
+| `pprof` | Optional debug listener. CPU profiling needs the `cliproxy-internal/pprof` build feature; Go runtime profiles return `501`. See [Configuration](CONFIGURATION.md#observability). |
 | `management.panel-github-repository`, `management.disable-auto-update-panel`, `MANAGEMENT_STATIC_PATH` | The dashboard is built into the binary and never downloaded or read from disk. `management.disable-control-panel` is honoured. |
 | Config reload log summaries | The config is reloaded, but the changes are not summarised in the log. |
 

@@ -13,15 +13,10 @@ keywords = ["llm", "proxy", "openai", "claude-code", "codex"]
 categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
 
 [dependencies]
+cliproxy-internal.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
-cpa-common.workspace = true
-cpa-core.workspace = true
-cpa-exec.workspace = true
-cpa-home.workspace = true
-cpa-server.workspace = true
-cpa-store.workspace = true
 getrandom = "0.3"
 libc.workspace = true
 # The -tui management client: the crossterm backend only.
@@ -33,14 +28,13 @@ tokio.workspace = true
 tracing.workspace = true
 tokio-util = "0.7"
 futures-util.workspace = true
-# Already in the tree through axum and cpa-server; the heap-trim response hook.
+# Already in the tree through axum and the internal library; the heap-trim response hook.
 http-body = "1"
 tower = { version = "0.5", features = ["util"] }
-# Already in the tree through cpa-exec; the TUI client follows redirects itself.
+# Already in the tree through the internal library; the TUI client follows redirects itself.
 url = "2"
 # The TUI's management API client.
 wreq.workspace = true
 
 [dev-dependencies]
-cpa-exec = { workspace = true, features = ["test-support"] }
-cpa-home = { workspace = true, features = ["fake"] }
+cliproxy-internal = { workspace = true, features = ["test-support"] }

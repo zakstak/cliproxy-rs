@@ -33,7 +33,7 @@ mod sys;
 mod widgets;
 
 pub use client::{Client, Object};
-pub use cpa_server::logging::LogHook;
+pub use cliproxy_internal::gateway::logging::LogHook;
 
 /// Bubble Tea `tea.Cmd`: work whose result comes back as a message.
 pub type Cmd = Pin<Box<dyn Future<Output = Msg> + Send>>;

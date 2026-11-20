@@ -1,6 +1,6 @@
 //! Go's logs tab (internal/tui/logs_tab.go): the embedded server's log hook in
 //! standalone mode, else `GET /logs` every two seconds.
-use cpa_core::gostr::GoStr;
+use cliproxy_internal::text::GoStr;
 use std::sync::Arc;
 use std::time::Duration;
 

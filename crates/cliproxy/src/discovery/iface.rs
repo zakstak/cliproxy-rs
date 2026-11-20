@@ -75,7 +75,7 @@ pub fn is_likely_physical_lan(name: &str) -> bool {
 /// Go `matchesAny`: case-insensitive names, `prefix*` wildcards.
 pub fn matches_any(name: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|p| {
-        let p = cpa_common::gostr::lower_bytes(super::go_trim(p).as_bytes());
+        let p = cliproxy_internal::text::lower_bytes(super::go_trim(p).as_bytes());
         match p.strip_suffix('*') {
             _ if p.is_empty() => false,
             Some(prefix) => name.starts_with(prefix),
@@ -89,7 +89,7 @@ pub fn filter_from(all: Vec<Iface>, include: &[String], exclude: &[String]) -> V
     all.into_iter()
         .filter(|i| i.up && !i.loopback && !i.point_to_point && i.multicast)
         .filter(|i| {
-            let name = cpa_common::gostr::lower_bytes(i.name.as_bytes());
+            let name = cliproxy_internal::text::lower_bytes(i.name.as_bytes());
             if !exclude.is_empty() && matches_any(&name, exclude) {
                 return false;
             }

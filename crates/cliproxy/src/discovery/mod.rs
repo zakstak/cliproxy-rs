@@ -1,7 +1,7 @@
 //! LAN discovery over mDNS / DNS-SD (Go `internal/discovery`, `internal/cmd/discover.go`
 //! and `sdk/cliproxy/discovery_advertiser.go`): the `discover` command and the server's
 //! opt-in `_ai-gateway._tcp` advertisement.
-use cpa_core::gostr::GoStr;
+use cliproxy_internal::text::GoStr;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -113,7 +113,7 @@ pub fn build_txt_records(opts: &TxtOptions) -> Vec<String> {
 /// Go `strings.TrimSpace` (Unicode White_Space).
 pub(crate) fn go_trim(s: &str) -> &str {
     // Trimming whole whitespace characters keeps valid UTF-8 valid.
-    std::str::from_utf8(cpa_core::config::go_trim_space(s.as_bytes())).unwrap_or(s)
+    std::str::from_utf8(cliproxy_internal::config::go_trim_space(s.as_bytes())).unwrap_or(s)
 }
 
 /// Go `ParseTXTRecords`: keys trimmed and lowercased, last duplicate wins.
@@ -121,7 +121,7 @@ pub fn parse_txt_records(txt: &[String]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for entry in txt {
         let (key, value) = entry.split_once('=').unwrap_or((entry, ""));
-        let key = cpa_common::gostr::lower_bytes(go_trim(key).as_bytes());
+        let key = cliproxy_internal::text::lower_bytes(go_trim(key).as_bytes());
         if !key.is_empty() {
             out.insert(key, value.to_owned());
         }
@@ -288,14 +288,14 @@ pub fn validate_service_type(st: &str) -> Result<(), String> {
 }
 
 fn go_quote(s: &str) -> String {
-    cpa_common::gostr::quote(s)
+    cliproxy_internal::text::quote(s)
 }
 
 /// `%q` of a rune.
 fn go_rune_quote(c: char) -> String {
     match c {
         '\'' => "'\\''".into(),
-        c if cpa_common::gostr::is_print(c) => format!("'{c}'"),
+        c if cliproxy_internal::text::is_print(c) => format!("'{c}'"),
         c => {
             let q = go_quote(&c.to_string());
             format!("'{}'", &q[1..q.len() - 1])

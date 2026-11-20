@@ -7,7 +7,7 @@ reopen the decision. Paths refer to this repository.
 
 Two rules decide most of these. The proxy stays transparent to providers: beyond the
 rewrites it already carries, such as Claude cloaking
-(`crates/cpa-exec/src/claude/cloak.rs`), it adds no new tools, instructions or replayed
+(`crates/cliproxy-internal/src/providers/claude/cloak.rs`), it adds no new tools, instructions or replayed
 provider content to requests. And a feature needs a retained client or deployment that
 uses it.
 
@@ -19,7 +19,7 @@ are missing.
 
 Rust has no web-search result cache. Its only web-search edit removes empty
 `allowed_domains` and `blocked_domains` lists from `web_search_*` tools
-(`sanitize_for_upstream` in `crates/cpa-exec/src/claude.rs`). The fixes have nothing to
+(`sanitize_for_upstream` in `crates/cliproxy-internal/src/providers/claude.rs`). The fixes have nothing to
 apply to.
 
 **Reason:** adding the cache would make the proxy send provider content from an earlier
@@ -34,9 +34,9 @@ Go stores the date pinned to each cloaked Claude session in a bbolt key-value st
 the pin survives a restart.
 
 Rust keeps the pin in the session's in-memory continuity entry (`pin_date` in
-`crates/cpa-exec/src/claude/session.rs`). The entry expires an hour after the session's
+`crates/cliproxy-internal/src/providers/claude/session.rs`). The entry expires an hour after the session's
 last request and is evicted at 4,096 entries. Only cloaked requests read the pin
-(`crates/cpa-exec/src/claude.rs`, the `pin_date` call inside the `cloak` branch).
+(`crates/cliproxy-internal/src/providers/claude.rs`, the `pin_date` call inside the `cloak` branch).
 
 **Reason:** a lost pin matters only for a cloaked session that started on an earlier date
 and continues after a restart. That session loses its cached prefix once. Persistence
@@ -52,7 +52,7 @@ Go adds a Muse reminder decision tool to every Muse request that carries tools.
 
 Rust's Meta executor edits tools the caller sent, for example removing
 `search_content_types` from `web_search` tools, which Meta rejects. It adds no tools and
-has no Muse reminder tool (`crates/cpa-exec/src/meta.rs`).
+has no Muse reminder tool (`crates/cliproxy-internal/src/providers/meta.rs`).
 
 **Reason:** the proxy would add a tool the caller did not send. That breaks provider
 transparency. Go cites one Muse 1.4.12 capture; no checked official source says the tool
@@ -71,9 +71,9 @@ never expire, and its receipts contain the new credentials.
 Rust has no durable refresh journal. On one node, a Codex refresh runs as one transaction
 under a per-credential preparation lock and the credential file's `<file>.lock`, reads the
 file again under that lock, and adopts tokens another process already rotated
-(`refresh_codex_file` in `crates/cpa-server/src/runtime.rs`). Shutdown waits for a grant
+(`refresh_codex_file` in `crates/cliproxy-internal/src/runtime/mod.rs`). Shutdown waits for a grant
 in flight to be written. Claude refresh is single-flighted per token endpoint and refresh
-token (`crates/cpa-exec/src/oauth.rs`). A4
+token (`crates/cliproxy-internal/src/providers/oauth.rs`). A4
 ([#92](https://github.com/zakstak/cliproxy-rs/issues/92)) made renewal and quarantine
 correct. A crash between the refresh request and the file write can still lose the new
 tokens.
@@ -93,9 +93,9 @@ of all requests follows its weight.
 
 Rust's `weighted-round-robin` advances its counters only on requests it picks itself.
 A request bound to an account by session affinity skips the pick (`pick_legacy` and the
-LCP branch in `crates/cpa-server/src/scheduler.rs`). With affinity on, weights split new
+LCP branch in `crates/cliproxy-internal/src/runtime/scheduler.rs`). With affinity on, weights split new
 conversations, not requests. The default strategy is `soonest-reset`
-(`crates/cpa-server/src/scheduler.rs`, [Several accounts](MULTI-ACCOUNT.md)).
+(`crates/cliproxy-internal/src/runtime/scheduler.rs`, [Several accounts](MULTI-ACCOUNT.md)).
 
 **Reason:** no deployment of this fork uses weighted routing; they use the
 `soonest-reset` default. Request-level fairness under affinity needs its own state model
@@ -111,10 +111,10 @@ negotiates downstream WebSocket compression, and resends a request uncompressed 
 400 or 415.
 
 Rust already decodes compressed traffic on these paths: zstd client request bodies on the
-OpenAI-format routes (`decode_body` in `crates/cpa-server/src/openai.rs`), compressed upstream responses
-(`crates/cpa-exec/src/upstream.rs`) and permessage-deflate frames on the upstream Codex
-socket (`crates/cpa-exec/src/codex_ws_deflate.rs`). It sends upstream requests and
-downstream responses uncompressed (`hop_by_hop` in `crates/cpa-server/src/respond.rs`
+OpenAI-format routes (`decode_body` in `crates/cliproxy-internal/src/gateway/openai.rs`), compressed upstream responses
+(`crates/cliproxy-internal/src/providers/upstream.rs`) and permessage-deflate frames on the upstream Codex
+socket (`crates/cliproxy-internal/src/providers/codex_ws_deflate.rs`). It sends upstream requests and
+downstream responses uncompressed (`hop_by_hop` in `crates/cliproxy-internal/src/gateway/respond.rs`
 drops `Content-Encoding`). A zstd body from the first-party Codex client
 ([Codex contract](codex/CONTRACT.md#transport-matrix)) is decoded and sent upstream
 uncompressed.
@@ -132,9 +132,9 @@ Go can give each API key its own upstream connection pool. It later disabled def
 connection reuse for Claude (Go `2c5b01f4`).
 
 Rust shares clients per effective proxy in a bounded 64-entry LRU, not per credential
-(`crates/cpa-exec/src/proxy.rs`, `crates/cpa-exec/src/tls.rs`). Codex reuses chatgpt.com
+(`crates/cliproxy-internal/src/providers/proxy.rs`, `crates/cliproxy-internal/src/providers/tls.rs`). Codex reuses chatgpt.com
 connections by default since [#151](https://github.com/zakstak/cliproxy-rs/pull/151)
-(`CHATGPT_KEEP_ALIVE_DEFAULT` in `crates/cpa-exec/src/codex_request.rs`).
+(`CHATGPT_KEEP_ALIVE_DEFAULT` in `crates/cliproxy-internal/src/providers/codex_request.rs`).
 
 **Reason:** no measured benefit. One pool per credential grows connections and file
 descriptors with every rotated or added account, and needs retirement rules for each.
@@ -148,7 +148,7 @@ Go adds planned rebalance handoff between Home nodes, latency probes, reused-tur
 and release fencing.
 
 Rust's Home mode is a node that takes its config and credential dispatch from a Home
-control plane (`crates/cpa-home/src/lib.rs`). It has none of these coordination messages.
+control plane (`crates/cliproxy-internal/src/home/mod.rs`). It has none of these coordination messages.
 
 **Reason:** this is an extra-large distributed-systems feature that needs a mixed-version
 protocol design. No deployment of this fork runs a multi-node Home cluster.
@@ -179,7 +179,7 @@ The OpenAI Responses WebSocket guide documents concurrent named lanes on one soc
 selected by `stream_id`.
 
 Rust has no `stream_id` state. A Codex socket has one queue of pending creates, and a
-`response.created` starts the oldest one (`crates/cpa-exec/src/codex_duplex.rs`). The
+`response.created` starts the oldest one (`crates/cliproxy-internal/src/providers/codex_duplex.rs`). The
 [Codex contract](codex/CONTRACT.md#transport-matrix) lists lanes as not used by the pinned
 client.
 

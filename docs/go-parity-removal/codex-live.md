@@ -1,6 +1,6 @@
 # Realtime Codex migration ledger
 
-Only `crates/cpa-exec/src/codex_live_tests.rs` changed in this additional assignment. Production behavior remains unchanged. The former file read 844 Go-produced output cases across 19 operation kinds. The replacement reads no fixture and constructs every input and expectation by hand.
+Only `crates/cliproxy-internal/src/providers/codex_live_tests.rs` changed in this additional assignment. Production behavior remains unchanged. The former file read 844 Go-produced output cases across 19 operation kinds. The replacement reads no fixture and constructs every input and expectation by hand.
 
 `docs/codex/CONTRACT.md` places realtime outside the Responses payload contract. The tests state that distinction and cite RFC 8866, RFC 7578, RFC 2045 section 6.7, the OpenAI realtime WebRTC guide, and the client-secret API reference. Codex model aliases, legacy sideband paths, default expiry, and error variants are explicit existing proxy policy. These tests do not claim that Go or the Responses client defines realtime behavior.
 
@@ -45,6 +45,6 @@ The tests prove local shaping and security/resource behavior only. They send no 
 
 ## Verification
 
-`unshare --user --map-root-user --net sh -c 'ip link set lo up; CMAKE=/home/zak/.local/share/mise/installs/cmake/4.5.0/cmake-4.5.0-linux-x86_64/bin/cmake CARGO_BUILD_JOBS=2 nice -n 19 cargo test --offline -p cpa-exec --lib codex_live::tests'`
+`unshare --user --map-root-user --net sh -c 'ip link set lo up; CMAKE=/home/zak/.local/share/mise/installs/cmake/4.5.0/cmake-4.5.0-linux-x86_64/bin/cmake CARGO_BUILD_JOBS=2 nice -n 19 cargo test --offline -p cliproxy-internal --lib codex_live::tests'`
 
 Final outcome: 23 passed, 0 failed. `rustfmt --edition 2024` and `git diff --check` passed for the changed file. Log: `/tmp/cliproxy-parity-migration/codex-live-tests.log`.
