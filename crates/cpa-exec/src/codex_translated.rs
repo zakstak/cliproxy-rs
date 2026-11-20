@@ -39,6 +39,7 @@ pub(crate) fn route(view: &View<'_>, req: &ExecRequest) -> bool {
 /// `reasoning`, then the routed `model` and `stream: true`.
 pub(crate) fn upstream_body(req: &ExecRequest, model: &str) -> Result<String, ExecError> {
     let ctx = cpa_translate::RequestCtx {
+        registry: req.registry.as_deref(),
         model,
         stream: true,
         tool_search: false,
@@ -61,6 +62,7 @@ pub(crate) fn upstream_body(req: &ExecRequest, model: &str) -> Result<String, Ex
         .as_ref()
         .map(|r| cpa_common::thinking::ModelCaps::from(&r.info));
     let thought = cpa_common::thinking::apply_request_thinking(&cpa_common::thinking::RequestThinking {
+        registry: req.registry.as_deref(),
         body: &translated,
         payload: &req.body,
         original: &req.original_body,

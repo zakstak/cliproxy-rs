@@ -22,6 +22,7 @@ fn chain(query: &str, repeats: usize) -> Vec<u8> {
 
 fn translate(body: &[u8]) -> Value {
     let ctx = RequestCtx {
+        registry: None,
         model: "claude-test",
         stream: true,
         tool_search: false,

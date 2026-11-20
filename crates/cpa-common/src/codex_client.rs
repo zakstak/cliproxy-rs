@@ -65,13 +65,13 @@ impl Settings {
 
 /// Go's Responses handlers (`prepareCodexMultiAgentV2Tools`, then
 /// `prepareCodexOrphanDelegation`) on a request body before dispatch.
-pub fn prepare_responses_request(headers: &HeaderMap, payload: &[u8], settings: &Settings) -> Vec<u8> {
-    let (prepared, _) = prepare_tools(
-        headers,
-        payload,
-        settings.optimize_multi_agent_v2,
-        served_spawn_agent_models,
-    );
+pub fn prepare_responses_request(
+    headers: &HeaderMap,
+    payload: &[u8],
+    settings: &Settings,
+    models: impl FnOnce() -> String,
+) -> Vec<u8> {
+    let (prepared, _) = prepare_tools(headers, payload, settings.optimize_multi_agent_v2, models);
     rewrite_orphan_delegation_input(headers, &prepared, settings.orphan_delegation)
 }
 
@@ -83,13 +83,14 @@ pub fn prepare_responses_request_if_changed(
     headers: &HeaderMap,
     payload: &[u8],
     settings: &Settings,
+    models: impl FnOnce() -> String,
 ) -> Option<Vec<u8>> {
     let tools = multi_agent_client(headers, settings.optimize_multi_agent_v2);
     let orphan = settings.orphan_delegation && folds_to_ascii(&header(headers, "x-openai-subagent"), "collab_spawn");
     if !tools && !orphan {
         return None;
     }
-    let prepared = prepare_responses_request(headers, payload, settings);
+    let prepared = prepare_responses_request(headers, payload, settings, models);
     (prepared != payload).then_some(prepared)
 }
 
@@ -840,44 +841,6 @@ fn format_models(models: &[SpawnModel]) -> String {
 /// registry `lookup`.
 pub fn spawn_agent_models(available: &[AvailableModel], lookup: &dyn Fn(&str) -> Option<ModelFacts>) -> String {
     format_models(&spawn_models(available, lookup))
-}
-
-/// [`spawn_agent_models`] for the models the installed registry serves now.
-// ponytail: Go caches the list per catalog revision and registry generation; it is
-// rebuilt per request here, only when the optimization is on and a spawn_agent tool is
-// present.
-pub fn served_spawn_agent_models() -> String {
-    let available: Vec<AvailableModel> = cpa_core::registry::available_models()
-        .into_iter()
-        .map(|m| {
-            let field = |k: &str| {
-                m.raw
-                    .get(k)
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            AvailableModel {
-                display_name: field("display_name"),
-                description: field("description"),
-                id: m.id,
-            }
-        })
-        .collect();
-    spawn_agent_models(&available, &registry_facts)
-}
-
-/// `registry.LookupModelInfo` as the facts the model list reads.
-pub fn registry_facts(id: &str) -> Option<ModelFacts> {
-    cpa_core::registry::lookup_model(id, None).map(|m| ModelFacts {
-        description: m
-            .raw
-            .get("description")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        thinking_levels: m.thinking.map(|t| t.levels).unwrap_or_default(),
-    })
 }
 
 /// `replaceCodexSpawnAgentModels`: one model section, placed on the line that holds

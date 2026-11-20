@@ -6,6 +6,7 @@ use crate::json::Kind;
 use super::{ModelCaps, lookup_model_info, parse_suffix};
 use super::{is_empty_object, with_bool, with_int, with_str, without};
 use crate::json;
+use cpa_core::registry::dynamic::Registry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SummaryMode {
@@ -164,25 +165,38 @@ pub fn extract_translated_summary_config(body: &[u8], source_format: &str, targe
 }
 
 /// `ApplyTranslatedSummaryToClaude`.
-pub fn apply_translated_summary_to_claude(out: &[u8], source: &[u8], source_format: &str, model: &str) -> Vec<u8> {
+pub fn apply_translated_summary_to_claude(
+    registry: Option<&Registry>,
+    out: &[u8],
+    source: &[u8],
+    source_format: &str,
+    model: &str,
+) -> Vec<u8> {
     let config = extract_translated_summary_config(source, source_format, "claude");
     if config.mode == SummaryMode::Unspecified {
         return out.to_vec();
     }
-    apply_summary_config_for_model(out, "claude", model, config)
+    apply_summary_config_for_model(registry, out, "claude", model, config)
 }
 
 /// `ApplySummaryConfig`.
 pub fn apply_summary_config(body: &[u8], format: &str, config: SummaryConfig) -> Vec<u8> {
-    apply_summary_config_for_model(body, format, "", config)
+    apply_summary_config_for_model(None, body, format, "", config)
 }
 
 /// `ApplySummaryConfigForModel`.
-pub fn apply_summary_config_for_model(body: &[u8], format: &str, model: &str, config: SummaryConfig) -> Vec<u8> {
-    apply_summary_config_for_provider(body, format, model, "", None, config)
+pub fn apply_summary_config_for_model(
+    registry: Option<&Registry>,
+    body: &[u8],
+    format: &str,
+    model: &str,
+    config: SummaryConfig,
+) -> Vec<u8> {
+    apply_summary_config_for_provider(registry, body, format, model, "", None, config)
 }
 
 pub(crate) fn apply_summary_config_for_provider(
+    registry: Option<&Registry>,
     body: &[u8],
     format: &str,
     model: &str,
@@ -207,7 +221,7 @@ pub(crate) fn apply_summary_config_for_provider(
         }
         "claude" => {
             if enabled && !json::get(&body, "thinking.type").exists() {
-                body = enable_claude_thinking_for_summary(&body, model, info);
+                body = enable_claude_thinking_for_summary(registry, &body, model, info);
             }
             if !claude_accepts_display(&body) {
                 return body;
@@ -393,7 +407,12 @@ pub(crate) fn strip_inferred_claude_summary_activation(body: &[u8], info: Option
     body
 }
 
-fn enable_claude_thinking_for_summary(body: &[u8], model: &str, resolved: Option<&ModelCaps>) -> Vec<u8> {
+fn enable_claude_thinking_for_summary(
+    registry: Option<&Registry>,
+    body: &[u8],
+    model: &str,
+    resolved: Option<&ModelCaps>,
+) -> Vec<u8> {
     let looked_up;
     let info = match resolved {
         Some(info) => Some(info),
@@ -402,7 +421,7 @@ fn enable_claude_thinking_for_summary(body: &[u8], model: &str, resolved: Option
             if base.is_empty() {
                 base = parse_suffix(&json::get(body, "model").str()).model_name;
             }
-            looked_up = lookup_model_info(&base, "claude");
+            looked_up = lookup_model_info(registry, &base, "claude");
             looked_up.as_ref()
         }
     };

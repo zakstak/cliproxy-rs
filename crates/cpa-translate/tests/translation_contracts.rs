@@ -61,6 +61,7 @@ fn openai_passthrough_is_byte_oriented() {
     assert!(s.event(b"data: {}\n\n").unwrap().is_empty(), "nothing after [DONE]");
     let body = b"{\"model\":\"m\",\"x\":\"\xff\"}";
     let req = RequestCtx {
+        registry: None,
         model: "m",
         stream: true,
         system_turns: false,
@@ -81,6 +82,7 @@ fn registry_adapters_and_unregistered_model_rewrites_are_explicit() {
     assert!(pair(Format::Claude, Format::Claude).is_none());
     // Unregistered pairs fall back to a model rewrite only.
     let ctx = RequestCtx {
+        registry: None,
         model: "new",
         system_turns: false,
         stream: false,
@@ -108,6 +110,7 @@ fn deeply_nested_client_bodies_translate_without_overflowing() {
     ]
     .concat();
     let ctx = RequestCtx {
+        registry: None,
         system_turns: false,
         model: "gpt-test",
         stream: false,

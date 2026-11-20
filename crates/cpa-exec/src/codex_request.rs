@@ -1043,6 +1043,7 @@ mod tests {
                 source: "",
                 provider: String::new(),
             },
+            registry: None,
             resolved_model: None,
             usage: Default::default(),
         };

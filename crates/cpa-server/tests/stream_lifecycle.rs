@@ -115,7 +115,6 @@ async fn proxy(upstream: &str, extra: &str) -> (String, Arc<cpa_server::Runtime>
         xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
-    cpa_server::install_registry(&rt);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let app = cpa_server::router(rt.clone());

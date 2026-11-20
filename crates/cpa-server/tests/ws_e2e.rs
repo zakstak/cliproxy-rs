@@ -700,11 +700,6 @@ async fn run_scenario(name: &str, scenario: &Value) -> Arc<cpa_server::runtime::
         xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(cfg, credentials, executors));
-    // Like main.rs (and Go's global registry): translators and the Codex client rewrites
-    // read this runtime's models. One scenario at a time owns the process-wide overlay.
-    static REGISTRY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _registry = REGISTRY.lock().await;
-    cpa_server::install_registry(&rt);
     let proxy = serve(router(rt.clone())).await;
 
     let mut request = wreq::Client::new().websocket(format!("ws://{proxy}/v1/responses"));

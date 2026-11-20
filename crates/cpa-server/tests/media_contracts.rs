@@ -785,7 +785,6 @@ async fn replay(tag: &str, fixture: &Fixture) {
         xai: Default::default(),
     };
     let rt = Arc::new(cpa_server::testing::runtime(config, credentials, executors));
-    cpa_server::install_registry(&rt);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router(rt)).await.unwrap() });

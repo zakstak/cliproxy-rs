@@ -82,6 +82,7 @@ fn request(native: bool, headers: &[(&str, &str)]) -> ExecRequest {
         session: None,
         execution_session: Some("conn-identity".into()),
         derived_session: None,
+        registry: None,
         resolved_model: None,
         usage: Default::default(),
         request_path: String::new(),

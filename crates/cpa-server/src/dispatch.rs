@@ -1097,6 +1097,7 @@ async fn run_routed(
         session: session.id,
         execution_session: call.execution_session.clone(),
         derived_session: session.derived,
+        registry: Some(registry.clone()),
         resolved_model: None,
         usage: cpa_core::exec::UsageSink::default().with_capture(trace.2.clone()),
         request_path: call.request_path.clone(),
@@ -2958,6 +2959,7 @@ mod tests {
                 source: "",
                 provider: String::new(),
             },
+            registry: None,
             resolved_model: None,
             usage: Default::default(),
         };

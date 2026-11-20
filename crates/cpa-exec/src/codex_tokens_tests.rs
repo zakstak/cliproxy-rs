@@ -34,6 +34,7 @@ fn request(v: &Value) -> ExecRequest {
         execution_session: None,
         derived_session: None,
         request_path: String::new(),
+        registry: None,
         resolved_model: None,
         usage: Default::default(),
         caller: Caller {

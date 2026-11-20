@@ -15,6 +15,7 @@ use cpa_translate::{RequestCtx, codex_request, responses_to_chat_completions_bod
 use serde_json::{Value, json};
 
 const CTX: RequestCtx<'static> = RequestCtx {
+    registry: None,
     model: "grok-4.7",
     stream: false,
     tool_search: false,
@@ -168,6 +169,7 @@ fn claude_receives_developer_text_as_system_instructions() {
     let raw = serde_json::to_vec(&responses_body(true)).unwrap();
     let chat = responses_to_chat_completions_body("claude-sonnet-4-5", &raw, false);
     let ctx = RequestCtx {
+        registry: None,
         model: "claude-sonnet-4-5",
         ..CTX
     };

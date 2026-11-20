@@ -119,6 +119,7 @@ fn translate(
         req.source_format,
         to,
         &RequestCtx {
+            registry: req.registry.as_deref(),
             model,
             stream,
             tool_search: false,
@@ -169,6 +170,7 @@ pub(crate) async fn prepare(
     let original_translated = preserve_output_controls(original_translated, &original_payload, req.source_format);
     let body = preserve_output_controls(body, &req.body, req.source_format);
     let mut body = thinking::apply_request_thinking(&RequestThinking {
+        registry: req.registry.as_deref(),
         body: &body,
         payload: &req.body,
         original: &original_payload,

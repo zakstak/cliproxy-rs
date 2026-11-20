@@ -338,6 +338,7 @@ fn continuation_result_keeps_the_paused_search_id() {
 fn claude_request(model: &str, input: Value) -> Value {
     let body = json!({"model": model, "input": input}).to_string();
     let ctx = RequestCtx {
+        registry: None,
         model,
         stream: true,
         tool_search: false,

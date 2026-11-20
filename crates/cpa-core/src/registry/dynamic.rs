@@ -1,7 +1,6 @@
 //! Dynamic model registry: which credential serves which public model ID, derived from
 //! the credential set and config (sdk/cliproxy/service_models.go,
-//! internal/registry/model_registry.go). The server builds it on demand and publishes
-//! it through [`super::install_overlay`].
+//! internal/registry/model_registry.go). Each runtime builds its own snapshot on demand.
 //!
 //! The static catalog is `cpa_core::registry::pinned()`. Each enabled credential
 //! registers its provider's channel (or its configured `models`), minus exclusions, plus

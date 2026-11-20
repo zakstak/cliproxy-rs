@@ -214,6 +214,7 @@ fn request(turn: &Value, session: &str, usage: cpa_core::exec::UsageSink) -> Exe
             .map(|id| cpa_common::session::bound_session_identity(&id)),
         execution_session: Some(session.to_owned()),
         derived_session: None,
+        registry: None,
         resolved_model: None,
         usage,
         request_path: "/v1/responses".into(),

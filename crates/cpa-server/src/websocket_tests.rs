@@ -799,8 +799,9 @@ async fn uninterrupted_claude_turns_send_masters_bytes() {
         .await
     };
     let dir = std::env::temp_dir().join(format!("cpa-ws-claude-{}", uuid::Uuid::new_v4()));
+    // Use the catalog registration whose 128k completion limit the recorded turns exercise.
     let cfg = Config::parse(&format!(
-        "auth-dir: {}\nclaude-api-key:\n  - api-key: sk-FAKE\n    base-url: http://{upstream}\n    models:\n      - name: claude-opus-5-5\n",
+        "auth-dir: {}\nclaude-api-key:\n  - api-key: sk-FAKE\n    base-url: http://{upstream}\n",
         dir.join("auths").display()
     ))
     .unwrap();
