@@ -11,6 +11,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use cpa_common::gostr::values_encode;
 use cpa_common::json::{self as gj, GoValue};
 use cpa_core::config::credentials::canonical_metadata_key;
 use cpa_core::exec::{ExecError, FailureScope};
@@ -20,7 +21,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::helpers::rfc3339_utc;
-use crate::login::{form, open_browser, write_private};
+use crate::login::{open_browser, write_private};
 use crate::meta_wire::{Slot, check_valid, unmarshal};
 use crate::proxy::{GoHeaders, MAX_ERROR_BODY, read_all, send};
 
@@ -285,7 +286,7 @@ impl MetaAuth {
             .post(
                 &self.device_url,
                 Self::form_headers(),
-                form(&[("client_id", CLIENT_ID)]),
+                values_encode(&[("client_id", CLIENT_ID)]),
             )
             .await
             .map_err(|e| format!("meta device flow: request failed: {e}"))?;
@@ -331,7 +332,7 @@ impl MetaAuth {
                 _ = tokio::time::sleep_until(deadline) => return Err(timed_out()),
                 _ = tick.tick() => {}
             }
-            let body = form(&[
+            let body = values_encode(&[
                 ("grant_type", DEVICE_GRANT),
                 ("device_code", &code.device_code),
                 ("client_id", CLIENT_ID),

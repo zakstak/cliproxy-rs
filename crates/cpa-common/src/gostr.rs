@@ -66,7 +66,10 @@ mod tests {
     #[test]
     fn form_encoding_escapes_delimiters_utf8_and_spaces() {
         assert_eq!(query_escape("a b/c?d=é~"), "a+b%2Fc%3Fd%3D%C3%A9~");
-        assert_eq!(values_encode(&[("z", "1"), ("a b", "x&y")]), "a+b=x%26y&z=1");
+        assert_eq!(
+            values_encode(&[("é", ""), ("a b", "+~*"), ("a b", "x&y")]),
+            "a+b=%2B~%2A&a+b=x%26y&%C3%A9="
+        );
         for plain in ["", "abcXYZ012-_.~"] {
             assert_eq!(query_escape(plain), plain);
         }

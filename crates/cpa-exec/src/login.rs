@@ -1,31 +1,6 @@
-//! Helpers shared by the device and browser login flows (Meta, xAI): Go form encoding,
-//! private credential writes and opening the desktop browser.
+//! Private credential writes and browser launching for device and browser login flows.
 
 use std::path::Path;
-
-/// Go `url.QueryEscape` for form bodies.
-fn query_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// Go `url.Values.Encode`: keys sorted.
-pub(crate) fn form(pairs: &[(&str, &str)]) -> String {
-    let mut pairs = pairs.to_vec();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{}={}", query_escape(k), query_escape(v)))
-        .collect::<Vec<_>>()
-        .join("&")
-}
 
 /// Writes a credential file atomically with mode 0600 in a 0700 directory.
 ///

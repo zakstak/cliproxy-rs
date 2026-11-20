@@ -13,7 +13,7 @@ use std::time::Duration;
 use base64::Engine;
 use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
-use cpa_common::gostr::{GoStr, quote};
+use cpa_common::gostr::{GoStr, quote, values_encode};
 use cpa_common::json::{self as gj, GoValue, Kind};
 use cpa_core::config::Config;
 use cpa_core::config::credentials::canonical_metadata_key;
@@ -64,30 +64,6 @@ pub fn validate_endpoint(raw: &str, field: &str) -> Result<String, String> {
         return Err(format!("xai discovery {field} host {} is not on x.ai", quote(&host)));
     }
     Ok(raw.to_owned())
-}
-
-/// Go `url.QueryEscape`.
-fn query_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// Go `url.Values.Encode`: keys sorted.
-fn form(pairs: &[(&str, &str)]) -> String {
-    let mut pairs = pairs.to_vec();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-    pairs
-        .iter()
-        .map(|(k, v)| format!("{}={}", query_escape(k), query_escape(v)))
-        .collect::<Vec<_>>()
-        .join("&")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -452,7 +428,10 @@ impl XaiAuth {
             ));
         }
         let (status, body) = self
-            .post_form(device_endpoint, form(&[("client_id", CLIENT_ID), ("scope", SCOPE)]))
+            .post_form(
+                device_endpoint,
+                values_encode(&[("client_id", CLIENT_ID), ("scope", SCOPE)]),
+            )
             .await
             .map_err(|_| fail("xai device code request failed".into()))?;
         if status != 200 {
@@ -505,7 +484,7 @@ impl XaiAuth {
         interval: &mut Duration,
     ) -> Result<Option<TokenData>, ExecError> {
         let fail = |m: String| auth_error(400, m);
-        let body = form(&[
+        let body = values_encode(&[
             ("client_id", CLIENT_ID),
             ("device_code", device_code.trim()),
             ("grant_type", DEVICE_GRANT),
@@ -619,7 +598,7 @@ impl XaiAuth {
 
     /// `refreshTokensSingleFlight` + `postTokenForm`.
     async fn refresh_once(&self, refresh_token: &str, token_endpoint: &str) -> Result<TokenData, ExecError> {
-        let body = form(&[
+        let body = values_encode(&[
             ("client_id", CLIENT_ID),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
