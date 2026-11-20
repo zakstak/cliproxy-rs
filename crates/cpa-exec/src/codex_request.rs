@@ -596,7 +596,8 @@ pub(crate) fn custom_headers(view: &View<'_>, client: &HeaderMap) -> Vec<(String
 /// except identity and credential headers ([`identity::model_override_permitted`]). The
 /// pinned catalog gives `gpt-5.6-luna` a `codex-tui` macOS identity, which #26 removes.
 fn model_overrides(model: &str) -> Vec<(String, String)> {
-    let Some(info) = cpa_core::registry::pinned().lookup(model) else {
+    let catalog = cpa_core::registry::pinned();
+    let Some(info) = catalog.lookup(model) else {
         return Vec::new();
     };
     info.raw
