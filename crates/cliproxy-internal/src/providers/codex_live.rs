@@ -1184,24 +1184,14 @@ fn dial_text(error: &wreq::Error) -> String {
 
 /// Go `mime/multipart.Reader` and `textproto.readMIMEHeader` over a body already in
 /// memory, as `multipartCallRequest` walks it: `NextPart` then `io.ReadAll(part)`.
-// ponytail: based on gateway's management multipart reader (the most Go-accurate of
-// the three in the tree) plus `NextPart`'s quoted-printable decoding and header limits.
-// Share the reader after unifying its quoted-printable, header and body-limit policies.
 mod form {
     use super::MediaType;
+    use crate::protocol::multipart::{Boundary, read_line};
 
     pub struct Reader<'a> {
         buf: &'a [u8],
         pos: usize,
-        nl: &'static [u8],
-        dash_boundary: Vec<u8>,
-        parts_read: usize,
-    }
-
-    enum Scan {
-        Data,
-        End,
-        UnexpectedEof,
+        boundary: Boundary,
     }
 
     impl<'a> Reader<'a> {
@@ -1209,50 +1199,17 @@ mod form {
             Self {
                 buf,
                 pos: 0,
-                nl: b"\r\n",
-                dash_boundary: format!("--{boundary}").into_bytes(),
-                parts_read: 0,
+                boundary: Boundary::new(boundary),
             }
-        }
-
-        fn read_slice(&mut self) -> (&'a [u8], bool) {
-            let rest = &self.buf[self.pos..];
-            match rest.iter().position(|&b| b == b'\n') {
-                Some(i) => {
-                    self.pos += i + 1;
-                    (&rest[..=i], false)
-                }
-                None => {
-                    self.pos = self.buf.len();
-                    (rest, true)
-                }
-            }
-        }
-
-        fn is_final_boundary(&self, line: &[u8]) -> bool {
-            let mut dash_dash = self.dash_boundary.clone();
-            dash_dash.extend_from_slice(b"--");
-            line.strip_prefix(dash_dash.as_slice())
-                .map(skip_lwsp)
-                .is_some_and(|rest| rest.is_empty() || rest == self.nl)
-        }
-
-        fn is_boundary_delimiter_line(&mut self, line: &[u8]) -> bool {
-            let Some(rest) = line.strip_prefix(self.dash_boundary.as_slice()).map(skip_lwsp) else {
-                return false;
-            };
-            if self.parts_read == 0 && rest == b"\n" {
-                self.nl = b"\n";
-            }
-            rest == self.nl
         }
 
         /// `NextPart`; `None` is (a wrapped) `io.EOF`.
         pub fn next_part(&mut self) -> Result<Option<Part>, String> {
             let mut expect_new_part = false;
             loop {
-                let (line, eof) = self.read_slice();
-                if eof && self.is_final_boundary(line) {
+                let line = read_line(self.buf, &mut self.pos);
+                let eof = !line.ends_with(b"\n");
+                if eof && self.boundary.is_final(line) {
                     return Ok(None);
                 }
                 if eof {
@@ -1260,11 +1217,10 @@ mod form {
                     // `errors.Is(err, io.EOF)` treats as the end of the form.
                     return Ok(None);
                 }
-                if self.is_boundary_delimiter_line(line) {
-                    self.parts_read += 1;
+                if self.boundary.start_part(line) {
                     return self.headers();
                 }
-                if self.is_final_boundary(line) {
+                if self.boundary.is_final(line) {
                     return Ok(None);
                 }
                 if expect_new_part {
@@ -1273,10 +1229,10 @@ mod form {
                         crate::text::quote(line)
                     ));
                 }
-                if self.parts_read == 0 {
+                if !self.boundary.started() {
                     continue;
                 }
-                if line == self.nl {
+                if line == self.boundary.newline() {
                     expect_new_part = true;
                     continue;
                 }
@@ -1291,7 +1247,7 @@ mod form {
             if self.pos >= self.buf.len() {
                 return None;
             }
-            let (line, _) = self.read_slice();
+            let line = read_line(self.buf, &mut self.pos);
             Some(match line.strip_suffix(b"\n") {
                 Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
                 None => line,
@@ -1402,21 +1358,9 @@ mod form {
         /// The current part's body up to its closing boundary (`partReader`), and the
         /// read error that ended it early.
         pub fn body(&mut self) -> (Vec<u8>, Option<String>) {
-            let mut nl_dash = self.nl.to_vec();
-            nl_dash.extend_from_slice(&self.dash_boundary);
-            let mut data = Vec::new();
-            let mut total = 0;
-            loop {
-                let rest = &self.buf[self.pos..];
-                let (n, scan) = scan_until_boundary(rest, &self.dash_boundary, &nl_dash, total);
-                data.extend_from_slice(&rest[..n]);
-                self.pos += n;
-                total += n;
-                match scan {
-                    Scan::Data => {}
-                    Scan::End => return (data, None),
-                    Scan::UnexpectedEof => return (data, Some("unexpected EOF".into())),
-                }
+            match self.boundary.read_part(self.buf, &mut self.pos) {
+                Ok(data) => (data.to_vec(), None),
+                Err(data) => (data.to_vec(), Some("unexpected EOF".into())),
             }
         }
     }
@@ -1504,49 +1448,6 @@ mod form {
             }
         }
         read_error.map_or(Ok(out), Err)
-    }
-
-    fn scan_until_boundary(buf: &[u8], dash: &[u8], nl_dash: &[u8], total: usize) -> (usize, Scan) {
-        if total == 0 {
-            if buf.starts_with(dash) {
-                return match match_after_prefix(buf, dash) {
-                    true => (0, Scan::End),
-                    false => (dash.len(), Scan::Data),
-                };
-            }
-            if dash.starts_with(buf) {
-                return (0, Scan::UnexpectedEof);
-            }
-        }
-        if let Some(i) = buf.windows(nl_dash.len()).position(|w| w == nl_dash) {
-            return match match_after_prefix(&buf[i..], nl_dash) {
-                true => (i, Scan::End),
-                false => (i + nl_dash.len(), Scan::Data),
-            };
-        }
-        if nl_dash.starts_with(buf) {
-            return (0, Scan::UnexpectedEof);
-        }
-        if let Some(i) = buf.iter().rposition(|&b| b == nl_dash[0])
-            && nl_dash.starts_with(&buf[i..])
-        {
-            return (i, Scan::Data);
-        }
-        (buf.len(), Scan::UnexpectedEof)
-    }
-
-    fn match_after_prefix(buf: &[u8], prefix: &[u8]) -> bool {
-        match buf.get(prefix.len()) {
-            None => true,
-            Some(b' ' | b'\t' | b'\r' | b'\n') => true,
-            Some(b'-') => buf.get(prefix.len() + 1) == Some(&b'-'),
-            Some(_) => false,
-        }
-    }
-
-    fn skip_lwsp(b: &[u8]) -> &[u8] {
-        let n = b.iter().take_while(|&&c| c == b' ' || c == b'\t').count();
-        &b[n..]
     }
 
     fn trim_ascii_space(b: &[u8]) -> &[u8] {

@@ -8,6 +8,7 @@
 //! (docs/DIFFERENCES-FROM-GO.md, images multipart forms). Field and file order follow first appearance, one of the
 //! orders Go's map iteration can produce.
 
+use crate::protocol::multipart::{Boundary, read_line, skip_lwsp};
 use crate::text::quote;
 use std::collections::BTreeMap;
 
@@ -271,9 +272,7 @@ fn base_name(path: &str) -> String {
 struct Reader<'a> {
     body: &'a [u8],
     pos: usize,
-    nl: &'static [u8],
-    dash_boundary: Vec<u8>,
-    parts_read: usize,
+    boundary: Boundary,
     /// `ReadForm` skips nameless parts without reading them; `NextPart` callers read all.
     skip_nameless: bool,
 }
@@ -283,17 +282,10 @@ impl<'a> Reader<'a> {
         Reader {
             body,
             pos: 0,
-            nl: b"\r\n",
-            dash_boundary: format!("--{boundary}").into_bytes(),
-            parts_read: 0,
+            boundary: Boundary::new(boundary),
             skip_nameless,
         }
     }
-}
-
-fn skip_lwsp(b: &[u8]) -> &[u8] {
-    let n = b.iter().take_while(|c| matches!(c, b' ' | b'\t')).count();
-    &b[n..]
 }
 
 /// What `partReader` makes of a delimiter prefix at the start of `rest`.
@@ -349,19 +341,15 @@ impl<'a> Reader<'a> {
     /// ending, `bufio: buffer full` when no newline falls within the buffer, and
     /// `EOF` (with what is left) when the body ends first.
     fn read_slice(&mut self) -> Result<&'a [u8], (&'static str, &'a [u8])> {
-        let body: &'a [u8] = self.body;
-        let rest = &body[self.pos..];
-        let window = &rest[..rest.len().min(PEEK_BUFFER_SIZE)];
-        if let Some(i) = window.iter().position(|b| *b == b'\n') {
-            self.pos += i + 1;
-            return Ok(&rest[..=i]);
+        let end = self.body.len().min(self.pos + PEEK_BUFFER_SIZE);
+        let line = read_line(&self.body[..end], &mut self.pos);
+        if line.ends_with(b"\n") {
+            Ok(line)
+        } else if line.len() == PEEK_BUFFER_SIZE {
+            Err(("bufio: buffer full", line))
+        } else {
+            Err(("EOF", line))
         }
-        if rest.len() >= PEEK_BUFFER_SIZE {
-            self.pos += PEEK_BUFFER_SIZE;
-            return Err(("bufio: buffer full", window));
-        }
-        self.pos = body.len();
-        Err(("EOF", rest))
     }
 
     /// textproto's `readLineSlice` (`bufio.Reader.ReadLine` joined): the line without
@@ -388,54 +376,32 @@ impl<'a> Reader<'a> {
         Some(line.strip_suffix(b"\r").unwrap_or(line))
     }
 
-    fn is_final(&self, line: &[u8]) -> bool {
-        let mut prefix = self.dash_boundary.clone();
-        prefix.extend_from_slice(b"--");
-        let Some(rest) = line.strip_prefix(prefix.as_slice()) else {
-            return false;
-        };
-        let rest = skip_lwsp(rest);
-        rest.is_empty() || rest == self.nl
-    }
-
-    fn is_delimiter(&mut self, line: &[u8]) -> bool {
-        let Some(rest) = line.strip_prefix(self.dash_boundary.as_slice()) else {
-            return false;
-        };
-        let rest = skip_lwsp(rest);
-        if self.parts_read == 0 && rest == b"\n" {
-            self.nl = b"\n";
-        }
-        rest == self.nl
-    }
-
     /// `nextPart`; `Ok(None)` is `io.EOF`, which also ends the form when the body
     /// ends inside a part's headers.
     fn next_part(&mut self) -> Result<Option<Part>, String> {
-        if self.dash_boundary == b"--" {
+        if self.boundary.is_empty() {
             return Err("multipart: boundary is empty".into());
         }
         let mut expect_new = false;
         loop {
             let line = match self.read_slice() {
                 Ok(line) => line,
-                Err(("EOF", line)) if self.is_final(line) => return Ok(None),
+                Err(("EOF", line)) if self.boundary.is_final(line) => return Ok(None),
                 Err((e, _)) => return Err(format!("multipart: NextPart: {e}")),
             };
-            if self.is_delimiter(line) {
-                self.parts_read += 1;
+            if self.boundary.start_part(line) {
                 return self.part();
             }
-            if self.is_final(line) {
+            if self.boundary.is_final(line) {
                 return Ok(None);
             }
             if expect_new {
                 return Err(format!("multipart: expecting a new Part; got line {}", quote(line)));
             }
-            if self.parts_read == 0 {
+            if !self.boundary.started() {
                 continue;
             }
-            if line == self.nl {
+            if line == self.boundary.newline() {
                 expect_new = true;
                 continue;
             }
@@ -560,28 +526,14 @@ impl<'a> Reader<'a> {
     /// followed by `--`, whitespace or the end of input.
     fn part_body(&mut self) -> Result<Vec<u8>, BodyError> {
         let buf = &self.body[self.pos..];
-        if buf.starts_with(&self.dash_boundary) {
-            match delimiter(buf, self.dash_boundary.len()) {
-                Delimiter::Match => return Ok(Vec::new()),
-                Delimiter::Data => {}
-                Delimiter::BufferFull => return Err(BodyError::BufferFull(self.pos + PEEK_BUFFER_SIZE)),
-            }
-        }
-        let mut nl_dash = self.nl.to_vec();
-        nl_dash.extend_from_slice(&self.dash_boundary);
-        let mut from = 0;
-        while let Some(i) = buf
-            .get(from..)
-            .and_then(|b| b.windows(nl_dash.len()).position(|w| w == nl_dash.as_slice()))
-            .map(|i| i + from)
-        {
-            match delimiter(&buf[i..], nl_dash.len()) {
+        for (i, len) in self.boundary.candidates(buf, true) {
+            match delimiter(&buf[i..], len) {
                 Delimiter::Match => {
                     let body = buf[..i].to_vec();
                     self.pos += i;
                     return Ok(body);
                 }
-                Delimiter::Data => from = i + nl_dash.len(),
+                Delimiter::Data => {}
                 Delimiter::BufferFull => return Err(BodyError::BufferFull(self.pos + i + PEEK_BUFFER_SIZE)),
             }
         }

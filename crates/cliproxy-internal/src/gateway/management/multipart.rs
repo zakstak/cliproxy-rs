@@ -4,6 +4,7 @@
 //!
 //! ponytail: no quoted-printable part decoding and no header count or size limits.
 
+use crate::protocol::multipart::{Boundary, Scan, read_line};
 use crate::text::GoStr;
 use crate::text::quote;
 use axum::body::Bytes;
@@ -87,9 +88,7 @@ fn read_form(
     let mut reader = Reader {
         buf: body,
         pos: 0,
-        nl: b"\r\n",
-        dash_boundary: format!("--{boundary}").into_bytes(),
-        parts_read: 0,
+        boundary: Boundary::new(boundary),
         limited,
         hit_limit,
         window: 0,
@@ -151,9 +150,7 @@ pub(super) fn go_base(path: &str) -> &str {
 struct Reader<'a, 'h> {
     buf: &'a [u8],
     pos: usize,
-    nl: &'static [u8],
-    dash_boundary: Vec<u8>,
-    parts_read: usize,
+    boundary: Boundary,
     limited: bool,
     hit_limit: &'h mut bool,
     /// Limited parse: the end of what Go's 4096-byte `bufio.Reader` has pulled from
@@ -172,51 +169,10 @@ enum Slice<'a> {
     Over(&'a [u8]),
 }
 
-enum Scan {
-    Data,
-    End,
-    UnexpectedEof,
-}
-
 impl<'a> Reader<'a, '_> {
-    /// `bufio.Reader.ReadSlice('\n')`: the line with its newline, and whether the
-    /// body ended before one.
-    fn read_slice(&mut self) -> (&'a [u8], bool) {
-        let rest = &self.buf[self.pos..];
-        match rest.iter().position(|&b| b == b'\n') {
-            Some(i) => {
-                self.pos += i + 1;
-                (&rest[..=i], false)
-            }
-            None => {
-                self.pos = self.buf.len();
-                (rest, true)
-            }
-        }
-    }
-
-    fn is_final_boundary(&self, line: &[u8]) -> bool {
-        let mut dash_dash = self.dash_boundary.clone();
-        dash_dash.extend_from_slice(b"--");
-        line.strip_prefix(dash_dash.as_slice())
-            .map(skip_lwsp)
-            .is_some_and(|rest| rest.is_empty() || rest == self.nl)
-    }
-
-    fn is_boundary_delimiter_line(&mut self, line: &[u8]) -> bool {
-        let Some(rest) = line.strip_prefix(self.dash_boundary.as_slice()).map(skip_lwsp) else {
-            return false;
-        };
-        // Go switches to bare-LF mode when the first delimiter line ends in "\n".
-        if self.parts_read == 0 && rest == b"\n" {
-            self.nl = b"\n";
-        }
-        rest == self.nl
-    }
-
     /// Go `Reader.nextPart`; `None` is a clean end of the form.
     fn next_part(&mut self) -> Result<Option<HashMap<String, String>>, String> {
-        if self.dash_boundary == b"--" {
+        if self.boundary.is_empty() {
             return Err("multipart: boundary is empty".into());
         }
         let mut expect_new_part = false;
@@ -228,8 +184,9 @@ impl<'a> Reader<'a, '_> {
                     Slice::Over(_) => return Err(format!("multipart: NextPart: {}", self.end("EOF"))),
                 }
             } else {
-                let (line, eof) = self.read_slice();
-                if eof && self.is_final_boundary(line) {
+                let line = read_line(self.buf, &mut self.pos);
+                let eof = !line.ends_with(b"\n");
+                if eof && self.boundary.is_final(line) {
                     return Ok(None);
                 }
                 if eof {
@@ -237,20 +194,19 @@ impl<'a> Reader<'a, '_> {
                 }
                 line
             };
-            if self.is_boundary_delimiter_line(line) {
-                self.parts_read += 1;
+            if self.boundary.start_part(line) {
                 return self.headers();
             }
-            if self.is_final_boundary(line) {
+            if self.boundary.is_final(line) {
                 return Ok(None);
             }
             if expect_new_part {
                 return Err(format!("multipart: expecting a new Part; got line {}", quote(line)));
             }
-            if self.parts_read == 0 {
+            if !self.boundary.started() {
                 continue;
             }
-            if line == self.nl {
+            if line == self.boundary.newline() {
                 expect_new_part = true;
                 continue;
             }
@@ -378,7 +334,7 @@ impl<'a> Reader<'a, '_> {
         if self.pos >= self.buf.len() {
             return None;
         }
-        let (line, _) = self.read_slice();
+        let line = read_line(self.buf, &mut self.pos);
         Some(match line.strip_suffix(b"\n") {
             Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
             None => line,
@@ -474,22 +430,10 @@ impl<'a> Reader<'a, '_> {
         if self.limited {
             return self.body_go();
         }
-        let mut nl_dash = self.nl.to_vec();
-        nl_dash.extend_from_slice(&self.dash_boundary);
-        let mut data = Vec::new();
-        let mut total = 0;
-        loop {
-            let rest = &self.buf[self.pos..];
-            let (n, scan) = scan_until_boundary(rest, &self.dash_boundary, &nl_dash, total);
-            data.extend_from_slice(&rest[..n]);
-            self.pos += n;
-            total += n;
-            match scan {
-                Scan::Data => {}
-                Scan::End => return Ok(data),
-                Scan::UnexpectedEof => return Err(self.end("unexpected EOF")),
-            }
-        }
+        self.boundary
+            .read_part(self.buf, &mut self.pos)
+            .map(<[u8]>::to_vec)
+            .map_err(|_| self.end("unexpected EOF"))
     }
 }
 
@@ -497,121 +441,35 @@ impl Reader<'_, '_> {
     /// `partReader.Read` until the part ends, over the bufio window: it scans what is
     /// buffered and fills only when the scan needs more (`Peek(len+1)`).
     fn body_go(&mut self) -> Result<Vec<u8>, String> {
-        let mut nl_dash = self.nl.to_vec();
-        nl_dash.extend_from_slice(&self.dash_boundary);
         let mut data = Vec::new();
         let (mut total, mut read_err) = (0, false);
         loop {
             let buffered = &self.buf[self.pos..self.window];
-            let (n, end) = scan_go(buffered, &self.dash_boundary, &nl_dash, total, read_err);
-            data.extend_from_slice(&buffered[..n]);
-            self.pos += n;
-            total += n;
-            match end {
-                Some(true) => return Ok(data),
-                Some(false) => return Err(self.end("unexpected EOF")),
-                None if n > 0 => {}
-                None => {
+            match self.boundary.scan_window(buffered, total == 0, read_err) {
+                Scan::Boundary(n) => {
+                    data.extend_from_slice(&buffered[..n]);
+                    self.pos += n;
+                    return Ok(data);
+                }
+                Scan::UnexpectedEof(n) => {
+                    self.pos += n;
+                    return Err(self.end("unexpected EOF"));
+                }
+                Scan::Data(0) => {
                     let want = buffered.len() + 1;
                     while self.window - self.pos < want.min(PEEK_BUFFER) && !self.over {
                         self.fill();
                     }
                     read_err = self.window - self.pos < want;
                 }
+                Scan::Data(n) => {
+                    data.extend_from_slice(&buffered[..n]);
+                    self.pos += n;
+                    total += n;
+                }
             }
         }
     }
-}
-
-/// Go `scanUntilBoundary`: the bytes that are part data, and `Some(true)` at the
-/// boundary or `Some(false)` for the read error.
-fn scan_go(buf: &[u8], dash: &[u8], nl_dash: &[u8], total: usize, read_err: bool) -> (usize, Option<bool>) {
-    let err = read_err.then_some(false);
-    if total == 0 {
-        if buf.starts_with(dash) {
-            return match match_after_go(buf, dash.len(), read_err) {
-                -1 => (dash.len(), None),
-                0 => (0, None),
-                _ => (0, Some(true)),
-            };
-        }
-        if dash.starts_with(buf) {
-            return (0, err);
-        }
-    }
-    if let Some(i) = buf.windows(nl_dash.len()).position(|w| w == nl_dash) {
-        return match match_after_go(&buf[i..], nl_dash.len(), read_err) {
-            -1 => (i + nl_dash.len(), None),
-            0 => (i, None),
-            _ => (i, Some(true)),
-        };
-    }
-    if nl_dash.starts_with(buf) {
-        return (0, err);
-    }
-    if let Some(i) = buf.iter().rposition(|&b| b == nl_dash[0])
-        && nl_dash.starts_with(&buf[i..])
-    {
-        return (i, None);
-    }
-    (buf.len(), err)
-}
-
-/// Go `matchAfterPrefix`: +1 the boundary ends here, -1 it does not, 0 more input is
-/// needed to tell.
-fn match_after_go(buf: &[u8], prefix: usize, read_err: bool) -> i8 {
-    match (buf.get(prefix), buf.get(prefix + 1)) {
-        (None, _) => i8::from(read_err),
-        (Some(b' ' | b'\t' | b'\r' | b'\n'), _) => 1,
-        (Some(b'-'), None) => -i8::from(read_err),
-        (Some(b'-'), Some(b'-')) => 1,
-        _ => -1,
-    }
-}
-
-/// Go `scanUntilBoundary` with the whole body buffered (the read error is set).
-fn scan_until_boundary(buf: &[u8], dash: &[u8], nl_dash: &[u8], total: usize) -> (usize, Scan) {
-    if total == 0 {
-        if buf.starts_with(dash) {
-            return match match_after_prefix(buf, dash) {
-                true => (0, Scan::End),
-                false => (dash.len(), Scan::Data),
-            };
-        }
-        if dash.starts_with(buf) {
-            return (0, Scan::UnexpectedEof);
-        }
-    }
-    if let Some(i) = buf.windows(nl_dash.len()).position(|w| w == nl_dash) {
-        return match match_after_prefix(&buf[i..], nl_dash) {
-            true => (i, Scan::End),
-            false => (i + nl_dash.len(), Scan::Data),
-        };
-    }
-    if nl_dash.starts_with(buf) {
-        return (0, Scan::UnexpectedEof);
-    }
-    if let Some(i) = buf.iter().rposition(|&b| b == nl_dash[0])
-        && nl_dash.starts_with(&buf[i..])
-    {
-        return (i, Scan::Data);
-    }
-    (buf.len(), Scan::UnexpectedEof)
-}
-
-/// Go `matchAfterPrefix` at end of input: true when the boundary ends here.
-fn match_after_prefix(buf: &[u8], prefix: &[u8]) -> bool {
-    match buf.get(prefix.len()) {
-        None => true,
-        Some(b' ' | b'\t' | b'\r' | b'\n') => true,
-        Some(b'-') => buf.get(prefix.len() + 1) == Some(&b'-'),
-        Some(_) => false,
-    }
-}
-
-fn skip_lwsp(b: &[u8]) -> &[u8] {
-    let n = b.iter().take_while(|&&c| c == b' ' || c == b'\t').count();
-    &b[n..]
 }
 
 /// textproto `trim`: spaces and tabs at both ends.

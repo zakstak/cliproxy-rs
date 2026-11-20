@@ -11,6 +11,7 @@ pub mod json;
 #[cfg(test)]
 mod json_edit_tests;
 pub(crate) mod json_output;
+pub(crate) mod multipart;
 pub(crate) mod openai_usage;
 pub mod payload;
 pub mod rawjson;
