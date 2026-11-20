@@ -69,6 +69,8 @@ Upstream pull requests contain only generic fixes, never fork-specific files.
 
 This fork builds from source or with the local Dockerfile. It has no release publishing workflow, release installer or distribution packages, and all workspace crates have publishing disabled. Preserve these choices when integrating upstream changes. Version tags follow the `-zak.N` convention in [AGENTS.md](../AGENTS.md); tags do not trigger publication.
 
+For the VM236 handoff, see [Deploy the fork to Pyre](zak/DEPLOYMENT.md).
+
 ## Functional checks only
 
 This fork has no Go/Rust differential harness, benchmark gates, memory soaks, idle or size
