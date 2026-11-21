@@ -190,21 +190,22 @@ try {
   assert.equal(await page.getByRole("dialog").count(), 0);
   assert.match(await page.evaluate(() => document.activeElement?.textContent.trim()), /operator@example.invalid/);
   assert.equal(await page.evaluate(k => JSON.stringify([localStorage, sessionStorage]).includes(k), key), false);
-  // Synthetic feed stress at the HTTP boundary; the rest of this suite uses the real server.
+  // Synthetic history stress at the HTTP boundary; the rest of this suite uses the real server.
+  // One read returns more rows than the tab keeps (2,000), so the oldest become unknown.
   let supplied = false;
-  await page.route("**/observability/usage/live?*", async intercepted => {
+  await page.route("**/history/requests?*", async intercepted => {
     const now = Date.now();
-    const records = supplied ? [] : Array.from({ length: 2101 }, (_, n) => ({
-      timestamp: new Date(now - 2201 + n).toISOString(), latency_ms: 1,
-      request_id: `failed-stream-${n}`, model: "reported-failure", failed: true,
-      usage_observed: true, tokens: { input_tokens: 9, output_tokens: 6 },
+    const requests = supplied ? [] : Array.from({ length: 2101 }, (_, n) => ({
+      id: 1_000_000 + n, at: now - 2201 + n + 1, latency_ms: 1,
+      request_id: `failed-stream-${n}`, model: "reported-failure", provider: "claude", failed: true, status: 529,
+      usage_reported: true, input_tokens: 9, output_tokens: 6, timings: {},
     }));
     supplied = true;
-    await intercepted.fulfill({ json: { cursor: "0123456789abcdef.2101", records, gap: false, usage_statistics_enabled: true } });
+    await intercepted.fulfill({ json: { requests, more: false } });
   });
   await page.setViewportSize({ width: 1440, height: 900 });
   await route("logs");
-  await main.getByText("Older request history was discarded locally.", { exact: false }).waitFor();
+  await main.getByText("Older requests in this window are not loaded here.", { exact: false }).waitFor();
   await main.getByText("18K", { exact: true }).first().waitFor();
   await main.getByText("12K", { exact: true }).first().waitFor();
   await main.getByRole("button", { name: /^Trends/ }).click();
@@ -214,7 +215,7 @@ try {
   await page.keyboard.press("Home");
   await main.locator(".trend").filter({ hasText: "Input tokens" }).getByText("Unknown", { exact: true }).waitFor();
   await page.screenshot({ path: `${out}/ledger-retention-failed-streams.png`, fullPage: true });
-  console.log("PASS synthetic >2000-record eviction is visibly unknown; failed-stream usage totals remain 18K/12K");
+  console.log("PASS >2000 history rows in a tab leave older time visibly unknown; failed-stream usage totals remain 18K/12K");
   assert.ok(writes.length >= 3);
   assert.deepEqual(errors, []);
   console.log("PASS keyboard detail dismissal and focus return; no management key in storage");

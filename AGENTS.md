@@ -4,6 +4,8 @@ If you are an agent installing cliproxy-rs for a user rather than developing it,
 
 A Rust rewrite of CLIProxyAPI (https://github.com/router-for-me/CLIProxyAPI), compatible with its `config.yaml`, auth JSON files in `auth-dir`, HTTP routes and response shapes and v8 Management API for the providers it keeps. This fork has four built-in upstreams: Claude (`claude`), Codex (`codex`), Grok (`xai`) and Muse (`meta`). Clients use Anthropic Messages, OpenAI Chat Completions or OpenAI Responses. Kimi, Devin, Gemini, Gemini Interactions, Vertex AI, AI Studio, Antigravity and the generic OpenAI-compatible upstreams were removed (issue #49); their settings, routes, logins and imports fail with a migration error (`cliproxy_internal::removed`), and their saved logins stay on disk unread. Do not add them back, migrate their code or keep compatibility layers for them.
 
+Go's remote config and credential stores (`PGSTORE_*`, `OBJECTSTORE_*`, `GITSTORE_*`) were removed too (issue #222): setting one stops the server with a migration error, and `config.yaml` and `auth-dir` stay files. Storage is an abstraction: callers depend on `persistence::history::HistoryStore`, and every backend passes its conformance suite. Do not bring back a file-mirroring store.
+
 ## Compatibility
 
 - The product contract is functional: supported clients, operators and providers get correct, secure and reliable behaviour. That covers the client APIs, `config.yaml`, the credential files in `auth-dir`, the HTTP routes and response shapes, and the v8 Management API for the four kept providers. Do not break a client or a saved config that works today just to simplify a rule.
@@ -24,7 +26,7 @@ independent build target or an actual external consumer requires one.
 - `crates/cliproxy-internal/src/providers`: Claude, Codex, xAI and Meta upstream I/O, authentication and provider profiles.
 - `crates/cliproxy-internal/src/translation`: format conversion and the client-rewrite entry point in `client.rs`.
 - `crates/cliproxy-internal/src/protocol`: byte-preserving JSON, payload rules, thinking, signatures and session identity.
-- `crates/cliproxy-internal/src/persistence`: config/auth persistence and cooldown contracts. `storage` implements PostgreSQL, object storage and Git; `home` implements the Home control-plane protocol.
+- `crates/cliproxy-internal/src/persistence`: the history store contract (`history`, with its conformance suite) and cooldown records. `storage` implements the history store in SQLite and PostgreSQL; `home` implements the Home control-plane protocol.
 - `crates/cliproxy-internal/src/{config,credential,execution,format,catalog}`: shared data contracts and model catalogs. These modules perform no provider networking.
 - `crates/cliproxy`: flags, startup, integration assembly and TUI. Go-style single-dash flags are accepted.
 - `ui/`: the dashboard, with separate browser build targets.

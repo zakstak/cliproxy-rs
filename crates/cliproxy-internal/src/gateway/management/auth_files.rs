@@ -1160,13 +1160,7 @@ fn delete_one(state: &Management, name: &str, v8: bool) -> Result<String, (Statu
         state.oauth.invalidate_siwc(&target);
     }
     match std::fs::remove_file(&target) {
-        Ok(()) => {
-            // Go `deleteTokenRecord`: remote stores record the removal explicitly.
-            state
-                .store_delete(&target)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-            Ok(base)
-        }
+        Ok(()) => Ok(base),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err((StatusCode::NOT_FOUND, "auth file not found".into()))
         }
@@ -1223,9 +1217,6 @@ pub(super) fn delete_sync(state: &Management, q: &Query, body: &[u8], v8: bool) 
                 }
                 std::fs::remove_file(entry.path()).is_ok()
             } {
-                if let Err(error) = state.store_delete(&entry.path()) {
-                    return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
-                }
                 deleted += 1;
             }
         }

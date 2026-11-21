@@ -25,6 +25,7 @@ mod access;
 mod api_call;
 mod auth_files;
 mod auth_index;
+mod history;
 pub(crate) mod legacy;
 mod logs;
 pub(crate) mod multipart;
@@ -68,8 +69,6 @@ pub struct Management {
     pub(crate) login_panic: bool,
     /// Go `Handler.logDir`: resolved once at startup.
     pub(crate) log_dir: PathBuf,
-    /// The remote store mirroring config and auth files, when one is configured.
-    pub(crate) store: Option<Arc<dyn crate::persistence::StorePersister>>,
     /// Pins auth-dir across reloads (tests only; see [`Options::auth_dir`]).
     auth_dir: Option<PathBuf>,
     /// The zone log line timestamps are parsed in (Go `time.Local` when `None`).
@@ -100,9 +99,6 @@ pub struct Options {
     pub login_panic: bool,
     /// Overrides the log directory Go resolves at startup (tests only).
     pub log_dir: Option<PathBuf>,
-    /// A Postgres, git or object store mirroring config and auth files (Go's
-    /// registered token store when it persists remotely).
-    pub store: Option<Arc<dyn crate::persistence::StorePersister>>,
     /// Parses log line timestamps in this zone instead of the local one (tests only).
     pub log_zone: Option<chrono::FixedOffset>,
     /// Scans this directory for credentials on every reload instead of the config's
@@ -150,7 +146,6 @@ impl Management {
             .clone()
             .unwrap_or_else(|| crate::gateway::logging::resolve_log_dir(&cfg));
         let mut options = options;
-        let store = options.store.take();
         let auth_dir = options.auth_dir.take();
         let login_settled = options.login_settled.take();
         let login_panic = options.login_panic;
@@ -175,7 +170,6 @@ impl Management {
             login_settled,
             login_panic,
             log_dir,
-            store,
             auth_dir,
             log_zone,
         });
@@ -184,35 +178,11 @@ impl Management {
         state
     }
 
-    /// Go `Watcher.mirroredAuthDir`: with a remote store, the auth directory is the
-    /// store's mirror whatever `auth-dir` says.
+    /// A test's fixed auth directory wins over the config's `auth-dir`.
     pub(crate) fn lock_auth_dir(&self, cfg: &mut Config) {
-        if let Some(store) = &self.store {
-            cfg.auth_dir = store.auth_dir();
-        } else if let Some(dir) = &self.auth_dir {
+        if let Some(dir) = &self.auth_dir {
             cfg.auth_dir = dir.clone();
         }
-    }
-
-    /// Go `deleteTokenRecord`: tells the store about an explicit removal. Blocking;
-    /// call from a blocking thread.
-    pub(crate) fn store_delete(&self, path: &std::path::Path) -> Result<(), String> {
-        let Some(store) = self.store.clone() else {
-            return Ok(());
-        };
-        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        store.delete_auth(path).map_err(|e| format!("{e:#}"))
-    }
-
-    /// Go `Store.Save`: `write` through the configured store, which has the file when
-    /// this returns (git syncs first and holds its lock across the write); without a
-    /// store, just `write`. Blocking: call from a blocking thread holding `disk`.
-    pub(crate) fn store_write(&self, write: crate::persistence::SaveFn<'_>) -> Result<Option<PathBuf>, String> {
-        match &self.store {
-            Some(store) => store.save_auth(write),
-            None => write(),
-        }
-        .map_err(|e| format!("{e:#}"))
     }
 
     /// Publishes a config and everything Go derives from it on reload: scheduler
@@ -296,6 +266,13 @@ impl Management {
         self.access.config_published(&cfg);
         crate::gateway::logging::configure(&cfg);
         self.rt.usage_queue().configure(self.access.available(), &cfg);
+        // Retention applies live; another backend or path needs a restart.
+        if let Some(history) = self.rt.usage_queue().history() {
+            match crate::storage::HistorySettings::from_config(&cfg) {
+                Ok(settings) => history.set_retention_days(settings.retention_days),
+                Err(e) => tracing::warn!("storage settings ignored: {e:#}"),
+            }
+        }
         let policy = policy(&cfg);
         self.rt.publish_config_and_policy(cfg, policy);
         let rejected = self.rt.store().reconcile_scanned(all, &read, &unsettled);
@@ -591,6 +568,11 @@ pub fn router(state: Arc<Management>) -> Router {
             "observability/usage/live",
             methods().get(guarded!(s, observability::usage_live)),
         ),
+        // cliproxy-rs only: the history store (request history, totals, server log events).
+        ("history/status", methods().get(guarded!(s, history::status))),
+        ("history/requests", methods().get(guarded!(s, history::requests))),
+        ("history/totals", methods().get(guarded!(s, history::totals))),
+        ("history/events", methods().get(guarded!(s, history::events))),
         ("oauth/auth-url", methods().get(guarded!(s, oauth::auth_url))),
         ("oauth/status", methods().get(guarded!(s, oauth::status))),
         ("oauth/session", methods().delete(guarded!(s, oauth::cancel))),

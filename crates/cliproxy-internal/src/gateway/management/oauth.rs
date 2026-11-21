@@ -587,15 +587,12 @@ async fn save_if_pending<T: Send + 'static>(
     let (worker, sid, owner) = (state.clone(), sid.to_owned(), provider.to_owned());
     let saved = tokio::task::spawn_blocking(move || {
         let _guard = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
-        // Go `saveTokenRecord`: saved only once the token store has the file. The
-        // session is checked right before the write, after any store sync.
-        worker.store_write(Box::new(|| {
-            if !worker.oauth.is_pending(&sid, &owner) {
-                return Ok(None);
-            }
-            assert!(!worker.login_panic, "injected login panic");
-            write(auth_dir, value).map(Some).map_err(anyhow::Error::msg)
-        }))
+        // The session is checked right before the write.
+        if !worker.oauth.is_pending(&sid, &owner) {
+            return Ok(None);
+        }
+        assert!(!worker.login_panic, "injected login panic");
+        write(auth_dir, value).map(Some)
     })
     .await;
     match saved {
@@ -775,16 +772,12 @@ async fn start_claude(state: Arc<Management>, webui: bool, target: Option<Target
 }
 
 /// Go `saveTokenRecord` after the canonical Claude or xAI credential is stored: the
-/// matching legacy file is deleted through the token store (`store.Delete`), so a git
-/// store commits the removal its watcher guard would refuse. `provider` names the
-/// credential in the log; `failure` is the session error when the removal fails.
+/// matching legacy file is deleted. `provider` names the credential in the log;
+/// `failure` is the session error when the removal fails.
 async fn remove_legacy(state: &Arc<Management>, legacy: PathBuf, provider: &str, failure: &str) -> Outcome {
     let worker = state.clone();
     let removed = tokio::task::spawn_blocking(move || {
         let _guard = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
-        if worker.store.is_some() {
-            return worker.store_delete(&legacy);
-        }
         match std::fs::remove_file(&legacy) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
             _ => Ok(()),

@@ -39,17 +39,18 @@ the client response and settle the lease. Upstream capture goes through
 | JSON span editing, payload rules, thinking and signatures | `protocol` |
 | Config documents, credentials and execution envelopes | `config`, `credential`, `execution`, `format` |
 | Static and dynamic model catalogs | `catalog` |
-| Persistence contracts and cooldown records | `persistence` |
-| PostgreSQL, object storage and Git adapters | `storage` |
+| Persistence contracts (history store, cooldown records) | `persistence` |
+| Storage backends for the history store: SQLite and PostgreSQL | `storage` |
 | Home enrollment, dispatch, leases and protocol | `home` |
 | Shared text compatibility and private filesystem operations | `text`, `private_fs` |
 
 Put a trait beside the code that consumes it, or beside its shared data contract.
 Implement it directly on the owning type. For example, `runtime::quota::QuotaSource`
 lets scheduling read passive quota evidence from Claude and Codex without accessing
-their concrete executor fields. `persistence::StorePersister` describes persistence
-without belonging to the HTTP gateway. `PostgresStore` and `ObjectStore` implement
-that trait directly. `GitPersister` moves blocking Git work onto the blocking pool.
+their concrete executor fields.
+`persistence::history::HistoryStore` is the store for request history and server log
+events. `storage::SqliteHistory`, `storage::PostgresHistory` and
+`persistence::history::memory::MemoryHistory` implement it, and every implementation runs `persistence::history::conformance::run`.
 Use concrete functions for fixed operations that need no interchangeable implementation.
 
 `protocol/json_output.rs` builds generated JSON objects for HTTP envelopes and Home

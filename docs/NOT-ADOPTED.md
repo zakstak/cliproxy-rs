@@ -78,13 +78,12 @@ token (`crates/cliproxy-internal/src/providers/oauth.rs`). A4
 correct. A crash between the refresh request and the file write can still lose the new
 tokens.
 
-**Reason:** a real guarantee needs a new persistence protocol across the file, Git, object
-and PostgreSQL stores, with operator recovery for stuck claims and protected storage for
-receipts. That is extra-large work, and Go's version keeps credentials in receipts and
+**Reason:** a real guarantee needs a new persistence protocol for credential files, with
+operator recovery for stuck claims and protected storage for receipts. That is extra-large work, and Go's version keeps credentials in receipts and
 claims that never expire. The locking above covers single-node deployments.
 
-**Reconsider when:** this fork runs several nodes against one shared remote store, or a
-lost refresh after a crash is observed.
+**Reconsider when:** this fork runs several nodes against shared credentials, or a lost
+refresh after a crash is observed.
 
 ## Weighted routing fairness with session affinity (R3, #96)
 

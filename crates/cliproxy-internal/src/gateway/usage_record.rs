@@ -1081,6 +1081,9 @@ pub struct Record {
     pub model: String,
     pub alias: String,
     pub source: String,
+    /// The account's display name for the history store: [`account_name`], never a key.
+    /// Not in the queued record.
+    pub account: String,
     pub auth_index: String,
     pub access_token_sha256: String,
     pub auth_type: String,
@@ -1128,6 +1131,7 @@ impl Record {
             model: _,
             alias: _,
             source: _,
+            account: _,
             auth_index: _,
             access_token_sha256: _,
             auth_type: _,
@@ -1945,6 +1949,8 @@ impl Observer {
             (record.executor_type, record.model) = (executor_type, model);
         }
         let (latency, ttft);
+        // An attempt Go's queue does not publish, recorded in the history alone.
+        let mut history_only = false;
         if let Some(outcome) = reported.outcome.take() {
             record.failed = outcome.failed;
             record.fail_status = outcome.status;
@@ -1958,7 +1964,9 @@ impl Observer {
         } else {
             let usage = reported.usage();
             record.detail = if reported.usage_required && usage.is_none() {
-                if reported.claude_cache.is_none() {
+                // Go publishes nothing here; the history still keeps the attempt.
+                history_only = reported.claude_cache.is_none();
+                if history_only && queue.history().is_none() {
                     return;
                 }
                 record.usage_observed = Some(false);
@@ -1991,7 +1999,7 @@ impl Observer {
             auth_id: &origin.auth_id,
             sent: &origin.sent,
         };
-        finish(queue, record, reported, latency, ttft, &stamp);
+        finish(queue, record, reported, latency, ttft, &stamp, history_only);
     }
 
     /// A record of its own on this observer's origin.
@@ -2188,6 +2196,7 @@ fn finish(
     latency: std::time::Duration,
     ttft: std::time::Duration,
     stamp: &Stamp<'_>,
+    history_only: bool,
 ) {
     // #25: nothing of the upstream's answer keeps a value its request or socket carried.
     // Status, scope and every other field stay as classified.
@@ -2234,7 +2243,11 @@ fn finish(
     if let Some(tier) = reported.sent_tier {
         record.service_tier = tier;
     }
-    queue.enqueue(queued(&record, stamp.client));
+    if history_only {
+        queue.record_history(&record, stamp.client);
+        return;
+    }
+    queue.record(&record, stamp.client);
     warn_model_substitution(&record, &reported.upstream_model, stamp.auth_id);
 }
 
@@ -2297,6 +2310,7 @@ impl Tracker {
             model: crate::protocol::thinking::parse_suffix(upstream_model).model_name,
             alias: facts.alias.clone(),
             source: source(credential, &facts.client.api_key),
+            account: account_name(credential),
             auth_index: crate::config::credentials::auth_index(credential),
             access_token_sha256: access_token_sha256(credential),
             auth_type: crate::catalog::dynamic::auth_kind(credential)
@@ -2426,6 +2440,8 @@ impl Tracker {
             record.fail_code = code;
         }
         let (latency, ttft);
+        // An attempt Go's queue does not publish, recorded in the history alone.
+        let mut history_only = false;
         if let Some(outcome) = reported.outcome.take() {
             record.failed = outcome.failed;
             record.fail_status = outcome.status;
@@ -2448,7 +2464,9 @@ impl Tracker {
             }
             let detail = match ending {
                 Ending::Done if reported.usage_required && usage.is_none() => {
-                    if reported.claude_cache.is_none() {
+                    // Go publishes nothing here; the history still keeps the attempt.
+                    history_only = reported.claude_cache.is_none();
+                    if history_only && queue.history().is_none() {
                         return;
                     }
                     // Keep activity and timestamps even when a Claude stream never
@@ -2490,7 +2508,7 @@ impl Tracker {
             auth_id: &origin.auth_id,
             sent: &origin.sent,
         };
-        finish(queue, record, reported, latency, ttft, &stamp);
+        finish(queue, record, reported, latency, ttft, &stamp, history_only);
     }
 }
 
@@ -2567,6 +2585,23 @@ pub fn source(c: &crate::credential::Credential, client_key: &str) -> String {
         .or_else(|| attr("api_key"))
         .unwrap_or(client_key.trim())
         .to_owned()
+}
+
+/// The account's display name for the history: a Vertex project or an OAuth account's
+/// email. Empty for an API-key credential, whose [`source`] is its key.
+pub fn account_name(c: &crate::credential::Credential) -> String {
+    let meta = |k: &str| c.str(k).map(str::trim).filter(|v| !v.is_empty());
+    if c.provider.trim().go_eq_fold("vertex")
+        && let Some(project) = meta("project_id").or_else(|| meta("project"))
+    {
+        return project.to_owned();
+    }
+    let (kind, account) = crate::catalog::dynamic::account_info(c);
+    match kind {
+        "api_key" => String::new(),
+        "oauth" if !account.is_empty() => account,
+        _ => meta("email").unwrap_or_default().to_owned(),
+    }
 }
 
 /// Go `AccessTokenSHA256`.
@@ -2666,6 +2701,7 @@ pub fn publish_home_unauthorized(
         model: model.to_owned(),
         alias: alias.to_owned(),
         source: auth_source_kind(credential).to_owned(),
+        account: account_name(credential),
         auth_index,
         access_token_sha256,
         auth_type: crate::catalog::dynamic::auth_kind(credential)
@@ -2685,7 +2721,95 @@ pub fn publish_home_unauthorized(
         ..Record::default()
     };
     // Go 37fe2608: the record carries the request's client key and access provider.
-    queue.enqueue(queued(&record, &home_session(&facts.client, credential)));
+    queue.record(&record, &home_session(&facts.client, credential));
+}
+
+/// Failure text the history keeps per attempt at most; longer text is cut at a character
+/// boundary.
+const HISTORY_FAIL_BODY_MAX: usize = 4096;
+
+/// The history row for one attempt: the queued record's facts without its client key,
+/// provider key, client address or user agent. `at` is when the attempt finished.
+pub(crate) fn history_entry(record: &Record, client: &Client) -> crate::persistence::history::RequestEntry {
+    use crate::persistence::history::{RequestEntry, UnixMillis};
+    let started = chrono::DateTime::parse_from_rfc3339(&record.timestamp)
+        .map(|t| t.timestamp_millis())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
+    let detail = ensure_breakdown(record.detail.clone(), &record.provider, &record.executor_type);
+    // The v2 breakdown normalizes providers: input counts cache reads and writes, output
+    // counts reasoning. Without a complete one, the flat counters are what there is.
+    let (input, cache_read, cache_creation, output, reasoning) = match detail.breakdown {
+        Some(b) if b.quality == Quality::Complete => (b.input[0], b.input[2], b.input[3], b.output[0], b.output[2]),
+        _ => (
+            detail.input,
+            detail.cache_read,
+            detail.cache_creation,
+            detail.output,
+            detail.reasoning,
+        ),
+    };
+    let t = &record.timings;
+    let timings = [
+        ("client_body_received_ms", t.client_body_received_ms),
+        ("upstream_started_ms", t.upstream_started_ms),
+        ("upstream_connected_ms", t.upstream_connected_ms),
+        ("upstream_body_sent_ms", t.upstream_body_sent_ms),
+        ("upstream_headers_ms", t.upstream_headers_ms),
+        ("upstream_first_byte_ms", t.upstream_first_byte_ms),
+        ("client_first_byte_ms", t.client_first_byte_ms),
+    ]
+    .into_iter()
+    .filter_map(|(name, ms)| Some((name.to_owned(), ms?)))
+    .collect();
+    let status = if !record.failed {
+        200
+    } else if record.fail_status > 0 {
+        u16::try_from(record.fail_status).unwrap_or(500)
+    } else {
+        500
+    };
+    let mut fail_body = if record.failed { record.fail_body.trim() } else { "" };
+    if fail_body.len() > HISTORY_FAIL_BODY_MAX {
+        let mut end = HISTORY_FAIL_BODY_MAX;
+        while !fail_body.is_char_boundary(end) {
+            end -= 1;
+        }
+        fail_body = &fail_body[..end];
+    }
+    RequestEntry {
+        at: UnixMillis(started.saturating_add(record.latency_ms.max(0))),
+        request_id: client.request_id.trim().to_owned(),
+        execution_id: record.execution_id.trim().to_owned(),
+        provider: record.provider.trim().to_owned(),
+        // The model the client asked for: its alias when it used one, as the usage record's
+        // `alias` falls back to `model`.
+        model: match record.alias.trim() {
+            "" => record.model.trim().to_owned(),
+            alias => alias.to_owned(),
+        },
+        response_model: record.response_model.trim().to_owned(),
+        endpoint: client.endpoint.trim().to_owned(),
+        auth_index: record.auth_index.trim().to_owned(),
+        account: record.account.trim().to_owned(),
+        user_agent: client.user_agent.trim().to_owned(),
+        stream: record.stream,
+        failed: record.failed,
+        status,
+        fail_body: fail_body.to_owned(),
+        usage_reported: record.usage_observed != Some(false),
+        input_tokens: input,
+        output_tokens: output,
+        reasoning_tokens: reasoning,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
+        total_tokens: detail.total,
+        latency_ms: record.latency_ms,
+        ttft_ms: record.ttft_ms,
+        timings,
+        session_id: client.session_id.trim().to_owned(),
+        reasoning_effort: record.reasoning_effort.trim().to_owned(),
+        service_tier: record.service_tier.trim().to_owned(),
+    }
 }
 
 /// Go `time.Time.MarshalJSON` (RFC 3339 with trailing-zero-trimmed nanoseconds).
@@ -2867,6 +2991,112 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source(&credential, "client-key"), "sa@p.iam.gserviceaccount.com");
+    }
+
+    #[test]
+    fn history_account_names_an_oauth_account_and_never_a_key() {
+        let file = |metadata: serde_json::Value| {
+            crate::credential::Credential::from_file(
+                std::path::Path::new("/auth"),
+                std::path::Path::new("/auth/c.json"),
+                metadata.as_object().unwrap().clone(),
+            )
+            .unwrap()
+        };
+        let oauth =
+            file(serde_json::json!({"type": "claude", "email": " dev@example.test ", "access_token": "at-FAKE"}));
+        assert_eq!(account_name(&oauth), "dev@example.test");
+        let mut keyed = file(serde_json::json!({"type": "xai"}));
+        keyed.attributes.insert("api_key".into(), "sk-FAKE".into());
+        assert_eq!(
+            source(&keyed, "client-FAKE"),
+            "sk-FAKE",
+            "the queue's source is unchanged"
+        );
+        assert_eq!(account_name(&keyed), "");
+        let record = Record {
+            timestamp: "2026-11-21T10:00:00Z".into(),
+            latency_ms: 1500,
+            source: source(&keyed, "client-FAKE"),
+            account: account_name(&keyed),
+            failed: true,
+            fail_status: 0,
+            fail_body: "é".repeat(HISTORY_FAIL_BODY_MAX),
+            ..Record::default()
+        };
+        let client = Client {
+            api_key: "client-FAKE".into(),
+            request_id: "req-1".into(),
+            ..Client::default()
+        };
+        let entry = history_entry(&record, &client);
+        assert_eq!(entry.at.0, 1_795_255_200_000 + 1500, "when the attempt finished");
+        assert_eq!(
+            entry.status, 500,
+            "a failure without a status is a 500, as in the queue"
+        );
+        assert!(entry.fail_body.len() <= HISTORY_FAIL_BODY_MAX && entry.fail_body.chars().all(|c| c == 'é'));
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("FAKE"), "{json}");
+        assert!(!entry.usage_reported || record.usage_observed.is_none());
+    }
+
+    #[test]
+    fn history_input_counts_cache_reads_and_writes_for_every_provider() {
+        let claude = Record {
+            timestamp: "2026-11-21T10:00:00Z".into(),
+            provider: "claude".into(),
+            executor_type: "claude".into(),
+            detail: parse_claude(
+                br#"{"usage":{"input_tokens":10,"output_tokens":4,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}"#,
+            ),
+            timings: Timings {
+                upstream_headers_ms: Some(80),
+                upstream_connection_reused: Some(true),
+                ..Timings::default()
+            },
+            ..Record::default()
+        };
+        let client = Client {
+            user_agent: "claude-cli/2.1".into(),
+            ..Client::default()
+        };
+        let aliased = Record {
+            model: "claude-sonnet-4-5".into(),
+            alias: "my-alias".into(),
+            ..claude.clone()
+        };
+        assert_eq!(
+            history_entry(&aliased, &client).model,
+            "my-alias",
+            "the model the client asked for"
+        );
+        let plain = Record {
+            model: "claude-sonnet-4-5".into(),
+            ..claude.clone()
+        };
+        assert_eq!(history_entry(&plain, &client).model, "claude-sonnet-4-5");
+        let e = history_entry(&claude, &client);
+        assert_eq!(
+            (
+                e.input_tokens,
+                e.cache_read_tokens,
+                e.cache_creation_tokens,
+                e.output_tokens
+            ),
+            (115, 100, 5, 4)
+        );
+        assert!(e.usage_reported);
+        assert_eq!(e.user_agent, "claude-cli/2.1");
+        assert_eq!(
+            e.timings,
+            std::collections::BTreeMap::from([("upstream_headers_ms".to_owned(), 80)])
+        );
+        let unobserved = Record {
+            usage_observed: Some(false),
+            ..claude
+        };
+        assert!(!history_entry(&unobserved, &client).usage_reported);
     }
 
     #[test]
@@ -3299,6 +3529,7 @@ mod tests {
                 model: s("model"),
                 alias: s("alias"),
                 source: source(&credential, &s("client_key")),
+                account: account_name(&credential),
                 auth_index: crate::config::credentials::auth_index(&credential),
                 access_token_sha256: access_token_sha256(&credential),
                 auth_type: crate::catalog::dynamic::auth_kind(&credential)

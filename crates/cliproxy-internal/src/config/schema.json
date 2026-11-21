@@ -1560,6 +1560,15 @@
       }
     },
     "config-version": "version",
-    "worker-threads": "int"
+    "worker-threads": "int",
+    "storage": {
+      "fields": {
+        "backend": "string",
+        "sqlite-path": "string",
+        "retention-days": "int",
+        "postgres-dsn": "string",
+        "postgres-schema": "string"
+      }
+    }
   }
 }

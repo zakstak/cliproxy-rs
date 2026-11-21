@@ -1,9 +1,9 @@
 <script lang="ts">
   // Activity: what the proxy is doing now, and what happened to a request.
-  //   Requests   — every request this tab has watched finish, drawn live: a timeline per
-  //                account, trends for requests, tokens, cache and first-token time, and the
-  //                list itself. Kept in this tab only, for the last hour.
-  //   Server log — the log file the server writes. Durable text, one line per event.
+  //   Requests   — every request the server's history recorded in the last hour, drawn live:
+  //                a timeline per account, trends for requests, tokens, cache and
+  //                first-token time, and the list itself.
+  //   Server log — the server's log events from the same history store.
   // Each links to the other by request ID.
   import { Effect } from "effect";
   import { accountName as credName } from "../account";
@@ -16,8 +16,7 @@
   import { ApiError, download } from "../api";
   import { credState, label, provider, type Data } from "../core";
   import { app, asData, watch, message, Res, server } from "../app.svelte";
-  import { configWrite, explain } from "../server";
-  import { parseLine, requestTotals, type LogLine, type Request } from "../records";
+  import { parseEvent, requestTotals, type LogLine, type Request } from "../records";
   import { compact, duration, num, percent, plural, pretty, time, when } from "../fmt";
   import { span as ago } from "../core";
   import Copy from "../parts/Copy.svelte";
@@ -32,36 +31,41 @@
   const view = $derived<View>(app.route.rest[0] === "server" ? "log" : "requests");
 
   // ---- server log -----------------------------------------------------------------------
+  // Events from the history store, read by row id: the newest 300 first, then whatever was
+  // appended since.
   const KEEP = 2000;
   let lines = $state.raw<LogLine[]>([]);
   let logState = $state<"loading" | "ok" | "off">("loading");
   let logError = $state("");
   let logAt = $state(0);
-  let cursor = "";
+  let after = 0;
   let n = 0;
   /** The read in progress; a second ask (the timer, Try again) waits for it instead of starting another. */
   let reading: Promise<boolean> | null = null;
-  /** Reads the newest lines. True when the server answered (with lines, or with logging off). */
+  /** Reads the newest events. True when the server answered (with events, or with the store off). */
   function readLog(): Promise<boolean> {
     return (reading ??= readOnce().finally(() => (reading = null)));
   }
   async function readOnce(): Promise<boolean> {
     try {
-      const r = await api(`/observability/logs?limit=300${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
-      const fresh: LogLine[] = (Array.isArray(r.lines) ? r.lines : []).map((l: unknown) => parseLine(String(l), ++n));
-      lines = (cursor && !r["cursor-reset"] ? [...lines, ...fresh] : fresh).slice(-KEEP);
-      cursor = typeof r["next-cursor"] === "string" ? r["next-cursor"] : "";
+      const r = await api(after ? `/history/events?after=${after}&limit=1000` : "/history/events?limit=300");
+      const events = (Array.isArray(r.events) ? r.events : []).flatMap((e: unknown) => parseEvent(e, 0) ?? []);
+      // The first read is newest first; later reads are oldest first.
+      events.sort((x: { row: number }, y: { row: number }) => x.row - y.row);
+      for (const e of events) e.n = ++n;
+      lines = [...lines, ...events].slice(-KEEP);
+      after = events.at(-1)?.row ?? after;
       logState = "ok";
       logError = "";
       logAt = Date.now();
       return true;
     } catch (e) {
-      // The one failure that is a setting, not a fault: the server writes no log file.
-      if (e instanceof ApiError && e.status === 400 && /logging to file disabled/.test(e.message)) {
+      // The one failure that is a setting, not a fault: the server records no history.
+      if (e instanceof ApiError && e.status === 503) {
         logState = "off";
         logError = "";
         lines = [];
-        cursor = "";
+        after = 0;
         return true;
       }
       logError = message(e);
@@ -307,31 +311,13 @@
 
   // ---- log files ------------------------------------------------------------------------
   const errorLogs = new Res<Data[]>(server.read("/observability/logs/errors").pipe(Effect.map((b) => (asData(b).files || []).filter((f: unknown): f is Data => !!f && typeof f === "object"))));
-  let confirmClear = $state(false);
-  let clearError = $state("");
   function openFiles() {
     selLine = null;
     files = !files;
-    confirmClear = false;
-    clearError = "";
     if (files) {
       errorLogs.load();
       reveal();
     }
-  }
-  async function clearLog() {
-    clearError = await app.act(async () => {
-      await api("/observability/logs", "DELETE");
-      cursor = "";
-      lines = [];
-      await readLog();
-    }, "Server log cleared.");
-    if (!clearError) confirmClear = false;
-    focusAfter(() => find(confirmClear ? ".clear-confirm .danger" : ".clear-start"));
-  }
-  function askClear(ask: boolean) {
-    confirmClear = ask;
-    focusAfter(() => find(ask ? ".clear-confirm .keep" : ".clear-start"));
   }
   function stopWatching() {
     watch.stop();
@@ -341,15 +327,6 @@
   async function startWatching() {
     await watch.start();
     focusAfter(() => (watch.state === "on" ? find(".stop-watching") : find(".start-watching")));
-  }
-  let turningOn = $state("");
-  async function turnOnLogging() {
-    const error = await app.write(configWrite({ path: "observability/logs/logging-to-file", before: false, next: true, what: "Turning on file logging", href: "#logs/server" }), "File logging is on.");
-    turningOn = error ? explain(error) : "";
-    if (!turningOn) {
-      logState = "loading";
-      readLog();
-    }
   }
 </script>
 
@@ -435,13 +412,8 @@
           <p class="empty muted">Reading the server log…</p>
         {:else if logState === "off"}
           <div class="empty">
-            <h2>The server is not writing a log file</h2>
-            <p class="muted">This list reads the server's log file, and file logging is off, so there is nothing to read. Turning it on takes effect right away and does not restart the server.</p>
-            {#if turningOn}<p class="notice bad small" role="alert"><span class="dot bad"></span><span>File logging was not turned on: {turningOn}</span></p>{/if}
-            <div class="row">
-              <button class="btn primary" aria-disabled={app.busy} onclick={turnOnLogging}>{turningOn ? "Try again" : "Turn on file logging"}</button>
-              <a class="btn" href="#logs">See live requests instead</a>
-            </div>
+            <h2>The server records no history</h2>
+            <p class="muted">The server log is read from the history store, which is off (<span class="mono">storage.backend: none</span>) or failed to open. Standard output still has the log.</p>
           </div>
         {:else if !shownLines.length}
           <div class="empty">
@@ -486,9 +458,9 @@
             {#if watch.state === "off"}<button class="btn small" onclick={startWatching}>Try again</button>{/if}
           </p>
         {/if}
-        {#if !watch.statistics}
+        {#if !watch.recording}
           <p class="notice warn small" style="margin:8px">
-            <span class="dot warn"></span><span>Usage statistics are off on this server, so it reports no requests here. <a href="#settings">Turn them on in Settings</a></span>
+            <span class="dot warn"></span><span>This server records no request history: the history store is off (<span class="mono">storage.backend: none</span>) or failed to open. <a href="#settings/system">See Settings</a></span>
           </p>
         {/if}
         {#if firstRun}
@@ -496,7 +468,7 @@
         {:else if !watch.since}
           <div class="empty">
             <h2>Not watching requests</h2>
-            <p class="muted">The live view draws each request as it finishes: which account took it, how long it ran, its tokens and cache use. It lasts as long as this tab watches.</p>
+            <p class="muted">Draws each request as it finishes: which account took it, how long it ran, its tokens and cache use. Starting reads the last hour back from the server's history.</p>
             <button class="btn primary start-watching" onclick={startWatching}>Start watching</button>
           </div>
         {:else}
@@ -545,7 +517,7 @@
               {#if blind.length}
                 <p class="small muted watched">
                   <span class="hatch-key" aria-hidden="true"></span>
-                  <span>{watched ? `Watched ${ago(watched)} of the last ${windowName}` : `Nothing watched in the last ${windowName}`}{watch.state === "off" ? ", not watching now" : ""}, so these counts are lower bounds. {watch.retainedAfter > from ? "Older request history was discarded locally." : ""}</span>
+                  <span>{watched ? `Watched ${ago(watched)} of the last ${windowName}` : `Nothing watched in the last ${windowName}`}{watch.state === "off" ? ", not watching now" : ""}, so these counts are lower bounds. {watch.retainedAfter > from ? "Older requests in this window are not loaded here." : ""}</span>
                 </p>
               {/if}
             </section>
@@ -608,8 +580,7 @@
                 {:else}
                   <h2>No requests since {time(watch.since, false)}</h2>
                   <p class="muted">
-                    Each request shows up here when it finishes. The server keeps no history of them: for anything earlier, the
-                    <a href="#logs/server">server log</a> has one line per request, without model or token detail.
+                    Each request shows up here when it finishes. Earlier days are on <a href="#usage">Usage</a>, from the same history.
                   </p>
                 {/if}
               </div>
@@ -656,7 +627,7 @@
             {:else}Watching since {time(watch.since, false)}.{/if}
           </span>
           {#if watch.state === "on" && !firstRun}<button class="link stop-watching" onclick={stopWatching}>Stop watching</button>{/if}
-          <span class="wide-only grow end-note">A request appears when it finishes. Kept in this tab only: the last hour, at most 2,000</span>
+          <span class="wide-only grow end-note">A request appears when it finishes. From the server's history: the last hour, at most 2,000</span>
         </div>
       {/if}
     </div>
@@ -688,7 +659,7 @@
             <h3>Same request <span class="mono faint">{line.id}</span></h3>
             {#if seen}
               <p class="small">
-                This tab watched it: <span class="mono">{seen.model}</span> on {nameOf(seen.auth)}{seen.usageReported ? `, ${num(seen.tokens.input + seen.tokens.output)} tokens` : ""}.
+                Recorded: <span class="mono">{seen.model}</span> on {nameOf(seen.auth)}{seen.usageReported ? `, ${num(seen.tokens.input + seen.tokens.output)} tokens` : ""}.
                 <button class="link" onclick={() => jumpToRequest(seen)}>Model, timing and tokens</button>
               </p>
             {/if}
@@ -782,7 +753,7 @@
                 </div>
               {/each}
             </div>
-          {:else}<p class="small muted">{logState === "off" ? "File logging is off, so the server wrote no lines for this request." : "No loaded log line has this request ID."}</p>{/if}
+          {:else}<p class="small muted">{logState === "off" ? "The server records no history, so no log lines are kept for this request." : "No loaded log line has this request ID."}</p>{/if}
         </section>
         <RequestLog id={r.id} />
         <details>
@@ -818,19 +789,6 @@
                 </li>
               {/each}
             </ul>
-          {/if}
-        </section>
-        <section>
-          <h3>Clear the server log</h3>
-          <p class="small muted">Empties the server's log file and deletes its rotated copies. Saved request logs stay.</p>
-          {#if clearError}<p class="notice bad small" role="alert"><span class="dot bad"></span><span>The log was not cleared: {clearError}</span></p>{/if}
-          {#if confirmClear}
-            <div class="row clear-confirm">
-              <button class="btn danger small" aria-disabled={app.busy} onclick={clearLog}>{clearError ? "Try clearing again" : "Clear the log for everyone"}</button>
-              <button class="btn small keep" onclick={() => askClear(false)}>Keep it</button>
-            </div>
-          {:else}
-            <div class="row"><button class="btn danger small clear-start" disabled={logState !== "ok"} onclick={() => askClear(true)}>Clear server log…</button></div>
           {/if}
         </section>
       </Detail>

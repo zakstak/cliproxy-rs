@@ -3,7 +3,6 @@ mod dotenv;
 mod home;
 mod tui;
 
-use cliproxy_internal::text::GoStr;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -714,29 +713,24 @@ async fn run(args: Args) -> anyhow::Result<()> {
         .map(|v| v.trim())
         .find(|v| !v.is_empty())
         .map(str::to_owned);
-    let home = home_jwt.is_some();
-    // Go main: PGSTORE_*, OBJECTSTORE_* or GITSTORE_* keep config and auth files in a
-    // remote store, served from its local mirror (never in Home mode).
-    let env = |key: &str| std::env::var(key).ok();
-    let store = match cliproxy_internal::storage::select(&env, &wd, home) {
-        Some(selection) => match cliproxy_internal::storage::bootstrap(selection, &wd).await {
-            Ok(store) => Some(store),
-            Err(line) => {
-                tracing::error!("{line}");
-                return Ok(());
-            }
-        },
-        None => None,
-    };
-    let config_path = match &store {
-        Some(store) => store.config_path.clone(),
-        None if args.config.is_empty() => wd.join("config.yaml"),
-        None => PathBuf::from(&args.config),
+    // Go's remote config and credential stores (PGSTORE_*, OBJECTSTORE_*, GITSTORE_*)
+    // are not supported (#222); one that is configured stops the server rather than
+    // starting it on local files the operator does not expect.
+    if home_jwt.is_none()
+        && let Err(line) = cliproxy_internal::storage::refuse_go_store_env(&|key| std::env::var(key).ok())
+    {
+        tracing::error!("{line}");
+        return Ok(());
+    }
+    let config_path = if args.config.is_empty() {
+        wd.join("config.yaml")
+    } else {
+        PathBuf::from(&args.config)
     };
     let cloud = std::env::var("DEPLOY").is_ok_and(|v| v == "cloud");
     // Go main: with a Home JWT the config comes from Home; the config path stays for
     // downstream components but need not exist.
-    let (mut config, home_config) = match &home_jwt {
+    let (config, home_config) = match &home_jwt {
         Some(jwt) => match home::bootstrap(jwt, args.home_disable_cluster_discovery).await {
             Ok((home_config, config)) => (config, Some(home_config)),
             Err(line) => {
@@ -746,13 +740,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         },
         None => (load_config(&config_path, cloud)?, None),
     };
-    if let Some(store) = &store {
-        config.auth_dir = store.auth_dir.clone();
-        tracing::info!("{}", store.enabled);
-    }
-    // The runtime was sized from -config (or ./config.yaml) before a store or Home
-    // supplied the config it now runs on.
-    if (store.is_some() || home_config.is_some())
+    // The runtime was sized from -config (or ./config.yaml) before Home supplied the
+    // config it now runs on.
+    if home_config.is_some()
         && std::env::var_os("TOKIO_WORKER_THREADS").is_none()
         && let Some(n) = config
             .document
@@ -776,12 +766,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // Go ConfigureLogOutput and SetLogLevel, before any login command.
     cliproxy_internal::gateway::logging::configure(&config);
     tracing::info!("{}", banner());
-    let before = store.as_ref().map(|store| auth_files(&store.auth_dir));
     let ran = command(&args, &config).await;
     if !matches!(ran, Ok(Ran::Nothing)) {
-        if let (Some(store), Some(before)) = (&store, &before) {
-            persist_command(store, before, &ran).await;
-        }
         return ran.map(|_| ());
     }
     if !config_present {
@@ -793,7 +779,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
     if args.tui {
         if args.standalone {
-            standalone_tui(config, config_path, args.password, args.local_model, store, home_config).await;
+            standalone_tui(config, config_path, args.password, args.local_model, home_config).await;
         } else {
             let base = resolve_management_base_url(&args.management_base_url, &config);
             remote_tui(base, args.password).await;
@@ -805,7 +791,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
         config_path,
         args.password,
         args.local_model,
-        store,
         home_config,
         shutdown_signal(),
         None,
@@ -903,7 +888,6 @@ async fn standalone_tui(
     config_path: PathBuf,
     password: String,
     local_model: bool,
-    store: Option<cliproxy_internal::storage::Store>,
     home_config: Option<cliproxy_internal::home::HomeConfig>,
 ) {
     let hook = cliproxy_internal::gateway::logging::capture(2000);
@@ -929,7 +913,6 @@ async fn standalone_tui(
         config_path,
         password.clone(),
         local_model,
-        store,
         home_config,
         shutdown,
         Some(listening),
@@ -961,84 +944,12 @@ async fn standalone_tui(
     }
 }
 
-/// The top-level `*.json` files of the auth directory.
-fn auth_files(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().go_lower().ends_with(".json"))
-        .filter_map(|e| Some((e.path(), std::fs::read(e.path()).ok()?)))
-        .collect()
-}
-
-/// Go's token store `Save` after a login command: what the login wrote goes to the
-/// remote store, or the next bootstrap would not know it.
-async fn persist_login(
-    store: &cliproxy_internal::storage::Store,
-    before: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
-) {
-    for (path, data) in auth_files(&store.auth_dir) {
-        if before.get(&path) == Some(&data) {
-            continue;
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if let Err(error) = store
-            .persister
-            .persist_auth_files(format!("Update auth {name}"), vec![path])
-            .await
-        {
-            tracing::error!("failed to save auth {name} to the token store: {error:#}");
-        }
-    }
-}
-
-/// What a command flag did, for the remote token store.
+/// What a command flag did.
 enum Ran {
     /// No command flag is set.
     Nothing,
-    /// A login or import: what it wrote into the auth directory is saved.
-    Login,
-    /// `-siwc-bind`: only the file it bound is saved, and nothing when it failed.
-    Bound(Option<PathBuf>),
-}
-
-/// Go's token store `Save` after a command: a login's or import's changes in the auth
-/// directory (even when it failed), only the file a `-siwc-bind` bound, and nothing for
-/// a failed one.
-async fn persist_command(
-    store: &cliproxy_internal::storage::Store,
-    before: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
-    ran: &anyhow::Result<Ran>,
-) {
-    match ran {
-        Ok(Ran::Nothing | Ran::Bound(None)) => {}
-        Ok(Ran::Bound(Some(path))) => persist_bound(store, path).await,
-        Ok(Ran::Login) | Err(_) => persist_login(store, before).await,
-    }
-}
-
-/// Saves the file `-siwc-bind` bound, under the store's spelling of the auth directory
-/// (the bound path has its symlinks resolved).
-async fn persist_bound(store: &cliproxy_internal::storage::Store, path: &Path) {
-    let path = std::fs::canonicalize(&store.auth_dir)
-        .ok()
-        .and_then(|dir| path.strip_prefix(dir).ok().map(|rel| store.auth_dir.join(rel)))
-        .unwrap_or_else(|| path.to_owned());
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if let Err(error) = store
-        .persister
-        .persist_auth_files(format!("Update auth {name}"), vec![path])
-        .await
-    {
-        tracing::error!("failed to save auth {name} to the token store: {error:#}");
-    }
+    /// A login, import or `-siwc-bind` ran.
+    Ran,
 }
 
 /// The login or import flag of a removed provider (issue #49), with that provider.
@@ -1071,7 +982,7 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
             Ok(path) => {
                 println!("SIWC credentials bound and saved to {}", path.display());
                 println!("Sign in with ChatGPT authentication successful!");
-                return Ok(Ran::Bound(Some(path)));
+                return Ok(Ran::Ran);
             }
             Err(cliproxy_internal::providers::codex_siwc_bind::BindError::Log(line)) => tracing::error!("{line}"),
             Err(cliproxy_internal::providers::codex_siwc_bind::BindError::Print(line)) => println!("{line}"),
@@ -1082,7 +993,7 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
                 std::process::exit(13);
             }
         }
-        return Ok(Ran::Bound(None));
+        return Ok(Ran::Ran);
     }
     if args.codex_login || args.codex_device_login {
         let options = cliproxy_internal::providers::codex_oauth::LoginOptions {
@@ -1099,7 +1010,7 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
         };
         println!("Authentication saved to {}", path.display());
         println!("Codex authentication successful!");
-        return Ok(Ran::Login);
+        return Ok(Ran::Ran);
     }
     if args.claude_login {
         let options = cliproxy_internal::providers::claude_login::LoginOptions {
@@ -1120,18 +1031,18 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
             }
             println!("Claude authentication failed: {message}");
         }
-        return Ok(Ran::Login);
+        return Ok(Ran::Ran);
     }
     if args.xai_login {
         // Go DoXAILogin: a failure is logged and the command still exits normally.
         if let Err(error) = cliproxy_internal::providers::xai_auth::login(config, args.no_browser).await {
             tracing::error!("xAI authentication failed: {}", String::from_utf8_lossy(&error.body));
         }
-        return Ok(Ran::Login);
+        return Ok(Ran::Ran);
     }
     if args.meta_login {
         cliproxy_internal::providers::meta_auth::login(config, args.no_browser).await?;
-        return Ok(Ran::Login);
+        return Ok(Ran::Ran);
     }
     Ok(Ran::Nothing)
 }
@@ -1208,7 +1119,6 @@ async fn serve(
     config_path: PathBuf,
     password: String,
     local_model: bool,
-    store: Option<cliproxy_internal::storage::Store>,
     home_config: Option<cliproxy_internal::home::HomeConfig>,
     shutdown: impl std::future::Future<Output = ()>,
     listening: Option<tokio::sync::oneshot::Sender<(SocketAddr, bool)>>,
@@ -1254,8 +1164,24 @@ async fn serve(
     // document of a credential whose file has not changed.
     rt.store().note_loaded(&read);
     rt.set_local_model(local_model);
-    if let Some(cooldown) = store.as_ref().and_then(|store| store.cooldown.clone()) {
-        rt.set_cooldown_backend(cooldown);
+    // The history store: request history and server log events for the dashboard. Home
+    // mode has no dashboard. A store that fails to open leaves the proxy serving.
+    if home_config.is_none() {
+        let settings = cliproxy_internal::storage::HistorySettings::from_config(&rt.config())?;
+        match settings.open().await {
+            Ok(Some(history)) => {
+                tracing::info!(
+                    backend = history.backend(),
+                    retention_days = settings.retention_days,
+                    "history store opened"
+                );
+                let recorder = cliproxy_internal::runtime::history::Recorder::start(history, settings.retention_days);
+                cliproxy_internal::gateway::logging::add_hook(recorder.log_hook());
+                rt.usage_queue().set_history(recorder);
+            }
+            Ok(None) => tracing::info!("history store disabled (storage.backend: none)"),
+            Err(e) => tracing::error!("history store unavailable, recording nothing: {e:#}"),
+        }
     }
     // Go `misc.StartAntigravityVersionUpdater` and `startModelCatalogUpdaters`.
     cliproxy_internal::gateway::model_updater::start(&rt, home_config.is_some());
@@ -1270,7 +1196,6 @@ async fn serve(
     let options = cliproxy_internal::gateway::management::Options {
         local_password: password,
         standalone,
-        store: store.map(|store| store.persister),
         ..Default::default()
     };
     let management = cliproxy_internal::gateway::management::Management::with_options(rt.clone(), config_path, options);
@@ -1352,75 +1277,18 @@ async fn serve(
     }
     // Server.Stop closes the HTTP server without draining (http.Server.Close).
     drop(server);
+    // What the history recorder accepted is written before the process exits.
+    if let Some(history) = rt.usage_queue().history()
+        && !history.flush(std::time::Duration::from_secs(5)).await
+    {
+        tracing::warn!("history store: entries still queued at shutdown were not written");
+    }
     served
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// After `-siwc-bind`, the remote store gets only the bound file, under the store's
-    /// spelling of the auth directory, and nothing when the bind failed; a login still
-    /// saves every file it changed. Another file written meanwhile is never uploaded
-    /// for a bind.
-    #[tokio::test]
-    async fn siwc_bind_saves_only_the_bound_file() {
-        struct Recorder(std::sync::Mutex<Vec<Vec<PathBuf>>>, PathBuf);
-        impl cliproxy_internal::persistence::StorePersister for Recorder {
-            fn persist_config(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn persist_auth_files(
-                &self,
-                _: String,
-                paths: Vec<PathBuf>,
-            ) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
-                self.0.lock().unwrap().push(paths);
-                Box::pin(async { Ok(()) })
-            }
-            fn delete_auth(&self, _: PathBuf) -> anyhow::Result<()> {
-                Ok(())
-            }
-            fn auth_dir(&self) -> PathBuf {
-                self.1.clone()
-            }
-        }
-        let root = std::env::temp_dir().join(format!(
-            "cliproxy-siwc-store-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join("real")).unwrap();
-        // The store names the auth directory through a link; the bound path is real.
-        std::os::unix::fs::symlink(root.join("real"), root.join("auth")).unwrap();
-        let auth = root.join("auth");
-        std::fs::write(auth.join("c.json"), "{}").unwrap();
-        let before = auth_files(&auth);
-        std::fs::write(auth.join("c.json"), r#"{"use_siwc":true}"#).unwrap();
-        std::fs::write(auth.join("other.json"), "{}").unwrap();
-        let recorder = Arc::new(Recorder(Default::default(), auth.clone()));
-        let store = cliproxy_internal::storage::Store {
-            config_path: root.join("config.yaml"),
-            auth_dir: auth.clone(),
-            persister: recorder.clone(),
-            cooldown: None,
-            enabled: String::new(),
-        };
-        let real = std::fs::canonicalize(auth.join("c.json")).unwrap();
-        persist_command(&store, &before, &Ok(Ran::Bound(Some(real)))).await;
-        assert_eq!(*recorder.0.lock().unwrap(), vec![vec![auth.join("c.json")]]);
-        recorder.0.lock().unwrap().clear();
-        persist_command(&store, &before, &Ok(Ran::Bound(None))).await;
-        assert!(recorder.0.lock().unwrap().is_empty());
-        persist_command(&store, &before, &Ok(Ran::Login)).await;
-        let mut saved: Vec<PathBuf> = recorder.0.lock().unwrap().concat();
-        saved.sort();
-        assert_eq!(saved, vec![auth.join("c.json"), auth.join("other.json")]);
-        let _ = std::fs::remove_dir_all(root);
-    }
 
     /// `worker-threads` from the config file; anything but a positive number, or no
     /// file, falls back to min(CPUs, 2). (`TOKIO_WORKER_THREADS` is not set in tests.)
@@ -1753,7 +1621,6 @@ mod tests {
             path,
             "fake-tui-password".into(),
             true,
-            None,
             None,
             async {
                 let _ = stopped.await;

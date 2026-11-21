@@ -231,7 +231,7 @@ pub(crate) async fn usage_live(State(state): State<Arc<Management>>, RawQuery(ra
         page.cursor,
         page.gap,
         page.more,
-        queue.accepts()
+        queue.queue_accepts()
     );
     for (i, record) in page.records.iter().enumerate() {
         if i > 0 {

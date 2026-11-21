@@ -179,6 +179,22 @@ keep the listener open and back off from 5 ms to one second; config changes and
 shutdown interrupt the wait. Addresses require numeric ports; unlike Go, `:` and
 service-name ports such as `:http` are not accepted.
 
+## storage
+
+The history store keeps what the server records about its own operation: one row per upstream attempt the usage tracker settles (time, request ID, provider, model, account, status, token counts, latency) and every server log line. An attempt that ended before the provider reported usage is kept with its token counts marked unknown, including the ones the usage queue leaves out (on Claude and xAI, which need provider usage). The dashboard reads it, so request history and the server log survive a restart. Rows never hold a client key, a provider key, a client address or a prompt: an API-key credential is recorded by its `auth_index` only.
+
+| Setting | What it does |
+|---|---|
+| `backend` | `sqlite` (the default) keeps the history in an embedded SQLite file. `postgres` keeps it in PostgreSQL. `none` records nothing. Any other value stops the server at start. |
+| `sqlite-path` | The SQLite file. By default `history.db` in `$WRITABLE_PATH` when it is set, otherwise in the auth directory. The file is created with owner-only permissions; SQLite keeps `-wal` and `-shm` files beside it. |
+| `postgres-dsn` | Required with `backend: postgres`: a `postgres://` URL or `key=value` connection string. Unset parts come from the libpq environment (`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE` and so on); keep the password in `PGPASSWORD` rather than in `config.yaml`, which the Management API can read. |
+| `postgres-schema` | The schema for the history tables (`cliproxy_history_requests`, `cliproxy_history_events`, `cliproxy_history_schema`), created when missing. Empty uses the connection's search path, usually `public`. One server per schema: two servers appending to the same tables could make the dashboard skip a row. |
+| `retention-days` | Rows older than this many days are deleted, hourly. `30` by default; `0` keeps everything. Changes apply without a restart. |
+
+`backend`, `sqlite-path`, `postgres-dsn` and `postgres-schema` are read at start; change them and restart. A database whose history schema is newer than the server supports is refused. When the store cannot be opened (for example a read-only directory), the server logs an error and serves without recording. Writes happen in the background in batches: a slow disk never delays a request, and entries that do not fit the bounded queue are dropped and counted rather than waited for. An orderly shutdown waits up to five seconds for queued entries to be written. Home mode records nothing, as it has no dashboard.
+
+While a history store is open, every upstream attempt is tracked as if `observability.usage.usage-statistics-enabled` were on. The usage queue, its RESP channel and the live feed still follow that setting. Tracking also sends a request body to an HTTP/1.1 upstream in 64 KiB pieces, with the same bytes and `Content-Length`.
+
 ## models
 
 | Setting | What it does |
@@ -199,7 +215,7 @@ A refresh reads only these two catalogs. It never asks a provider account which 
 
 `worker-threads: 4` at the top level sets how many threads serve requests. Without it, cliproxy-rs uses the smaller of the CPU count and two, which is plenty for one person: a coding-agent request with a 300 KB prompt costs about 20 to 30 ms of CPU (a small chat request about 1 ms), and most of a request's time is spent waiting on the provider. Each extra thread can keep its own pool of freed memory, so more threads mean a larger resident size. The `TOKIO_WORKER_THREADS` environment variable overrides it.
 
-The key is read once at start from the `-config` file (`./config.yaml` by default), before a remote store (`PGSTORE_*`, `OBJECTSTORE_*`, `GITSTORE_*`) or Home supplies a config. It has no effect in a store's `config.yaml` or in the config Home supplies (the local `-config` file still applies); set `TOKIO_WORKER_THREADS` there. A value there that differs from the running thread count logs a warning.
+The key is read once at start from the `-config` file (`./config.yaml` by default), before Home supplies a config. It has no effect in the config Home supplies (the local `-config` file still applies); set `TOKIO_WORKER_THREADS` there. A value there that differs from the running thread count logs a warning.
 
 This setting exists only in cliproxy-rs. CLIProxyAPI starts with it in the file and keeps it through v0 Management API saves, but any v8 configuration write comments it out, and uploading a whole `config.yaml` that contains it is refused. With a config shared between the two servers, use `TOKIO_WORKER_THREADS`. See [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
 
@@ -214,4 +230,4 @@ This fork has no native plugin support. A `plugins` section, in either layout an
 - `RUST_LOG`: overrides the log level, for example `RUST_LOG=debug`. Module filters use the current Rust paths, such as `RUST_LOG=info,cliproxy_internal::providers=debug`.
 - `CLIPROXY_NO_UPDATE_CHECK=1`: disables explicit checks for the upstream Rust project's latest release.
 - A `.env` file in the working directory is loaded at start, as in CLIProxyAPI.
-- `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` keep the config and the account files in PostgreSQL, an S3-compatible bucket or a git repository, as in CLIProxyAPI. When the store has no config yet, the local one (or `config.example.yaml`) seeds it after a plaintext management key is replaced with its bcrypt hash and legacy settings that a v8 setting overrides are removed. A file in which the key's value would still appear as another setting's value, for example through a YAML anchor, is refused and the server does not start; comments and keys are not checked.
+- `PGSTORE_DSN`, `OBJECTSTORE_ENDPOINT` and `GITSTORE_GIT_URL` (CLIProxyAPI's remote config and credential stores) are not supported: when one is set, the server logs how to move off it and stops. Keep `config.yaml` and the auth directory on a persistent volume instead. The request history can live in PostgreSQL; see [storage](#storage).

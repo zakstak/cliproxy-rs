@@ -43,7 +43,7 @@ These features differ from Go:
 | `management.panel-github-repository`, `management.disable-auto-update-panel`, `MANAGEMENT_STATIC_PATH` | The dashboard is built into the binary and never downloaded or read from disk. `management.disable-control-panel` is honoured. |
 | Config reload log summaries | The config is reloaded, but the changes are not summarised in the log. |
 
-`.env` in the working directory is loaded as in Go, and the `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` storage backends and `WRITABLE_PATH` work as in Go. `RUST_LOG`, when set, overrides the log level from `debug`.
+`.env` in the working directory is loaded as in Go, and `WRITABLE_PATH` works as in Go. The `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` storage backends are not supported: see [Remote config and credential stores](DIFFERENCES-FROM-GO.md#remote-config-and-credential-stores). `RUST_LOG`, when set, overrides the log level from `debug`.
 
 ## Management API differences
 

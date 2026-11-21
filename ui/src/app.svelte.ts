@@ -3,10 +3,10 @@
 // drafts, and the one queue every configuration write goes through.
 import { Effect, Result } from "effect";
 import { LatestRead, type ReadResult } from "./latest";
-import { api, connect, disconnect, transport } from "./api";
+import { api, ApiError, connect, disconnect, transport } from "./api";
 import { reconcile, type Data, type Window } from "./core";
 import { signInHelp } from "./api";
-import { parseLivePage, retainRequests, type Request } from "./records";
+import { parseHistoryPage, retainRequests, type Request } from "./records";
 import { client, explain, type Applied, type CallError, type ConfigWrite, type WriteError } from "./server";
 import { configuredAccounts } from "./configured-accounts";
 import { isUnsaved, type Draft } from "./draft";
@@ -91,92 +91,107 @@ export class Res<T> {
   }
 }
 
-const FEED = "/observability/usage/live";
+const HISTORY = "/history/requests";
 const HOUR = 60 * 60_000;
+/** Rows one history read returns at most (the server's page limit). */
+const PAGE = 1000;
 
 /**
- * The live request watch. It pages through the non-consuming usage feed by cursor, so the
- * usage queue, its collectors and other tabs still get every record. Kept in this tab only:
- * the last hour, at most 2,000 requests. Time it could not see is recorded as a gap.
+ * Requests from the server's history store. Starting reads the last hour back from the
+ * store, so a new tab or a restarted server loses nothing the store kept; polling then
+ * reads rows appended since, by row id. The tab keeps the last hour, at most 2,000
+ * requests.
  */
 class Watch {
   state = $state<"off" | "on">("off");
   /** Why the last read failed; empty after a good read. */
   problem = $state("");
-  /** When this tab first started watching; 0 before that. */
+  /** The start of what this tab holds: an hour before it first started watching; 0 before that. */
   since = $state(0);
   /** When watching started again after a stop; 0 before any restart. */
   resumedAt = $state(0);
-  /** When watching last stopped; 0 while watching. Time after it is not captured. */
+  /** When watching last stopped; 0 while watching. */
   stoppedAt = $state(0);
   requests = $state.raw<Request[]>([]);
-  /** History through this completion time was discarded locally and is unknown. */
+  /** Requests through this completion time are not loaded here and are unknown. */
   retainedAfter = $state(0);
+  /** The store keeps every request, so a stop leaves no hole: restarting reads it back. */
   gaps = $state.raw<{ from: number; to: number }[]>([]);
-  /** False when the server has usage statistics off and so reports no requests. */
-  statistics = $state(true);
-  #cursor: string | null = null;
+  /** False when the server records no history (`storage.backend: none`, or the store failed to open). */
+  recording = $state(true);
+  #cursor = 0;
   #run = 0;
   #n = 0;
-  #readAt = 0;
   #polling = false;
+
+  /** A read the store could not answer because it is off says so instead of failing. */
+  #off(e: unknown) {
+    if (e instanceof ApiError && e.status === 503) {
+      this.recording = false;
+      this.problem = "";
+      return true;
+    }
+    return false;
+  }
 
   async start() {
     const mine = ++this.#run;
     try {
-      const page = parseLivePage(await api(FEED), () => ++this.#n);
-      if (mine !== this.#run) return;
       const now = Date.now();
-      // Stopping and starting again leaves a hole between the two.
-      if (this.since) {
-        this.gaps = [
-          ...this.gaps,
-          { from: this.stoppedAt || this.#readAt, to: now },
-        ];
-        this.resumedAt = now;
-      } else this.since = now;
+      const page = parseHistoryPage(await api(`${HISTORY}?since=${now - HOUR}&limit=${PAGE}`), () => ++this.#n);
+      // An empty hour still needs a cursor: the newest row of all, if any. A row that
+      // finished between the two reads belongs to the hour and is kept.
+      let rows = page.requests;
+      let cursor = rows.at(-1)?.row ?? 0;
+      if (!rows.length) {
+        const newest = parseHistoryPage(await api(`${HISTORY}?limit=1`), () => ++this.#n).requests;
+        rows = newest.filter((r) => r.at + r.latency > now - HOUR);
+        cursor = newest.at(-1)?.row ?? 0;
+      }
+      if (mine !== this.#run) return;
+      if (this.since) this.resumedAt = now;
+      this.since = now - HOUR;
+      // More than a page in the hour: what is older than the page is unknown here.
+      const oldest = rows[0];
+      this.retainedAfter = page.more && oldest ? oldest.at + oldest.latency - 1 : 0;
+      this.requests = retainRequests(rows, { cutoff: now - HOUR, retainedAfter: this.retainedAfter }).requests;
       this.stoppedAt = 0;
-      this.#cursor = page.cursor;
-      this.#readAt = now;
-      this.statistics = page.statistics;
+      this.#cursor = cursor;
+      this.recording = true;
       this.problem = "";
       this.state = "on";
     } catch (e) {
-      if (mine === this.#run) this.problem = message(e);
+      if (mine === this.#run && !this.#off(e)) this.problem = message(e);
     }
   }
   stop() {
     this.#run++;
-    this.#cursor = null;
-    if (this.state === "on") this.stoppedAt = this.#readAt || Date.now();
+    if (this.state === "on") this.stoppedAt = Date.now();
     this.state = "off";
   }
   async poll() {
-    if (this.state !== "on" || this.#cursor === null || this.#polling) return;
+    if (this.state !== "on" || this.#polling) return;
     this.#polling = true;
     const mine = this.#run;
     try {
-      // ponytail: one page (at most 500 records) every 3 s; past that the tab falls behind and
-      // the server reports a gap. Read again while the page says `more` to lift it.
-      const page = parseLivePage(
-        await api(`${FEED}?after=${this.#cursor}`),
-        () => ++this.#n,
-      );
-      if (mine !== this.#run) return;
-      const now = Date.now();
-      if (page.gap) this.gaps = [...this.gaps, { from: this.#readAt, to: now }];
-      if (page.requests.length || page.gap) {
+      let more = true;
+      // Reads until caught up; each page is at most PAGE rows.
+      for (let pages = 0; more && pages < 5; pages++) {
+        const page = parseHistoryPage(await api(`${HISTORY}?after=${this.#cursor}&limit=${PAGE}`), () => ++this.#n);
+        if (mine !== this.#run) return;
+        more = page.more;
+        const last = page.requests.at(-1);
+        if (!last) break;
+        const now = Date.now();
         const retained = retainRequests([...this.requests, ...page.requests], { cutoff: now - HOUR, retainedAfter: this.retainedAfter });
         this.requests = retained.requests;
         this.retainedAfter = retained.retainedAfter;
-        this.gaps = this.gaps.filter((g) => g.to > now - HOUR);
+        this.#cursor = last.row;
       }
-      this.#cursor = page.cursor;
-      this.#readAt = now;
-      this.statistics = page.statistics;
+      this.recording = true;
       this.problem = "";
     } catch (e) {
-      if (mine === this.#run) this.problem = message(e);
+      if (mine === this.#run && !this.#off(e)) this.problem = message(e);
     } finally {
       this.#polling = false;
     }
@@ -189,6 +204,7 @@ class Watch {
     this.since = 0;
     this.resumedAt = 0;
     this.stoppedAt = 0;
+    this.#cursor = 0;
     this.problem = "";
   }
 }

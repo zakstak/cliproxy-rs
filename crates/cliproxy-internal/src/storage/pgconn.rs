@@ -1,7 +1,6 @@
-//! The Postgres connection behind `PGSTORE_DSN`: pgx's DSN rules on top of
+//! The Postgres connection behind `storage.postgres-dsn`: libpq/pgx DSN rules on top of
 //! tokio-postgres, TLS through BoringSSL, and one worker thread that owns the
-//! connection. Async callers and the runtime's synchronous cooldown hook both queue
-//! jobs to it, so neither depends on the caller's runtime flavour.
+//! connection. Callers queue jobs to it, so none depends on the caller's runtime flavour.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -88,7 +87,7 @@ impl TlsFiles {
     }
 }
 
-/// A parsed `PGSTORE_DSN`.
+/// A parsed `storage.postgres-dsn`.
 #[derive(Clone)]
 pub(crate) struct Dsn {
     config: tokio_postgres::Config,
@@ -200,7 +199,7 @@ impl Dsn {
         let raw = raw.trim();
         let mut tls = TlsFiles::default();
         // pgx sends every other key to the server as a startup parameter (`search_path`
-        // picks the tables when PGSTORE_SCHEMA is unset); here they travel as `-c`.
+        // picks the tables when storage.postgres-schema is unset); here they travel as `-c`.
         let mut runtime: Vec<(String, String)> = Vec::new();
         let mut keep = |key: &str, value: String| -> bool {
             if TLS_KEYS.contains(&key) {
@@ -209,7 +208,7 @@ impl Dsn {
             } else if NATIVE_KEYS.contains(&key) {
                 true
             } else if UNSUPPORTED_KEYS.contains(&key) {
-                tracing::warn!(key, "postgres store: ignoring unsupported connection parameter");
+                tracing::warn!(key, "postgres history: ignoring unsupported connection parameter");
                 false
             } else {
                 runtime.push((key.to_owned(), value));
@@ -372,7 +371,7 @@ impl Dsn {
             .map_err(|e| anyhow!("{}", error_text(&e)))?;
         tokio::spawn(async move {
             if let Err(error) = connection.await {
-                tracing::warn!("postgres store: connection closed: {error}");
+                tracing::warn!("postgres history: connection closed: {error}");
             }
         });
         Ok(client)
@@ -504,30 +503,32 @@ impl Pg {
     pub(crate) fn start(dsn: Dsn) -> Result<Pg> {
         let (jobs, mut queue) = tokio::sync::mpsc::unbounded_channel::<Job>();
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        std::thread::Builder::new().name("pgstore".into()).spawn(move || {
-            runtime.block_on(async move {
-                let mut client: Option<Arc<Client>> = None;
-                while let Some(job) = queue.recv().await {
-                    let current = match client.as_ref().filter(|c| !c.is_closed()) {
-                        Some(c) => Ok(c.clone()),
-                        None => match dsn.connect().await {
-                            Ok(c) => {
-                                let c = Arc::new(c);
-                                client = Some(c.clone());
-                                Ok(c)
-                            }
-                            Err(e) => {
-                                client = None;
-                                Err(e)
-                            }
-                        },
-                    };
-                    if tokio::time::timeout(JOB_TIMEOUT, job(current)).await.is_err() {
-                        client = None;
+        std::thread::Builder::new()
+            .name("postgres-history".into())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    let mut client: Option<Arc<Client>> = None;
+                    while let Some(job) = queue.recv().await {
+                        let current = match client.as_ref().filter(|c| !c.is_closed()) {
+                            Some(c) => Ok(c.clone()),
+                            None => match dsn.connect().await {
+                                Ok(c) => {
+                                    let c = Arc::new(c);
+                                    client = Some(c.clone());
+                                    Ok(c)
+                                }
+                                Err(e) => {
+                                    client = None;
+                                    Err(e)
+                                }
+                            },
+                        };
+                        if tokio::time::timeout(JOB_TIMEOUT, job(current)).await.is_err() {
+                            client = None;
+                        }
                     }
-                }
-            });
-        })?;
+                });
+            })?;
         Ok(Pg { jobs })
     }
 
@@ -560,26 +561,7 @@ impl Pg {
             let _ = tx.send(result);
         });
         rx.await
-            .unwrap_or_else(|_| Err(anyhow!("postgres store: request abandoned (timeout or shutdown)")))
-    }
-
-    /// `run` for synchronous callers; must not be called from the worker itself.
-    pub(crate) fn run_blocking<T, F, Fut>(&self, f: F) -> Result<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(Arc<Client>) -> Fut + Send + 'static,
-        Fut: Future<Output = Result<T>> + Send + 'static,
-    {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.submit(move |client| async move {
-            let result = match client {
-                Ok(client) => f(client).await,
-                Err(error) => Err(error),
-            };
-            let _ = tx.send(result);
-        });
-        rx.recv()
-            .unwrap_or_else(|_| Err(anyhow!("postgres store: request abandoned (timeout or shutdown)")))
+            .unwrap_or_else(|_| Err(anyhow!("postgres history: request abandoned (timeout or shutdown)")))
     }
 }
 

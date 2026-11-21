@@ -4,17 +4,13 @@ import { test } from "node:test";
 import {
   ago,
   buckets,
-  capable,
-  cleanEvent,
   credState,
   accountRow,
   authUrl,
   canSignInAgain,
   equal,
   fieldPath,
-  keepEvents,
   level,
-  livePage,
   lineDiff,
   otherSignals,
   quotaWindows,
@@ -24,7 +20,6 @@ import {
   span,
   strategy,
   sumBuckets,
-  usageStats,
 } from "./core.ts";
 
 const now = Date.parse("2026-10-02T12:00:00Z");
@@ -82,57 +77,6 @@ test("traffic buckets: absent history stays absent; sums align to the newest buc
 test("grille levels: zero is dark, any traffic is visible, the peak is full", () => {
   assert.deepEqual([0, 1, 50, 51, 100].map((n) => level(n, 100)), [0, 1, 2, 3, 4]);
   assert.equal(level(5, 0), 0);
-});
-
-test("usage events keep display fields only and summarise by model", () => {
-  const raw = {
-    timestamp: "2026-10-02T11:59:59Z",
-    latency_ms: 100,
-    ttft_ms: 40,
-    failed: true,
-    fail: { status_code: 529, body: "upstream said secret things" },
-    api_key: "sk-client-secret",
-    client_ip: "203.0.113.9",
-    user_agent: "tool/1.0",
-    model: "claude-sonnet-4-5",
-    alias: "daily",
-    tokens: { input_tokens: 10, output_tokens: 5 },
-  };
-  const e = cleanEvent(raw);
-  assert.deepEqual(Object.keys(e).sort(), ["at", "auth", "failed", "id", "input", "latency", "model", "output", "provider", "status", "ttft"]);
-  assert.equal(JSON.stringify(e).includes("secret"), false);
-  assert.deepEqual([e.model, e.status, e.at], ["daily", 529, Date.parse(raw.timestamp)]);
-  const s = usageStats([e, cleanEvent({ model: "m", latency_ms: 0 }), cleanEvent({ model: "m", latency_ms: 300, ttft_ms: 0 })]);
-  assert.deepEqual([s.count, s.failed, s.latency, s.ttft], [3, 1, 100, 40]);
-  assert.deepEqual(s.models.map((m) => [m.model, m.count]), [["m", 2], ["daily", 1]]);
-  assert.equal(usageStats([]).latency, null);
-});
-
-test("live usage pages parse strictly and keep display fields only", () => {
-  const page = livePage({
-    cursor: "00000000000000ab.7",
-    gap: true,
-    more: false,
-    usage_statistics_enabled: true,
-    records: [{ model: "m", api_key: "secret-client", timestamp: at(0) }, "not json", null],
-  });
-  assert.deepEqual([page.cursor, page.gap, page.more, page.statistics, page.events.length], ["00000000000000ab.7", true, false, true, 1]);
-  assert.equal(JSON.stringify(page).includes("secret"), false);
-  assert.equal(livePage({ cursor: "0000000000000000.0", records: [], usage_statistics_enabled: false }).statistics, false);
-  for (const bad of [[], { cursor: 7, records: [] }, { cursor: "7", records: [] }, { cursor: "00000000000000ab.7" }, null, "x"])
-    assert.throws(() => livePage(bad), /Unexpected live feed format/);
-  const old = cleanEvent({ timestamp: at(-61 * 60_000) });
-  const fresh = Array.from({ length: 2001 }, () => cleanEvent({ timestamp: at(0) }));
-  assert.equal(keepEvents([old, ...fresh], now).length, 2000);
-});
-
-test("Rust-only routes are off on Go without a probe; other routes follow probes", () => {
-  const live = ["GET", "/observability/usage/live?count=0"] as const;
-  assert.equal(capable("go", {}, ...live), false);
-  assert.equal(capable("go", {}, "GET", "/observability/usage/queue?count=0"), true, "Go's own routes stay on");
-  assert.equal(capable("rust", {}, ...live), true);
-  assert.equal(capable("unknown", {}, ...live), true, "until its probe answers");
-  assert.equal(capable("rust", { "GET /observability/usage/live": false }, ...live), false, "a probe or call found it missing");
 });
 
 test("quota is percent used, not remaining; unknown payloads stay empty", () => {

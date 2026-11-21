@@ -14,7 +14,9 @@ Host Grotesk is self-hosted. Figures are tabular. Body and controls use 14 px te
 
 A top bar holds Activity, Usage, Accounts and Tools. Settings and Sign out stay reachable. On phones, the four main tabs move to the bottom. Settings has its own section navigation. A detail sits beside its list at widths of 1100 px or more; below that it becomes a modal sheet.
 
-Activity puts requests before expanded charts. Its compact/full chart choice stays in the tab. Filters reveal additional controls on phones. Long account names wrap without widening the document. Usage presents only the counters the server reports; token and cache detail belongs to watched requests on Activity.
+Activity puts requests before expanded charts. Its compact/full chart choice stays in the tab. Filters reveal additional controls on phones. Long account names wrap without widening the document.
+
+Activity, Usage and the server log read the server's history store (`/v8/management/history/*`), so they survive restarts and new tabs. Activity shows the last hour; Usage shows requests, failures and tokens per hour or day over 24 hours, 7 days or 30 days. When the store is off, each says so and names `storage.backend` instead of showing zeros.
 
 ## Interaction
 

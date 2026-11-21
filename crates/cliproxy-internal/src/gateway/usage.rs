@@ -11,6 +11,10 @@
 //! bounded copy of every accepted record that readers page through by cursor without
 //! removing anything, so it never competes with the queue, its RESP subscribers or
 //! other viewers.
+//!
+//! The history recorder ([`crate::runtime::history::Recorder`]) gets every record too,
+//! as a [`crate::persistence::history::RequestEntry`], whatever the queue settings:
+//! [`UsageQueue::accepts`] is true while either wants one.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -34,6 +38,7 @@ pub struct UsageQueue {
     usage_subscribers: std::sync::Arc<Subscribers>,
     error_subscribers: std::sync::Arc<Subscribers>,
     live: Mutex<LiveFeed>,
+    history: std::sync::RwLock<Option<Arc<crate::runtime::history::Recorder>>>,
 }
 
 /// Go `usageSubscriberBuffer` / `errorSubscriberBuffer`.
@@ -115,6 +120,7 @@ impl Default for UsageQueue {
             usage_subscribers: std::sync::Arc::default(),
             error_subscribers: std::sync::Arc::default(),
             live: Mutex::new(LiveFeed::new()),
+            history: std::sync::RwLock::default(),
         }
     }
 }
@@ -157,19 +163,57 @@ impl UsageQueue {
         }
     }
 
-    /// Whether a usage record would be kept; producers can skip building one.
+    /// Whether a usage record would be kept, by the queue or the history; producers can
+    /// skip building one otherwise.
     pub fn accepts(&self) -> bool {
+        self.queue_accepts() || self.history().is_some()
+    }
+
+    /// Whether the queue (Go's usage statistics) keeps records.
+    pub fn queue_accepts(&self) -> bool {
         self.enabled.load(Ordering::SeqCst) && self.statistics.load(Ordering::SeqCst)
     }
 
     pub fn wants_claude_cache(&self) -> bool {
-        self.accepts() && self.claude_cache.load(Ordering::SeqCst)
+        self.queue_accepts() && self.claude_cache.load(Ordering::SeqCst)
+    }
+
+    /// Sends every record from now on to `recorder` as well.
+    pub fn set_history(&self, recorder: Arc<crate::runtime::history::Recorder>) {
+        *self.history.write().unwrap_or_else(PoisonError::into_inner) = Some(recorder);
+    }
+
+    pub fn history(&self) -> Option<Arc<crate::runtime::history::Recorder>> {
+        self.history.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// An attempt Go's queue does not publish (a usage-required attempt that ended before
+    /// the provider reported usage): recorded in the history alone.
+    pub fn record_history(
+        &self,
+        record: &crate::gateway::usage_record::Record,
+        client: &crate::gateway::usage_record::Client,
+    ) {
+        if let Some(history) = self.history() {
+            history.request(crate::gateway::usage_record::history_entry(record, client));
+        }
+    }
+
+    /// One finished attempt: queued as Go's record while usage statistics are on, and
+    /// recorded in the history while one is attached.
+    pub fn record(&self, record: &crate::gateway::usage_record::Record, client: &crate::gateway::usage_record::Client) {
+        if self.queue_accepts() {
+            self.enqueue(crate::gateway::usage_record::queued(record, client));
+        }
+        if let Some(history) = self.history() {
+            history.request(crate::gateway::usage_record::history_entry(record, client));
+        }
     }
 
     /// Queues one serialized usage record (Go `usageQueuePlugin.HandleUsage` +
     /// `Enqueue`). The dashboard's live feed observes it first, whoever then takes it.
     pub fn enqueue(&self, payload: Vec<u8>) {
-        if !self.accepts() || payload.is_empty() {
+        if !self.queue_accepts() || payload.is_empty() {
             return;
         }
         self.live_lock().observe(&payload, Instant::now());
@@ -179,7 +223,7 @@ impl UsageQueue {
     /// Puts back a record that was popped but could not be delivered (Home's usage
     /// forwarder). The live feed saw it when it was first enqueued.
     pub fn requeue(&self, payload: Vec<u8>) {
-        if !self.accepts() || payload.is_empty() {
+        if !self.queue_accepts() || payload.is_empty() {
             return;
         }
         self.deliver(payload);

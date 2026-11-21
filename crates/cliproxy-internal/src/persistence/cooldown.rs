@@ -228,9 +228,9 @@ fn cds_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// A cooldown store other than `.cds` files (Go `CooldownStateStore` from a token store
-/// that is a `CooldownStateStoreProvider`: PGSTORE's `cooldown_store` table). Used
-/// while `save-cooldown-status` is on, in place of the files.
+/// A cooldown store other than `.cds` files (Go `CooldownStateStore`). Used while
+/// `save-cooldown-status` is on, in place of the files; tests supply one to restore
+/// recorded state.
 pub trait Backend: Send + Sync {
     /// Go `Load`.
     fn load(&self) -> Result<Vec<Record>, String>;
