@@ -186,7 +186,7 @@ The history store keeps what the server records about its own operation: one row
 | Setting | What it does |
 |---|---|
 | `backend` | `sqlite` (the default) keeps the history in an embedded SQLite file. `postgres` keeps it in PostgreSQL. `none` records nothing. Any other value stops the server at start. |
-| `sqlite-path` | The SQLite file. By default `history.db` in `$WRITABLE_PATH` when it is set, otherwise in the auth directory (in the working directory while a `PGSTORE_*`, `OBJECTSTORE_*` or `GITSTORE_*` store mirrors the auth directory). The file is created with owner-only permissions; SQLite keeps `-wal` and `-shm` files beside it. |
+| `sqlite-path` | The SQLite file. By default `history.db` in `$WRITABLE_PATH` when it is set, otherwise in the auth directory. The file is created with owner-only permissions; SQLite keeps `-wal` and `-shm` files beside it. |
 | `postgres-dsn` | Required with `backend: postgres`: a `postgres://` URL or `key=value` connection string. Unset parts come from the libpq environment (`PGHOST`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE` and so on); keep the password in `PGPASSWORD` rather than in `config.yaml`, which the Management API can read. |
 | `postgres-schema` | The schema for the history tables (`cliproxy_history_requests`, `cliproxy_history_events`, `cliproxy_history_schema`), created when missing. Empty uses the connection's search path, usually `public`. One server per schema: two servers appending to the same tables could make the dashboard skip a row. |
 | `retention-days` | Rows older than this many days are deleted, hourly. `30` by default; `0` keeps everything. Changes apply without a restart. |
