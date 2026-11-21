@@ -10,9 +10,9 @@
   import type { Bar } from "../parts/types";
   import { compact, num, percent, plural, time } from "../fmt";
   import Bars from "../parts/Bars.svelte";
+  import { sumByKey, type Totals } from "../records";
 
   type Group = "account" | "provider" | "model";
-  type Totals = { start: number; key: string; requests: number; failed: number; input_tokens: number; output_tokens: number; reasoning_tokens: number; cache_read_tokens: number; cache_creation_tokens: number; total_tokens: number };
   const HOUR = 3_600_000;
   const DAY = 24 * HOUR;
   const periods = [
@@ -57,7 +57,7 @@
       ]);
       if (mine !== run) return;
       series = parse(s);
-      groups = parse(g);
+      groups = sumByKey(parse(g));
       [from, to] = [start, end];
       phase = "ok";
       error = "";

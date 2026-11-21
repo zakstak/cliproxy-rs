@@ -1167,7 +1167,10 @@ async fn serve(
     // The history store: request history and server log events for the dashboard. Home
     // mode has no dashboard. A store that fails to open leaves the proxy serving.
     if home_config.is_none() {
-        let settings = cliproxy_internal::storage::HistorySettings::from_config(&rt.config())?;
+        // With a remote store, the auth directory is its mirror: the working directory, where
+        // Go's store spools live by default, holds the history instead.
+        let data_dir = store.as_ref().and_then(|_| std::env::current_dir().ok());
+        let settings = cliproxy_internal::storage::HistorySettings::at_startup(&rt.config(), data_dir.as_deref())?;
         match settings.open().await {
             Ok(Some(history)) => {
                 tracing::info!(
@@ -1277,6 +1280,12 @@ async fn serve(
     }
     // Server.Stop closes the HTTP server without draining (http.Server.Close).
     drop(server);
+    // What the history recorder accepted is written before the process exits.
+    if let Some(history) = rt.usage_queue().history()
+        && !history.flush(std::time::Duration::from_secs(5)).await
+    {
+        tracing::warn!("history store: entries still queued at shutdown were not written");
+    }
     served
 }
 

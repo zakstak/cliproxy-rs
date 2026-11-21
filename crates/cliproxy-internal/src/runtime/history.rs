@@ -26,6 +26,8 @@ const WARN_EVERY: Duration = Duration::from_secs(60);
 enum Item {
     Request(Box<RequestEntry>),
     Event(EventEntry),
+    /// Acknowledged once everything queued before it is written (or dropped).
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 /// Counts the dashboard reports about the recorder.
@@ -108,6 +110,18 @@ impl Recorder {
         })
     }
 
+    /// Waits until everything recorded before this call is written, at most `limit`.
+    /// For an orderly shutdown; returns false when the writer did not finish in time.
+    pub async fn flush(&self, limit: std::time::Duration) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // The queue may be full; waiting for room is fine here, unlike on the request path.
+        let sent = tokio::time::timeout(limit, self.tx.send(Item::Flush(tx))).await;
+        if !matches!(sent, Ok(Ok(()))) {
+            return false;
+        }
+        matches!(tokio::time::timeout(limit, rx).await, Ok(Ok(())))
+    }
+
     fn offer(&self, item: Item) {
         if self.tx.try_send(item).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -150,25 +164,34 @@ impl Recorder {
 async fn write_loop(recorder: std::sync::Weak<Recorder>, mut rx: mpsc::Receiver<Item>) {
     let mut items = Vec::with_capacity(BATCH);
     loop {
-        // Wait for a first entry, then let the batch fill for a moment.
+        // Wait for a first entry, then let the batch fill for a moment; a flush ends the
+        // batch at once.
         let Some(first) = rx.recv().await else { return };
+        let mut flushing = matches!(first, Item::Flush(_));
         items.push(first);
         let deadline = tokio::time::Instant::now() + LINGER;
-        while items.len() < BATCH {
+        while items.len() < BATCH && !flushing {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(item)) => items.push(item),
+                Ok(Some(item)) => {
+                    flushing = matches!(item, Item::Flush(_));
+                    items.push(item);
+                }
                 Ok(None) | Err(_) => break,
             }
         }
-        let (mut requests, mut events) = (Vec::new(), Vec::new());
+        let (mut requests, mut events, mut acks) = (Vec::new(), Vec::new(), Vec::new());
         for item in items.drain(..) {
             match item {
                 Item::Request(r) => requests.push(*r),
                 Item::Event(e) => events.push(e),
+                Item::Flush(ack) => acks.push(ack),
             }
         }
         let Some(recorder) = recorder.upgrade() else { return };
         recorder.write(requests, events).await;
+        for ack in acks {
+            let _ = ack.send(());
+        }
     }
 }
 
@@ -313,6 +336,32 @@ mod tests {
         let dropped = recorder.stats().dropped;
         assert!(dropped >= extra as u64, "dropped {dropped}");
         assert!(dropped <= (BATCH + extra) as u64, "dropped {dropped}");
+    }
+
+    #[tokio::test]
+    async fn flush_waits_for_everything_recorded_before_it() {
+        let store = Arc::new(MemoryHistory::default());
+        let recorder = Recorder::start(store.clone(), 0);
+        for at in 1..=3 {
+            recorder.request(entry(at));
+        }
+        assert!(recorder.flush(Duration::from_secs(10)).await);
+        let rows = store
+            .requests(RequestFilter::default(), Cursor::Newest, 10)
+            .await
+            .unwrap()
+            .rows;
+        assert_eq!(
+            rows.len(),
+            3,
+            "written before flush returned, without waiting for the linger"
+        );
+        assert!(
+            !Recorder::start(Arc::new(Stuck), 0)
+                .flush(Duration::from_millis(50))
+                .await,
+            "a stuck store times out"
+        );
     }
 
     #[tokio::test]

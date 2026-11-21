@@ -231,6 +231,10 @@ async fn history_routes_page_filter_and_total_the_store() {
         ("/history/totals?since=1", "required"),
         ("/history/totals?since=5&until=5", "after since"),
         ("/history/totals?since=0&until=100000000&bucket=1000", "buckets"),
+        (
+            "/history/totals?since=-9223372036854775808&until=9223372036854775807&bucket=1000",
+            "buckets",
+        ),
         ("/history/totals?since=0&until=10&bucket=10", "bucket"),
         ("/history/totals?since=0&until=10&group=colour", "group"),
     ] {
