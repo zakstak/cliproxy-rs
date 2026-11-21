@@ -191,7 +191,8 @@ pub(crate) async fn totals(State(state): State<Arc<Management>>, RawQuery(raw): 
             if until <= since {
                 return Err(bad("until must be after since"));
             }
-            if (until.0 - since.0) / bucket > MAX_BUCKETS {
+            // i128: the bounds are any i64, and their difference can exceed one.
+            if (i128::from(until.0) - i128::from(since.0)) / i128::from(bucket) > i128::from(MAX_BUCKETS) {
                 return Err(bad(format!(
                     "at most {MAX_BUCKETS} buckets per answer; use a wider bucket"
                 )));
