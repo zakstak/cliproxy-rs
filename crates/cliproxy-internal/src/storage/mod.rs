@@ -412,6 +412,17 @@ impl HistorySettings {
     /// Reads `storage.*` from `cfg`. The SQLite file defaults to `$WRITABLE_PATH/history.db`,
     /// else `history.db` in the auth directory, which the server can always write.
     pub fn from_config(cfg: &crate::config::Config) -> AnyResult<Self> {
+        Self::read(cfg, None)
+    }
+
+    /// [`Self::from_config`] at startup. `data_dir` replaces the auth directory as the
+    /// default SQLite location: with a remote store, the auth directory is the store's
+    /// mirror, which belongs to the store.
+    pub fn at_startup(cfg: &crate::config::Config, data_dir: Option<&Path>) -> AnyResult<Self> {
+        Self::read(cfg, data_dir)
+    }
+
+    fn read(cfg: &crate::config::Config, data_dir: Option<&Path>) -> AnyResult<Self> {
         let section = cfg.document.get("storage");
         let text = |key: &str| {
             section
@@ -434,7 +445,7 @@ impl HistorySettings {
         let backend = match text("backend").map(str::to_ascii_lowercase).as_deref() {
             None | Some("sqlite") => HistoryBackend::Sqlite(match text("sqlite-path") {
                 Some(path) => PathBuf::from(path),
-                None => default_sqlite_path(cfg),
+                None => default_sqlite_path(cfg, data_dir),
             }),
             Some("none") => HistoryBackend::None,
             Some(other) => return Err(anyhow!("storage.backend {other:?} is not one of sqlite, none")),
@@ -454,7 +465,7 @@ impl HistorySettings {
     }
 }
 
-fn default_sqlite_path(cfg: &crate::config::Config) -> PathBuf {
+fn default_sqlite_path(cfg: &crate::config::Config, data_dir: Option<&Path>) -> PathBuf {
     for key in ["WRITABLE_PATH", "writable_path"] {
         if let Ok(v) = std::env::var(key)
             && !v.trim().is_empty()
@@ -462,7 +473,7 @@ fn default_sqlite_path(cfg: &crate::config::Config) -> PathBuf {
             return Path::new(v.trim()).join(HISTORY_FILE);
         }
     }
-    cfg.auth_dir.join(HISTORY_FILE)
+    data_dir.unwrap_or(&cfg.auth_dir).join(HISTORY_FILE)
 }
 
 #[cfg(test)]
@@ -491,6 +502,15 @@ mod history_settings_tests {
             HistoryBackend::None
         );
         assert!(settings("storage: {backend: mongo}\n").is_err());
+        if std::env::var_os("WRITABLE_PATH").is_none() && std::env::var_os("writable_path").is_none() {
+            let cfg = crate::config::Config::parse("auth-dir: /srv/pgstore/auths\n").unwrap();
+            let mirrored = HistorySettings::at_startup(&cfg, Some(Path::new("/srv"))).unwrap();
+            assert_eq!(
+                mirrored.backend,
+                HistoryBackend::Sqlite(PathBuf::from("/srv/history.db")),
+                "never inside a remote store's auth mirror"
+            );
+        }
         assert!(settings("storage: {retention-days: -1}\n").is_err());
         assert!(
             crate::config::Config::parse("storage: {retention-days: soon}\n").is_err(),
