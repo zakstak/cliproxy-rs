@@ -2723,6 +2723,31 @@ pub(crate) fn history_entry(record: &Record, client: &Client) -> crate::persiste
         .map(|t| t.timestamp_millis())
         .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
     let detail = ensure_breakdown(record.detail.clone(), &record.provider, &record.executor_type);
+    // The v2 breakdown normalizes providers: input counts cache reads and writes, output
+    // counts reasoning. Without a complete one, the flat counters are what there is.
+    let (input, cache_read, cache_creation, output, reasoning) = match detail.breakdown {
+        Some(b) if b.quality == Quality::Complete => (b.input[0], b.input[2], b.input[3], b.output[0], b.output[2]),
+        _ => (
+            detail.input,
+            detail.cache_read,
+            detail.cache_creation,
+            detail.output,
+            detail.reasoning,
+        ),
+    };
+    let t = &record.timings;
+    let timings = [
+        ("client_body_received_ms", t.client_body_received_ms),
+        ("upstream_started_ms", t.upstream_started_ms),
+        ("upstream_connected_ms", t.upstream_connected_ms),
+        ("upstream_body_sent_ms", t.upstream_body_sent_ms),
+        ("upstream_headers_ms", t.upstream_headers_ms),
+        ("upstream_first_byte_ms", t.upstream_first_byte_ms),
+        ("client_first_byte_ms", t.client_first_byte_ms),
+    ]
+    .into_iter()
+    .filter_map(|(name, ms)| Some((name.to_owned(), ms?)))
+    .collect();
     let status = if !record.failed {
         200
     } else if record.fail_status > 0 {
@@ -2748,18 +2773,21 @@ pub(crate) fn history_entry(record: &Record, client: &Client) -> crate::persiste
         endpoint: client.endpoint.trim().to_owned(),
         auth_index: record.auth_index.trim().to_owned(),
         account: record.account.trim().to_owned(),
+        user_agent: client.user_agent.trim().to_owned(),
         stream: record.stream,
         failed: record.failed,
         status,
         fail_body: fail_body.to_owned(),
-        input_tokens: detail.input,
-        output_tokens: detail.output,
-        reasoning_tokens: detail.reasoning,
-        cache_read_tokens: detail.cache_read,
-        cache_creation_tokens: detail.cache_creation,
+        usage_reported: record.usage_observed != Some(false),
+        input_tokens: input,
+        output_tokens: output,
+        reasoning_tokens: reasoning,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
         total_tokens: detail.total,
         latency_ms: record.latency_ms,
         ttft_ms: record.ttft_ms,
+        timings,
         session_id: client.session_id.trim().to_owned(),
         reasoning_effort: record.reasoning_effort.trim().to_owned(),
         service_tier: record.service_tier.trim().to_owned(),
@@ -2992,6 +3020,50 @@ mod tests {
         assert!(entry.fail_body.len() <= HISTORY_FAIL_BODY_MAX && entry.fail_body.chars().all(|c| c == 'é'));
         let json = serde_json::to_string(&entry).unwrap();
         assert!(!json.contains("FAKE"), "{json}");
+        assert!(!entry.usage_reported || record.usage_observed.is_none());
+    }
+
+    #[test]
+    fn history_input_counts_cache_reads_and_writes_for_every_provider() {
+        let claude = Record {
+            timestamp: "2026-11-21T10:00:00Z".into(),
+            provider: "claude".into(),
+            executor_type: "claude".into(),
+            detail: parse_claude(
+                br#"{"usage":{"input_tokens":10,"output_tokens":4,"cache_read_input_tokens":100,"cache_creation_input_tokens":5}}"#,
+            ),
+            timings: Timings {
+                upstream_headers_ms: Some(80),
+                upstream_connection_reused: Some(true),
+                ..Timings::default()
+            },
+            ..Record::default()
+        };
+        let client = Client {
+            user_agent: "claude-cli/2.1".into(),
+            ..Client::default()
+        };
+        let e = history_entry(&claude, &client);
+        assert_eq!(
+            (
+                e.input_tokens,
+                e.cache_read_tokens,
+                e.cache_creation_tokens,
+                e.output_tokens
+            ),
+            (115, 100, 5, 4)
+        );
+        assert!(e.usage_reported);
+        assert_eq!(e.user_agent, "claude-cli/2.1");
+        assert_eq!(
+            e.timings,
+            std::collections::BTreeMap::from([("upstream_headers_ms".to_owned(), 80)])
+        );
+        let unobserved = Record {
+            usage_observed: Some(false),
+            ..claude
+        };
+        assert!(!history_entry(&unobserved, &client).usage_reported);
     }
 
     #[test]

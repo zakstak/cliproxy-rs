@@ -170,7 +170,7 @@ impl UsageQueue {
     }
 
     /// Whether the queue (Go's usage statistics) keeps records.
-    fn queue_accepts(&self) -> bool {
+    pub fn queue_accepts(&self) -> bool {
         self.enabled.load(Ordering::SeqCst) && self.statistics.load(Ordering::SeqCst)
     }
 
