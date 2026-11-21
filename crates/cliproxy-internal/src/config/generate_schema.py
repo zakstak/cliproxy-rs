@@ -110,6 +110,8 @@ schema["fields"]["worker-threads"] = "int"
 put("storage.backend", "string")
 put("storage.sqlite-path", "string")
 put("storage.retention-days", "int")
+put("storage.postgres-dsn", "string")
+put("storage.postgres-schema", "string")
 schema["fields"].pop("home", None)
 Path(__file__).with_name("schema.json").write_text(json.dumps(schema, indent=2) + "\n")
 print(f"Generated schema from {revision}")

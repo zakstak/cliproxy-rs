@@ -1261,7 +1261,7 @@ async fn serve(
     // mode has no dashboard. A store that fails to open leaves the proxy serving.
     if home_config.is_none() {
         let settings = cliproxy_internal::storage::HistorySettings::from_config(&rt.config())?;
-        match settings.open() {
+        match settings.open().await {
             Ok(Some(history)) => {
                 tracing::info!(
                     backend = history.backend(),

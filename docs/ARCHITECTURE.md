@@ -40,7 +40,7 @@ the client response and settle the lease. Upstream capture goes through
 | Config documents, credentials and execution envelopes | `config`, `credential`, `execution`, `format` |
 | Static and dynamic model catalogs | `catalog` |
 | Persistence contracts (history store, cooldown records) | `persistence` |
-| Storage backends: SQLite history; PostgreSQL, object storage and Git adapters | `storage` |
+| Storage backends: SQLite and PostgreSQL history; PostgreSQL, object storage and Git adapters | `storage` |
 | Home enrollment, dispatch, leases and protocol | `home` |
 | Shared text compatibility and private filesystem operations | `text`, `private_fs` |
 
@@ -51,8 +51,8 @@ their concrete executor fields. `persistence::StorePersister` describes persiste
 without belonging to the HTTP gateway. `PostgresStore` and `ObjectStore` implement
 that trait directly. `GitPersister` moves blocking Git work onto the blocking pool.
 `persistence::history::HistoryStore` is the store for request history and server log
-events. `storage::SqliteHistory` and `persistence::history::memory::MemoryHistory`
-implement it, and every implementation runs `persistence::history::conformance::run`.
+events. `storage::SqliteHistory`, `storage::PostgresHistory` and
+`persistence::history::memory::MemoryHistory` implement it, and every implementation runs `persistence::history::conformance::run`.
 Use concrete functions for fixed operations that need no interchangeable implementation.
 
 `protocol/json_output.rs` builds generated JSON objects for HTTP envelopes and Home

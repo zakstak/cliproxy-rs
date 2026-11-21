@@ -11,6 +11,7 @@ mod mirror;
 mod object;
 mod pgconn;
 mod postgres;
+mod postgres_history;
 mod sigv4;
 mod sqlite;
 
@@ -23,6 +24,7 @@ use std::time::Duration;
 pub use git::{GitPersister, GitStore};
 pub use object::{ObjectConfig, ObjectStore};
 pub use postgres::{PgCooldown, PostgresConfig, PostgresStore};
+pub use postgres_history::PostgresHistory;
 pub use sqlite::SqliteHistory;
 
 use crate::persistence::StorePersister;
@@ -395,6 +397,8 @@ pub enum HistoryBackend {
     None,
     /// `storage.backend: sqlite` (the default) at `storage.sqlite-path`.
     Sqlite(PathBuf),
+    /// `storage.backend: postgres` at `storage.postgres-dsn`, in `storage.postgres-schema`.
+    Postgres { dsn: String, schema: String },
 }
 
 /// `storage.*`: where the history lives and how long it is kept.
@@ -437,7 +441,17 @@ impl HistorySettings {
                 None => default_sqlite_path(cfg),
             }),
             Some("none") => HistoryBackend::None,
-            Some(other) => return Err(anyhow!("storage.backend {other:?} is not one of sqlite, none")),
+            Some("postgres" | "postgresql") => HistoryBackend::Postgres {
+                dsn: text("postgres-dsn")
+                    .ok_or_else(|| anyhow!("storage.backend: postgres needs storage.postgres-dsn"))?
+                    .to_owned(),
+                schema: text("postgres-schema").unwrap_or_default().to_owned(),
+            },
+            Some(other) => {
+                return Err(anyhow!(
+                    "storage.backend {other:?} is not one of sqlite, postgres, none"
+                ));
+            }
         };
         Ok(Self {
             backend,
@@ -446,10 +460,14 @@ impl HistorySettings {
     }
 
     /// Opens the configured store; `None` for `storage.backend: none`.
-    pub fn open(&self) -> AnyResult<Option<Arc<dyn crate::persistence::history::HistoryStore>>> {
+    pub async fn open(&self) -> AnyResult<Option<Arc<dyn crate::persistence::history::HistoryStore>>> {
         Ok(match &self.backend {
             HistoryBackend::None => None,
-            HistoryBackend::Sqlite(path) => Some(Arc::new(SqliteHistory::open(path)?)),
+            HistoryBackend::Sqlite(path) => {
+                let path = path.clone();
+                Some(Arc::new(blocking(move || SqliteHistory::open(&path)).await?))
+            }
+            HistoryBackend::Postgres { dsn, schema } => Some(Arc::new(PostgresHistory::connect(dsn, schema).await?)),
         })
     }
 }
@@ -490,6 +508,16 @@ mod history_settings_tests {
             settings("storage: {backend: none}\n").unwrap().backend,
             HistoryBackend::None
         );
+        assert_eq!(
+            settings("storage: {backend: postgres, postgres-dsn: 'postgres://h/db', postgres-schema: proxy}\n")
+                .unwrap()
+                .backend,
+            HistoryBackend::Postgres {
+                dsn: "postgres://h/db".into(),
+                schema: "proxy".into()
+            }
+        );
+        assert!(settings("storage: {backend: postgres}\n").is_err(), "a DSN is required");
         assert!(settings("storage: {backend: mongo}\n").is_err());
         assert!(settings("storage: {retention-days: -1}\n").is_err());
         assert!(

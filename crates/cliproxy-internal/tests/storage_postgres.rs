@@ -623,3 +623,47 @@ async fn seeding_upserts_the_prepared_config() {
     assert_eq!(row("refused").await, None);
     assert_eq!(std::fs::read_to_string(refused.config_path()).unwrap(), anchored);
 }
+
+/// The history store contract on PostgreSQL, in a quoted schema, and the schema version
+/// guard: a database from a newer server is refused, an existing one is reused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_history_meets_the_contract() {
+    use cliproxy_internal::persistence::history::{Cursor, HistoryStore, RequestFilter, conformance};
+    use cliproxy_internal::storage::PostgresHistory;
+    let Some(cluster) = Cluster::start() else { return };
+    let schema = "history \"tenant\"";
+    let store = PostgresHistory::connect(&cluster.dsn(), schema).await.unwrap();
+    conformance::run(&store).await;
+    // Reconnecting keeps the rows and does not run the migration again.
+    let again = PostgresHistory::connect(&cluster.dsn(), schema).await.unwrap();
+    let rows = again
+        .requests(RequestFilter::default(), Cursor::Newest, 10)
+        .await
+        .unwrap()
+        .rows;
+    assert_eq!(rows.len(), 4, "the conformance run leaves four requests");
+    let sql = cluster.client().await;
+    sql.batch_execute("INSERT INTO \"history \"\"tenant\"\"\".cliproxy_history_schema (version) VALUES (99)")
+        .await
+        .unwrap();
+    let error = PostgresHistory::connect(&cluster.dsn(), schema)
+        .await
+        .err()
+        .expect("refused");
+    assert!(
+        format!("{error:#}").contains("newer than this server supports"),
+        "{error:#}"
+    );
+    // Another schema in the same database is independent.
+    let other = PostgresHistory::connect(&cluster.dsn(), "").await.unwrap();
+    assert!(
+        other
+            .requests(RequestFilter::default(), Cursor::Newest, 10)
+            .await
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+    let missing = PostgresHistory::connect("", "").await.err().expect("a DSN is required");
+    assert!(format!("{missing:#}").contains("postgres-dsn"), "{missing:#}");
+}

@@ -1565,7 +1565,9 @@
       "fields": {
         "backend": "string",
         "sqlite-path": "string",
-        "retention-days": "int"
+        "retention-days": "int",
+        "postgres-dsn": "string",
+        "postgres-schema": "string"
       }
     }
   }
