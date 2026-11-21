@@ -181,15 +181,15 @@ service-name ports such as `:http` are not accepted.
 
 ## storage
 
-The history store keeps what the server records about its own operation: one row per upstream attempt (time, request ID, provider, model, account, status, token counts, latency) and every server log line. The dashboard reads it, so request history and the server log survive a restart. Rows never hold a client key, a provider key, a client address or a prompt: an API-key credential is recorded by its `auth_index` only.
+The history store keeps what the server records about its own operation: one row per upstream attempt the usage tracker settles (time, request ID, provider, model, account, status, token counts, latency) and every server log line. As in the usage queue, an attempt on a route that needs provider usage (Claude, xAI) is not recorded when the client leaves before the provider reported any. The dashboard reads it, so request history and the server log survive a restart. Rows never hold a client key, a provider key, a client address or a prompt: an API-key credential is recorded by its `auth_index` only.
 
 | Setting | What it does |
 |---|---|
 | `backend` | `sqlite` (the default) keeps the history in an embedded SQLite file. `none` records nothing. Any other value stops the server at start. |
-| `sqlite-path` | The SQLite file. By default `history.db` in `$WRITABLE_PATH` when it is set, otherwise in the auth directory. The file is created with owner-only permissions; SQLite keeps `-wal` and `-shm` files beside it. |
+| `sqlite-path` | The SQLite file. By default `history.db` in `$WRITABLE_PATH` when it is set, otherwise in the auth directory (in the working directory while a `PGSTORE_*`, `OBJECTSTORE_*` or `GITSTORE_*` store mirrors the auth directory). The file is created with owner-only permissions; SQLite keeps `-wal` and `-shm` files beside it. |
 | `retention-days` | Rows older than this many days are deleted, hourly. `30` by default; `0` keeps everything. Changes apply without a restart. |
 
-`backend` and `sqlite-path` are read at start; change them and restart. When the store cannot be opened (for example a read-only directory), the server logs an error and serves without recording. Writes happen in the background in batches: a slow disk never delays a request, and entries that do not fit the bounded queue are dropped and counted rather than waited for. Home mode records nothing, as it has no dashboard.
+`backend` and `sqlite-path` are read at start; change them and restart. When the store cannot be opened (for example a read-only directory), the server logs an error and serves without recording. Writes happen in the background in batches: a slow disk never delays a request, and entries that do not fit the bounded queue are dropped and counted rather than waited for. An orderly shutdown waits up to five seconds for queued entries to be written. Home mode records nothing, as it has no dashboard.
 
 While a history store is open, every upstream attempt is tracked as if `observability.usage.usage-statistics-enabled` were on. The usage queue, its RESP channel and the live feed still follow that setting. Tracking also sends a request body to an HTTP/1.1 upstream in 64 KiB pieces, with the same bytes and `Content-Length`.
 
