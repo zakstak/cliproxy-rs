@@ -332,6 +332,7 @@ impl HistoryStore for SqliteHistory {
     }
 
     fn append_requests(&self, batch: Vec<RequestEntry>) -> BoxFuture<'_, Result<()>> {
+        let batch: Vec<_> = batch.into_iter().map(RequestEntry::storable).collect();
         self.run(move |conn| {
             let tx = conn.transaction()?;
             {
@@ -380,6 +381,7 @@ impl HistoryStore for SqliteHistory {
     }
 
     fn append_events(&self, batch: Vec<EventEntry>) -> BoxFuture<'_, Result<()>> {
+        let batch: Vec<_> = batch.into_iter().map(EventEntry::storable).collect();
         self.run(move |conn| {
             let tx = conn.transaction()?;
             {
