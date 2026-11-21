@@ -2781,7 +2781,12 @@ pub(crate) fn history_entry(record: &Record, client: &Client) -> crate::persiste
         request_id: client.request_id.trim().to_owned(),
         execution_id: record.execution_id.trim().to_owned(),
         provider: record.provider.trim().to_owned(),
-        model: record.model.trim().to_owned(),
+        // The model the client asked for: its alias when it used one, as the usage record's
+        // `alias` falls back to `model`.
+        model: match record.alias.trim() {
+            "" => record.model.trim().to_owned(),
+            alias => alias.to_owned(),
+        },
         response_model: record.response_model.trim().to_owned(),
         endpoint: client.endpoint.trim().to_owned(),
         auth_index: record.auth_index.trim().to_owned(),
@@ -3056,6 +3061,21 @@ mod tests {
             user_agent: "claude-cli/2.1".into(),
             ..Client::default()
         };
+        let aliased = Record {
+            model: "claude-sonnet-4-5".into(),
+            alias: "my-alias".into(),
+            ..claude.clone()
+        };
+        assert_eq!(
+            history_entry(&aliased, &client).model,
+            "my-alias",
+            "the model the client asked for"
+        );
+        let plain = Record {
+            model: "claude-sonnet-4-5".into(),
+            ..claude.clone()
+        };
+        assert_eq!(history_entry(&plain, &client).model, "claude-sonnet-4-5");
         let e = history_entry(&claude, &client);
         assert_eq!(
             (
