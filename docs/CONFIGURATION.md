@@ -181,7 +181,7 @@ service-name ports such as `:http` are not accepted.
 
 ## storage
 
-The history store keeps what the server records about its own operation: one row per upstream attempt the usage tracker settles (time, request ID, provider, model, account, status, token counts, latency) and every server log line. As in the usage queue, an attempt on a route that needs provider usage (Claude, xAI) is not recorded when the client leaves before the provider reported any. The dashboard reads it, so request history and the server log survive a restart. Rows never hold a client key, a provider key, a client address or a prompt: an API-key credential is recorded by its `auth_index` only.
+The history store keeps what the server records about its own operation: one row per upstream attempt the usage tracker settles (time, request ID, provider, model, account, status, token counts, latency) and every server log line. An attempt that ended before the provider reported usage is kept with its token counts marked unknown, including the ones the usage queue leaves out (on Claude and xAI, which need provider usage). The dashboard reads it, so request history and the server log survive a restart. Rows never hold a client key, a provider key, a client address or a prompt: an API-key credential is recorded by its `auth_index` only.
 
 | Setting | What it does |
 |---|---|

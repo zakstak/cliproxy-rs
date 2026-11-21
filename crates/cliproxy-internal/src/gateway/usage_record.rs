@@ -1949,6 +1949,8 @@ impl Observer {
             (record.executor_type, record.model) = (executor_type, model);
         }
         let (latency, ttft);
+        // An attempt Go's queue does not publish, recorded in the history alone.
+        let mut history_only = false;
         if let Some(outcome) = reported.outcome.take() {
             record.failed = outcome.failed;
             record.fail_status = outcome.status;
@@ -1962,7 +1964,9 @@ impl Observer {
         } else {
             let usage = reported.usage();
             record.detail = if reported.usage_required && usage.is_none() {
-                if reported.claude_cache.is_none() {
+                // Go publishes nothing here; the history still keeps the attempt.
+                history_only = reported.claude_cache.is_none();
+                if history_only && queue.history().is_none() {
                     return;
                 }
                 record.usage_observed = Some(false);
@@ -1995,7 +1999,7 @@ impl Observer {
             auth_id: &origin.auth_id,
             sent: &origin.sent,
         };
-        finish(queue, record, reported, latency, ttft, &stamp);
+        finish(queue, record, reported, latency, ttft, &stamp, history_only);
     }
 
     /// A record of its own on this observer's origin.
@@ -2192,6 +2196,7 @@ fn finish(
     latency: std::time::Duration,
     ttft: std::time::Duration,
     stamp: &Stamp<'_>,
+    history_only: bool,
 ) {
     // #25: nothing of the upstream's answer keeps a value its request or socket carried.
     // Status, scope and every other field stay as classified.
@@ -2237,6 +2242,10 @@ fn finish(
     }
     if let Some(tier) = reported.sent_tier {
         record.service_tier = tier;
+    }
+    if history_only {
+        queue.record_history(&record, stamp.client);
+        return;
     }
     queue.record(&record, stamp.client);
     warn_model_substitution(&record, &reported.upstream_model, stamp.auth_id);
@@ -2431,6 +2440,8 @@ impl Tracker {
             record.fail_code = code;
         }
         let (latency, ttft);
+        // An attempt Go's queue does not publish, recorded in the history alone.
+        let mut history_only = false;
         if let Some(outcome) = reported.outcome.take() {
             record.failed = outcome.failed;
             record.fail_status = outcome.status;
@@ -2453,7 +2464,9 @@ impl Tracker {
             }
             let detail = match ending {
                 Ending::Done if reported.usage_required && usage.is_none() => {
-                    if reported.claude_cache.is_none() {
+                    // Go publishes nothing here; the history still keeps the attempt.
+                    history_only = reported.claude_cache.is_none();
+                    if history_only && queue.history().is_none() {
                         return;
                     }
                     // Keep activity and timestamps even when a Claude stream never
@@ -2495,7 +2508,7 @@ impl Tracker {
             auth_id: &origin.auth_id,
             sent: &origin.sent,
         };
-        finish(queue, record, reported, latency, ttft, &stamp);
+        finish(queue, record, reported, latency, ttft, &stamp, history_only);
     }
 }
 

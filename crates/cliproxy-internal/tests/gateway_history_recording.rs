@@ -18,6 +18,7 @@ use tokio::sync::mpsc;
 const CREATED: &str = r#"{"type":"response.created","response":{"id":"resp_1","object":"response","model":"grok-4.7","status":"in_progress","output":[]}}"#;
 const DELTA: &str =
     r#"{"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"hi"}"#;
+const COMPLETED_BARE: &str = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","model":"grok-4.7","status":"completed","output":[]}}"#;
 const COMPLETED_USAGE: &str = r#"{"type":"response.completed","response":{"id":"resp_1","object":"response","model":"grok-4.7","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}"#;
 
 #[derive(Clone, Copy)]
@@ -100,7 +101,14 @@ async fn mock(behaviour: Upstream) -> (String, mpsc::UnboundedReceiver<()>) {
 }
 
 async fn proxy(statistics: bool) -> (String, Arc<cliproxy_internal::runtime::Runtime>, Arc<MemoryHistory>) {
-    let (upstream, _ready) = mock(Upstream::Complete(COMPLETED_USAGE)).await;
+    proxy_with(statistics, COMPLETED_USAGE).await
+}
+
+async fn proxy_with(
+    statistics: bool,
+    completed: &'static str,
+) -> (String, Arc<cliproxy_internal::runtime::Runtime>, Arc<MemoryHistory>) {
+    let (upstream, _ready) = mock(Upstream::Complete(completed)).await;
     // A private auth-dir: without one, credential loading reads the real ~/.cli-proxy-api.
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -205,4 +213,20 @@ async fn history_and_the_usage_queue_both_get_the_attempt() {
     assert_eq!(queued.len(), 1);
     let record: serde_json::Value = serde_json::from_slice(&queued[0]).unwrap();
     assert_eq!(record["tokens"]["total_tokens"], 10, "Go's record is unchanged");
+}
+
+/// A stream that ends without provider usage is not published by Go's queue (xAI needs
+/// usage); the history keeps it with its usage marked unknown.
+#[tokio::test]
+async fn history_keeps_an_attempt_the_queue_drops_for_missing_usage() {
+    let (addr, rt, store) = proxy_with(true, COMPLETED_BARE).await;
+    complete_request(&addr).await;
+    let rows = stored(&store).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(!rows[0].entry.usage_reported);
+    assert!(!rows[0].entry.failed);
+    assert!(
+        rt.usage_queue().pop_oldest(10).is_empty(),
+        "Go's queue still publishes nothing"
+    );
 }
