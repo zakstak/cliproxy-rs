@@ -32,10 +32,12 @@ const MIGRATIONS: &[&str] = &[
         endpoint TEXT NOT NULL,
         auth_index TEXT NOT NULL,
         account TEXT NOT NULL,
+        user_agent TEXT NOT NULL,
         stream INTEGER NOT NULL,
         failed INTEGER NOT NULL,
         status INTEGER NOT NULL,
         fail_body TEXT NOT NULL,
+        usage_reported INTEGER NOT NULL,
         input_tokens INTEGER NOT NULL,
         output_tokens INTEGER NOT NULL,
         reasoning_tokens INTEGER NOT NULL,
@@ -44,6 +46,7 @@ const MIGRATIONS: &[&str] = &[
         total_tokens INTEGER NOT NULL,
         latency_ms INTEGER NOT NULL,
         ttft_ms INTEGER NOT NULL,
+        timings TEXT NOT NULL,
         session_id TEXT NOT NULL,
         reasoning_effort TEXT NOT NULL,
         service_tier TEXT NOT NULL
@@ -62,10 +65,36 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
-const REQUEST_COLUMNS: &str = "id, at_ms, request_id, execution_id, provider, model, response_model, endpoint, \
-    auth_index, account, stream, failed, status, fail_body, input_tokens, output_tokens, reasoning_tokens, \
-    cache_read_tokens, cache_creation_tokens, total_tokens, latency_ms, ttft_ms, session_id, reasoning_effort, \
-    service_tier";
+/// The `requests` columns an insert writes, in its parameter order.
+const REQUEST_INSERT_COLUMNS: [&str; 27] = [
+    "at_ms",
+    "request_id",
+    "execution_id",
+    "provider",
+    "model",
+    "response_model",
+    "endpoint",
+    "auth_index",
+    "account",
+    "user_agent",
+    "stream",
+    "failed",
+    "status",
+    "fail_body",
+    "usage_reported",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "total_tokens",
+    "latency_ms",
+    "ttft_ms",
+    "timings",
+    "session_id",
+    "reasoning_effort",
+    "service_tier",
+];
 
 pub struct SqliteHistory {
     path: PathBuf,
@@ -242,34 +271,39 @@ fn paged<T>(
 }
 
 fn read_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRequest> {
-    let status: i64 = row.get(12)?;
+    let status: i64 = row.get("status")?;
+    let timings: String = row.get("timings")?;
     Ok(StoredRequest {
-        id: RowId(row.get(0)?),
+        id: RowId(row.get("id")?),
         entry: RequestEntry {
-            at: UnixMillis(row.get(1)?),
-            request_id: row.get(2)?,
-            execution_id: row.get(3)?,
-            provider: row.get(4)?,
-            model: row.get(5)?,
-            response_model: row.get(6)?,
-            endpoint: row.get(7)?,
-            auth_index: row.get(8)?,
-            account: row.get(9)?,
-            stream: row.get(10)?,
-            failed: row.get(11)?,
+            at: UnixMillis(row.get("at_ms")?),
+            request_id: row.get("request_id")?,
+            execution_id: row.get("execution_id")?,
+            provider: row.get("provider")?,
+            model: row.get("model")?,
+            response_model: row.get("response_model")?,
+            endpoint: row.get("endpoint")?,
+            auth_index: row.get("auth_index")?,
+            account: row.get("account")?,
+            user_agent: row.get("user_agent")?,
+            stream: row.get("stream")?,
+            failed: row.get("failed")?,
             status: u16::try_from(status).unwrap_or(0),
-            fail_body: row.get(13)?,
-            input_tokens: row.get(14)?,
-            output_tokens: row.get(15)?,
-            reasoning_tokens: row.get(16)?,
-            cache_read_tokens: row.get(17)?,
-            cache_creation_tokens: row.get(18)?,
-            total_tokens: row.get(19)?,
-            latency_ms: row.get(20)?,
-            ttft_ms: row.get(21)?,
-            session_id: row.get(22)?,
-            reasoning_effort: row.get(23)?,
-            service_tier: row.get(24)?,
+            fail_body: row.get("fail_body")?,
+            usage_reported: row.get("usage_reported")?,
+            input_tokens: row.get("input_tokens")?,
+            output_tokens: row.get("output_tokens")?,
+            reasoning_tokens: row.get("reasoning_tokens")?,
+            cache_read_tokens: row.get("cache_read_tokens")?,
+            cache_creation_tokens: row.get("cache_creation_tokens")?,
+            total_tokens: row.get("total_tokens")?,
+            latency_ms: row.get("latency_ms")?,
+            ttft_ms: row.get("ttft_ms")?,
+            // Written by this module from a map; unreadable text reads as no timings.
+            timings: serde_json::from_str(&timings).unwrap_or_default(),
+            session_id: row.get("session_id")?,
+            reasoning_effort: row.get("reasoning_effort")?,
+            service_tier: row.get("service_tier")?,
         },
     })
 }
@@ -297,14 +331,14 @@ impl HistoryStore for SqliteHistory {
         self.run(move |conn| {
             let tx = conn.transaction()?;
             {
-                let mut stmt = tx.prepare_cached(
-                    "INSERT INTO requests (at_ms, request_id, execution_id, provider, model, response_model, \
-                     endpoint, auth_index, account, stream, failed, status, fail_body, input_tokens, output_tokens, \
-                     reasoning_tokens, cache_read_tokens, cache_creation_tokens, total_tokens, latency_ms, ttft_ms, \
-                     session_id, reasoning_effort, service_tier) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                )?;
+                let sql = format!(
+                    "INSERT INTO requests ({}) VALUES ({})",
+                    REQUEST_INSERT_COLUMNS.join(", "),
+                    vec!["?"; REQUEST_INSERT_COLUMNS.len()].join(", ")
+                );
+                let mut stmt = tx.prepare_cached(&sql)?;
                 for e in &batch {
+                    let timings = serde_json::to_string(&e.timings)?;
                     stmt.execute(params![
                         e.at.0,
                         e.request_id,
@@ -315,10 +349,12 @@ impl HistoryStore for SqliteHistory {
                         e.endpoint,
                         e.auth_index,
                         e.account,
+                        e.user_agent,
                         e.stream,
                         e.failed,
                         e.status,
                         e.fail_body,
+                        e.usage_reported,
                         e.input_tokens,
                         e.output_tokens,
                         e.reasoning_tokens,
@@ -327,6 +363,7 @@ impl HistoryStore for SqliteHistory {
                         e.total_tokens,
                         e.latency_ms,
                         e.ttft_ms,
+                        timings,
                         e.session_id,
                         e.reasoning_effort,
                         e.service_tier,
@@ -362,7 +399,7 @@ impl HistoryStore for SqliteHistory {
         self.run(move |conn| {
             let mut w = request_where(filter);
             let order = w.cursor(cursor);
-            let sql = format!("SELECT {REQUEST_COLUMNS} FROM requests {} {order}", w.sql());
+            let sql = format!("SELECT * FROM requests {} {order}", w.sql());
             paged(conn, &sql, w.params, limit, read_request)
         })
     }
