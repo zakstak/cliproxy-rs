@@ -1,392 +1,78 @@
-//! Remote homes for `config.yaml` and the auth files, chosen by `PGSTORE_*`,
-//! `OBJECTSTORE_*` and `GITSTORE_*` (Go cmd/server/main.go and internal/store). Each
-//! store mirrors its content into a local workspace; the server runs on those files
-//! and reports changes back through [`crate::persistence::StorePersister`].
+//! Storage backends for the history store ([`crate::persistence::history::HistoryStore`]):
+//! embedded SQLite (the default) and PostgreSQL, chosen by the `storage` config section.
+//!
+//! Go CLIProxyAPI's remote config and credential stores (`PGSTORE_*`, `OBJECTSTORE_*`,
+//! `GITSTORE_*`) are not supported (#222): [`refuse_go_store_env`] stops the server when
+//! one is configured, instead of silently running on local files.
 
-// Used only by the object-store tests, which assert Unix modes.
-#[cfg(test)]
-mod fake_s3;
-mod git;
-mod mirror;
-mod object;
 mod pgconn;
-mod postgres;
 mod postgres_history;
-mod sigv4;
 mod sqlite;
 
-use crate::text::GoStr;
 use anyhow::{Result as AnyResult, anyhow};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
-pub use git::{GitPersister, GitStore};
-pub use object::{ObjectConfig, ObjectStore};
-pub use postgres::{PgCooldown, PostgresConfig, PostgresStore};
 pub use postgres_history::PostgresHistory;
 pub use sqlite::SqliteHistory;
 
-use crate::persistence::StorePersister;
-use crate::persistence::cooldown::Backend as CooldownBackend;
-
-/// Go main's 30-second contexts around store setup.
-const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// The store the environment asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Selection {
-    Postgres {
-        dsn: String,
-        schema: String,
-        /// `<local path>/pgstore`.
-        spool: PathBuf,
-    },
-    Object {
-        endpoint: String,
-        access_key: String,
-        secret_key: String,
-        bucket: String,
-        /// `<local path>/objectstore`.
-        root: PathBuf,
-    },
-    Git {
-        url: String,
-        username: String,
-        token: String,
-        branch: String,
-        /// `<local path>/gitstore`.
-        root: PathBuf,
-    },
-}
-
-/// Go `filepath.Clean`, lexically.
-pub(crate) fn clean(path: &Path) -> PathBuf {
-    let mut out: Vec<Component> = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => match out.last() {
-                Some(Component::Normal(_)) => {
-                    out.pop();
-                }
-                Some(Component::RootDir) => {}
-                _ => out.push(component),
-            },
-            other => out.push(other),
-        }
-    }
-    if out.is_empty() {
-        return PathBuf::from(".");
-    }
-    out.iter().collect()
-}
-
-/// Go `filepath.Abs`: joined with the working directory, then cleaned.
-pub(crate) fn go_abs(path: &Path) -> std::io::Result<PathBuf> {
-    std::path::absolute(path).map(|p| clean(&p))
-}
-
-/// Go main's `lookupEnv`: the first key holding a non-blank value, trimmed.
-fn lookup(env: &dyn Fn(&str) -> Option<String>, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .filter_map(|key| env(key))
-        .map(|value| value.trim().to_owned())
-        .find(|value| !value.is_empty())
-}
-
-/// Go `util.WritablePath`.
-fn writable_path(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    lookup(env, &["WRITABLE_PATH", "writable_path"]).map(PathBuf::from)
-}
-
-/// Go main's store choice: a Home JWT disables every store; otherwise Postgres, then
-/// the object store, then git. `wd` is the working directory.
-pub fn select(env: &dyn Fn(&str) -> Option<String>, wd: &Path, home: bool) -> Option<Selection> {
-    if home {
-        return None;
-    }
-    let get = |upper: &str| lookup(env, &[upper, &upper.go_lower()]);
-    let local = |key: &str| {
-        get(key)
-            .map(PathBuf::from)
-            .or_else(|| writable_path(env))
-            .unwrap_or_else(|| wd.to_path_buf())
-    };
-    if let Some(dsn) = get("PGSTORE_DSN") {
-        return Some(Selection::Postgres {
-            dsn,
-            schema: get("PGSTORE_SCHEMA").unwrap_or_default(),
-            spool: local("PGSTORE_LOCAL_PATH").join("pgstore"),
-        });
-    }
-    if let Some(endpoint) = get("OBJECTSTORE_ENDPOINT") {
-        return Some(Selection::Object {
-            endpoint,
-            access_key: get("OBJECTSTORE_ACCESS_KEY").unwrap_or_default(),
-            secret_key: get("OBJECTSTORE_SECRET_KEY").unwrap_or_default(),
-            bucket: get("OBJECTSTORE_BUCKET").unwrap_or_default(),
-            root: local("OBJECTSTORE_LOCAL_PATH").join("objectstore"),
-        });
-    }
-    get("GITSTORE_GIT_URL").map(|url| Selection::Git {
-        url,
-        username: get("GITSTORE_GIT_USERNAME").unwrap_or_default(),
-        token: get("GITSTORE_GIT_TOKEN").unwrap_or_default(),
-        branch: get("GITSTORE_GIT_BRANCH").unwrap_or_default(),
-        root: local("GITSTORE_LOCAL_PATH").join("gitstore"),
-    })
-}
-
-/// A store ready to serve: its config file, its auth mirror and the hooks the server
-/// needs.
-pub struct Store {
-    pub config_path: PathBuf,
-    pub auth_dir: PathBuf,
-    pub persister: Arc<dyn StorePersister>,
-    /// Postgres keeps cooldown state in its own table.
-    pub cooldown: Option<Arc<dyn CooldownBackend>>,
-    /// Go's info line once the config loaded.
-    pub enabled: String,
-}
-
+/// Runs blocking work (file I/O, SQLite) on Tokio's blocking pool.
 pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> AnyResult<T> + Send + 'static) -> AnyResult<T> {
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|e| anyhow!("store task failed: {e}"))?
 }
 
-async fn bounded<T>(work: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
-    tokio::time::timeout(SETUP_TIMEOUT, work)
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("context deadline exceeded")))
-}
+/// The variables that selected one of Go's remote config and credential stores.
+const GO_STORE_ENV: [(&str, &str); 3] = [
+    ("PGSTORE_DSN", "PostgreSQL"),
+    ("OBJECTSTORE_ENDPOINT", "object storage"),
+    ("GITSTORE_GIT_URL", "Git"),
+];
 
-/// Go main's store setup. The error is the line Go logs before exiting.
-pub async fn bootstrap(selection: Selection, wd: &Path) -> Result<Store, String> {
-    let example = wd.join("config.example.yaml");
-    match selection {
-        Selection::Postgres { dsn, schema, spool } => {
-            let cfg = PostgresConfig {
-                dsn,
-                schema,
-                spool_dir: spool,
-            };
-            let store = PostgresStore::connect(cfg)
-                .await
-                .map_err(|e| format!("failed to initialize postgres token store: {e:#}"))?;
-            bounded(store.bootstrap(&example))
-                .await
-                .map_err(|e| format!("failed to bootstrap postgres-backed config: {e:#}"))?;
-            let store = Arc::new(store);
-            Ok(Store {
-                config_path: store.config_path(),
-                auth_dir: store.auth_dir(),
-                cooldown: Some(Arc::new(store.cooldown_backend())),
-                enabled: format!(
-                    "postgres-backed token store enabled, workspace path: {}",
-                    store.work_dir().display()
-                ),
-                persister: store,
-            })
-        }
-        Selection::Object {
-            endpoint,
-            access_key,
-            secret_key,
-            bucket,
-            root,
-        } => {
-            let (resolved, use_ssl) = ObjectConfig::endpoint_from(&endpoint).map_err(|e| e.to_string())?;
-            let cfg = ObjectConfig {
-                endpoint: resolved,
-                bucket: bucket.clone(),
-                access_key,
-                secret_key,
-                local_root: root,
-                use_ssl,
-            };
-            let store = blocking(move || ObjectStore::new(cfg))
-                .await
-                .map_err(|e| format!("failed to initialize object token store: {e:#}"))?;
-            bounded(store.bootstrap(&example))
-                .await
-                .map_err(|e| format!("failed to bootstrap object-backed config: {e:#}"))?;
-            let store = Arc::new(store);
-            Ok(Store {
-                config_path: store.config_path(),
-                auth_dir: store.auth_dir(),
-                cooldown: None,
-                enabled: format!("object-backed token store enabled, bucket: {bucket}"),
-                persister: store,
-            })
-        }
-        Selection::Git {
-            url,
-            username,
-            token,
-            branch,
-            root,
-        } => {
-            let store = Arc::new(GitStore::new(&url, &username, &token, &branch, &root));
-            let config_path = store.config_path();
-            let prepared = store.clone();
-            blocking(move || prepared.ensure_repository())
-                .await
-                .map_err(|e| format!("failed to prepare git token store: {e:#}"))?;
-            match std::fs::metadata(&config_path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::metadata(&example)
-                        .map_err(|e| format!("failed to find template config file: stat {}: {e}", example.display()))?;
-                    object::seed_config(&example, &config_path)
-                        .map_err(|e| format!("failed to bootstrap git-backed config: {e:#}"))?;
-                    // Go `persistSeededConfig`: a copy that cannot be prepared is removed,
-                    // so every start refuses the template instead of running unpersisted.
-                    if let Err(e) = crate::config::prepare_for_upload(&config_path) {
-                        if let Err(remove) = std::fs::remove_file(&config_path) {
-                            tracing::warn!("failed to remove the config copied from the template: {remove}");
-                        }
-                        return Err(format!(
-                            "failed to commit initial git-backed config: prepare config for upload: {e:#}"
-                        ));
-                    }
-                    let committing = store.clone();
-                    blocking(move || committing.persist_config())
-                        .await
-                        .map_err(|e| format!("failed to commit initial git-backed config: {e:#}"))?;
-                    tracing::info!("git-backed config initialized from template: {}", config_path.display());
-                }
-                Err(e) => return Err(format!("failed to inspect git-backed config: {e}")),
-                Ok(_) => {}
-            }
-            Ok(Store {
-                config_path,
-                auth_dir: store.auth_dir(),
-                cooldown: None,
-                enabled: format!("git-backed token store enabled, repository path: {}", root.display()),
-                persister: Arc::new(GitPersister(store)),
-            })
+/// Refuses a Go remote store setting (`PGSTORE_DSN`, `OBJECTSTORE_ENDPOINT`,
+/// `GITSTORE_GIT_URL`, upper or lower case, non-blank): the error names the variable
+/// and the way forward. Starting on local files instead would silently lose the
+/// config and logins the operator keeps in that store.
+pub fn refuse_go_store_env(env: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
+    for (key, name) in GO_STORE_ENV {
+        let set = [key.to_owned(), key.to_ascii_lowercase()]
+            .iter()
+            .any(|k| env(k).is_some_and(|v| !v.trim().is_empty()));
+        if set {
+            return Err(format!(
+                "{key} is set, but cliproxy-rs no longer keeps config.yaml and credential files in a remote {name} store (issue #222). \
+                 Copy config.yaml and the auth directory out of the store, point -config and auth-dir at them (or mount them), \
+                 unset {key}, and start again. See docs/DIFFERENCES-FROM-GO.md."
+            ));
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
+mod go_store_env_tests {
     use super::*;
-    use std::collections::HashMap;
-
-    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        move |key| map.get(key).cloned()
-    }
-
-    /// Go `TestPersistSeededConfig*` (f9437700): the template copy is prepared before
-    /// its first commit; a refused copy is removed and nothing is pushed.
-    #[tokio::test]
-    async fn the_git_seed_commits_the_prepared_config() {
-        const PLAIN: &str = "seed-plaintext-secret";
-        let git = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .current_dir(dir)
-                .args(args)
-                .output()
-                .unwrap();
-            out.status
-                .success()
-                .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-        };
-        for (template, accepted) in [
-            (format!("port: 8317\nremote-management:\n  secret-key: {PLAIN}\n"), true),
-            (
-                format!("remote-management:\n  secret-key: {PLAIN}\nport: [8317\n"),
-                false,
-            ),
-            (
-                format!("defaults: &management\n  secret-key: {PLAIN}\nmanagement: *management\n"),
-                false,
-            ),
-        ] {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let wd = std::env::temp_dir().join(format!("cpa-store-git-seed-{}-{nanos}", std::process::id()));
-            let remote = wd.join("remote.git");
-            std::fs::create_dir_all(&remote).unwrap();
-            git(&remote, &["init", "-q", "--bare"]).unwrap();
-            git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
-            std::fs::write(wd.join("config.example.yaml"), &template).unwrap();
-            let root = wd.join("gitstore");
-            let selection = Selection::Git {
-                url: remote.to_string_lossy().into_owned(),
-                username: String::new(),
-                token: String::new(),
-                branch: "main".into(),
-                root: root.clone(),
-            };
-            let result = bootstrap(selection, &wd).await;
-            let committed = git(&remote, &["show", "main:config/config.yaml"]);
-            if accepted {
-                result.unwrap();
-                let committed = committed.unwrap();
-                assert!(!committed.contains(PLAIN), "{committed}");
-                let hash = crate::config::Config::parse(&committed).unwrap().management.secret_key;
-                assert!(bcrypt::verify(PLAIN, &hash).unwrap());
-            } else {
-                let error = result.err().unwrap();
-                assert!(error.contains("prepare config for upload"), "{error}");
-                assert_eq!(committed, None, "{template}");
-                assert!(!root.join("config/config.yaml").exists(), "the refused copy is removed");
-            }
-            let _ = std::fs::remove_dir_all(&wd);
-        }
-    }
 
     #[test]
-    fn store_selection_respects_explicit_operator_precedence() {
-        let wd = Path::new("/srv/app");
-        // Postgres wins over the others; blank values do not count; lower-case keys work.
-        let env = env_of(&[
-            ("PGSTORE_DSN", "   "),
-            ("pgstore_dsn", " postgres://db/x "),
-            ("OBJECTSTORE_ENDPOINT", "http://s3"),
-            ("GITSTORE_GIT_URL", "https://git/x.git"),
-            ("WRITABLE_PATH", "/data"),
-        ]);
-        assert_eq!(
-            select(&env, wd, false),
-            Some(Selection::Postgres {
-                dsn: "postgres://db/x".into(),
-                schema: String::new(),
-                spool: "/data/pgstore".into(),
-            })
-        );
-        // A Home JWT disables every store.
-        assert_eq!(select(&env, wd, true), None);
-        let env = env_of(&[
-            ("OBJECTSTORE_ENDPOINT", "http://s3"),
-            ("OBJECTSTORE_BUCKET", "b"),
-            ("OBJECTSTORE_LOCAL_PATH", "/obj"),
-            ("GITSTORE_GIT_URL", "https://git/x.git"),
-        ]);
-        assert!(
-            matches!(select(&env, wd, false), Some(Selection::Object { root, bucket, .. }) if root == Path::new("/obj/objectstore") && bucket == "b")
-        );
-        let env = env_of(&[
-            ("GITSTORE_GIT_URL", "https://git/x.git"),
-            ("gitstore_git_branch", "main"),
-        ]);
-        assert_eq!(
-            select(&env, wd, false),
-            Some(Selection::Git {
-                url: "https://git/x.git".into(),
-                username: String::new(),
-                token: String::new(),
-                branch: "main".into(),
-                root: "/srv/app/gitstore".into(),
-            })
-        );
-        assert_eq!(select(&env_of(&[]), wd, false), None);
+    fn a_go_remote_store_setting_stops_the_server_with_the_way_forward() {
+        let none = |_: &str| None;
+        assert!(refuse_go_store_env(&none).is_ok());
+        let blank = |_: &str| Some("  ".to_owned());
+        assert!(refuse_go_store_env(&blank).is_ok(), "blank values select nothing");
+        for key in [
+            "PGSTORE_DSN",
+            "pgstore_dsn",
+            "OBJECTSTORE_ENDPOINT",
+            "GITSTORE_GIT_URL",
+            "gitstore_git_url",
+        ] {
+            let env = |k: &str| (k == key).then(|| "postgres://user:secret@db/x".to_owned());
+            let error = refuse_go_store_env(&env).expect_err(key);
+            assert!(error.contains(&key.to_ascii_uppercase()), "{error}");
+            assert!(error.contains("auth directory"), "{error}");
+            assert!(!error.contains("secret"), "the value is never echoed: {error}");
+        }
     }
 }
 

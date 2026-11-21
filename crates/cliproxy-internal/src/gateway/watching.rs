@@ -365,10 +365,6 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
             if loaded.is_err() {
                 tracing::error!("config watcher: reload failed unexpectedly; retrying on the next change");
             }
-            if let Some(before) = &applied {
-                let accepted = matches!(loaded, Ok(Ok(Some(_))));
-                persist_changes(&state, before, &current, config_changed && accepted);
-            }
             match loaded {
                 Ok(Ok(Some(next_config))) => {
                     // The first observation's read of the file the runtime started
@@ -422,61 +418,6 @@ fn targets(state: &Management) -> Targets {
         config: state.path.clone(),
         auth_dir: state.rt.config().auth_dir.clone(),
     }
-}
-
-/// Go `persistConfigAsync` / `persistAuthAsync`: with a remote store, what changed
-/// between two applied snapshots is pushed in the background. The config goes only
-/// after a reload accepted it, and never when empty or missing (Go ignores those
-/// events). An auth write goes as "Sync auth <name>" unless the file is empty or not a
-/// JSON object; a removal goes as "Remove auth <name>".
-// ponytail: Go also skips files whose JSON does not decode into its `Auth` struct or
-// whose weight is invalid; here any JSON object is pushed.
-fn persist_changes(state: &Management, before: &Snapshot, after: &Snapshot, config_accepted: bool) {
-    let Some(store) = state.store.clone() else {
-        return;
-    };
-    let config = config_accepted && std::fs::metadata(&state.path).is_ok_and(|m| m.len() > 0);
-    let mut auth = Vec::new();
-    for (path, hash) in &after.auth {
-        if before.auth.get(path) == Some(hash) {
-            continue;
-        }
-        let object = std::fs::read(path)
-            .ok()
-            .filter(|data| !data.is_empty())
-            .is_some_and(|data| serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&data).is_ok());
-        if object {
-            auth.push(("Sync", path.clone()));
-        }
-    }
-    for path in before.auth.keys().filter(|p| !after.auth.contains_key(*p)) {
-        auth.push(("Remove", path.clone()));
-    }
-    if !config && auth.is_empty() {
-        return;
-    }
-    tokio::spawn(async move {
-        let bound = Duration::from_secs(30);
-        if config {
-            match tokio::time::timeout(bound, store.persist_config()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::error!("failed to persist config change: {error:#}"),
-                Err(_) => tracing::error!("failed to persist config change: context deadline exceeded"),
-            }
-        }
-        for (verb, path) in auth {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let message = format!("{verb} auth {name}");
-            match tokio::time::timeout(bound, store.persist_auth_files(message, vec![path])).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::error!("failed to persist auth changes: {error:#}"),
-                Err(_) => tracing::error!("failed to persist auth changes: context deadline exceeded"),
-            }
-        }
-    });
 }
 
 /// Go's `syscall.Errno` text: strerror in lower case, without Rust's suffix.
@@ -1337,7 +1278,7 @@ mod tests {
 
     /// #89 (Go v8.0.67 57a12996): an auth folder that exists but cannot be listed keeps
     /// every credential loaded from it, with its revision, and the watcher sees no
-    /// change (no removal is logged or pushed to a remote store). A credential replaced
+    /// change (no removal is logged). A credential replaced
     /// or deleted before access was lost is not brought back, and a file deleted while
     /// the folder was unreadable is dropped once it can be listed again. Both an
     /// absolute and a relative auth-dir, with an upload fallback recorded under its

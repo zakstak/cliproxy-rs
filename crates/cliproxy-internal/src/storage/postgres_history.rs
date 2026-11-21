@@ -50,7 +50,7 @@ fn db(context: &str) -> impl Fn(tokio_postgres::Error) -> anyhow::Error + '_ {
 
 impl PostgresHistory {
     /// Connects, creates the schema and tables when missing and checks their version.
-    /// `dsn` takes the forms `PGSTORE_DSN` takes (URL or key/value); `schema` may be empty.
+    /// `dsn` is a `postgres://` URL or a key/value string; `schema` may be empty.
     pub async fn connect(dsn: &str, schema: &str) -> Result<Self> {
         let dsn = dsn.trim();
         if dsn.is_empty() {

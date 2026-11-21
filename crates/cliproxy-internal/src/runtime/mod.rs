@@ -185,8 +185,7 @@ impl Runtime {
         self.local_model.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Persists cooldowns to `backend` instead of `.cds` files (PGSTORE's cooldown
-    /// table; additive API). Call before serving.
+    /// Persists cooldowns to `backend` instead of `.cds` files. Call before serving.
     pub fn set_cooldown_backend(&self, backend: Arc<dyn crate::persistence::cooldown::Backend>) {
         self.store.set_cooldown_backend(backend);
     }
@@ -1802,8 +1801,8 @@ impl CredentialStore {
         }
     }
 
-    /// Go's builder taking the token store's `CooldownStateStore`: cooldowns go to
-    /// `backend` instead of `.cds` files, restored from it now when persistence is on.
+    /// Go's builder taking a `CooldownStateStore`: cooldowns go to `backend` instead of
+    /// `.cds` files, restored from it now when persistence is on.
     pub fn set_cooldown_backend(&self, backend: Arc<dyn crate::persistence::cooldown::Backend>) {
         *self.cooldown_backend.write().unwrap_or_else(PoisonError::into_inner) = Some(backend);
         let dir = self.cooldown_dir.read().unwrap_or_else(PoisonError::into_inner).clone();
