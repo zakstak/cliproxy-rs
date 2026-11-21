@@ -25,6 +25,7 @@ mod access;
 mod api_call;
 mod auth_files;
 mod auth_index;
+mod history;
 pub(crate) mod legacy;
 mod logs;
 pub(crate) mod multipart;
@@ -598,6 +599,11 @@ pub fn router(state: Arc<Management>) -> Router {
             "observability/usage/live",
             methods().get(guarded!(s, observability::usage_live)),
         ),
+        // cliproxy-rs only: the history store (request history, totals, server log events).
+        ("history/status", methods().get(guarded!(s, history::status))),
+        ("history/requests", methods().get(guarded!(s, history::requests))),
+        ("history/totals", methods().get(guarded!(s, history::totals))),
+        ("history/events", methods().get(guarded!(s, history::events))),
         ("oauth/auth-url", methods().get(guarded!(s, oauth::auth_url))),
         ("oauth/status", methods().get(guarded!(s, oauth::status))),
         ("oauth/session", methods().delete(guarded!(s, oauth::cancel))),
