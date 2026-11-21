@@ -11,7 +11,9 @@
 //! - Filters combine with AND. Time bounds are `since <= at < until`.
 //! - [`HistoryStore::prune`] deletes rows strictly older than its bound and leaves the
 //!   ids of the rest unchanged.
-//! - Text is stored and returned as given.
+//! - Text is stored and returned as given, except U+0000, which every backend stores as
+//!   U+FFFD ([`storable`]): PostgreSQL text cannot hold it, and one entry must not cost
+//!   its batch.
 //!
 //! No row carries a credential or a client key: [`RequestEntry`] has no field for one,
 //! and its builders (the usage tracker) leave out key-derived account names.
@@ -89,6 +91,80 @@ pub struct RequestEntry {
     pub session_id: String,
     pub reasoning_effort: String,
     pub service_tier: String,
+}
+
+/// `text` with U+0000 replaced by U+FFFD, the form every backend stores.
+pub fn storable(text: String) -> String {
+    if text.contains('\0') {
+        text.replace('\0', "\u{FFFD}")
+    } else {
+        text
+    }
+}
+
+impl RequestEntry {
+    /// The entry as a backend stores it: see [`storable`]. Every field is named, so a new
+    /// text field does not compile until it is placed here.
+    pub fn storable(self) -> Self {
+        let RequestEntry {
+            at,
+            request_id,
+            execution_id,
+            provider,
+            model,
+            response_model,
+            endpoint,
+            auth_index,
+            account,
+            user_agent,
+            stream,
+            failed,
+            status,
+            fail_body,
+            usage_reported,
+            input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            total_tokens,
+            latency_ms,
+            ttft_ms,
+            timings,
+            session_id,
+            reasoning_effort,
+            service_tier,
+        } = self;
+        RequestEntry {
+            at,
+            request_id: storable(request_id),
+            execution_id: storable(execution_id),
+            provider: storable(provider),
+            model: storable(model),
+            response_model: storable(response_model),
+            endpoint: storable(endpoint),
+            auth_index: storable(auth_index),
+            account: storable(account),
+            user_agent: storable(user_agent),
+            stream,
+            failed,
+            status,
+            fail_body: storable(fail_body),
+            usage_reported,
+            input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            total_tokens,
+            latency_ms,
+            ttft_ms,
+            timings: timings.into_iter().map(|(k, v)| (storable(k), v)).collect(),
+            session_id: storable(session_id),
+            reasoning_effort: storable(reasoning_effort),
+            service_tier: storable(service_tier),
+        }
+    }
 }
 
 /// A stored [`RequestEntry`] with its id.
@@ -171,6 +247,17 @@ pub struct EventEntry {
     pub request_id: String,
     /// The formatted log line, as the server log prints it.
     pub line: String,
+}
+
+impl EventEntry {
+    /// The event as a backend stores it: see [`storable`].
+    pub fn storable(self) -> Self {
+        EventEntry {
+            request_id: storable(self.request_id),
+            line: storable(self.line),
+            ..self
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -403,7 +490,7 @@ pub mod memory {
             let mut inner = self.lock();
             for entry in batch {
                 let id = inner.id();
-                inner.requests.insert(id, entry);
+                inner.requests.insert(id, entry.storable());
             }
             Box::pin(async { Ok(()) })
         }
@@ -412,7 +499,7 @@ pub mod memory {
             let mut inner = self.lock();
             for entry in batch {
                 let id = inner.id();
-                inner.events.insert(id, entry);
+                inner.events.insert(id, entry.storable());
             }
             Box::pin(async { Ok(()) })
         }
@@ -751,9 +838,40 @@ pub mod conformance {
             .unwrap();
         assert_eq!(rest.rows.len(), 3);
 
+        // U+0000 is stored as U+FFFD, without costing the rest of its batch.
+        let mut nul = r(1_500, "claude", "a1", "opus", true, 0);
+        nul.fail_body = "bad\0body".into();
+        nul.timings.insert("x\0y".into(), 1);
+        store.append_requests(vec![nul]).await.unwrap();
+        let got = store
+            .requests(
+                RequestFilter {
+                    request_id: Some("req-1500".into()),
+                    ..Default::default()
+                },
+                Cursor::Newest,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(got.rows[0].entry.fail_body, "bad\u{FFFD}body");
+        assert_eq!(got.rows[0].entry.timings.get("x\u{FFFD}y"), Some(&1));
+        store
+            .append_events(vec![EventEntry {
+                at: UnixMillis(1_500),
+                level: Level::Error,
+                request_id: "r\0".into(),
+                line: "nul \0 here".into(),
+            }])
+            .await
+            .unwrap();
+        let newest = store.events(EventFilter::default(), Cursor::Newest, 1).await.unwrap();
+        assert_eq!(newest.rows[0].entry.line, "nul \u{FFFD} here");
+        assert_eq!(newest.rows[0].entry.request_id, "r\u{FFFD}");
+
         // Pruning removes strictly older rows and keeps the ids of the rest.
         let pruned = store.prune(UnixMillis(61_000)).await.unwrap();
-        assert_eq!(pruned, Pruned { requests: 2, events: 4 });
+        assert_eq!(pruned, Pruned { requests: 3, events: 5 });
         let left = store
             .requests(RequestFilter::default(), Cursor::Newest, 10)
             .await
