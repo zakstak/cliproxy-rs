@@ -12,6 +12,7 @@ mod object;
 mod pgconn;
 mod postgres;
 mod sigv4;
+mod sqlite;
 
 use crate::text::GoStr;
 use anyhow::{Result as AnyResult, anyhow};
@@ -22,6 +23,7 @@ use std::time::Duration;
 pub use git::{GitPersister, GitStore};
 pub use object::{ObjectConfig, ObjectStore};
 pub use postgres::{PgCooldown, PostgresConfig, PostgresStore};
+pub use sqlite::SqliteHistory;
 
 use crate::persistence::StorePersister;
 use crate::persistence::cooldown::Backend as CooldownBackend;

@@ -4,6 +4,7 @@
 //! here so the store can push it.
 
 pub mod cooldown;
+pub mod history;
 
 use std::path::PathBuf;
 
