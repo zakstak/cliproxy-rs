@@ -168,14 +168,14 @@ export function currentIssues(now: number): Issue[] {
     ...accountIssues(accounts, now),
     ...failureIssues(watch.requests, accounts, now),
   ];
-  if (!watch.statistics)
+  if (!watch.recording)
     out.push({
-      key: "statistics",
+      key: "history",
       level: "warn",
       kind: "Proxy",
-      title: "The server is not reporting requests",
+      title: "The server is not recording requests",
       detail:
-        "Usage statistics are off, so failed requests cannot be seen here.",
+        "The history store is off (storage.backend: none) or failed to open, so failed requests cannot be seen here. The server log says which.",
       last: 0,
       action: { label: "Open Settings", href: "#settings" },
     });

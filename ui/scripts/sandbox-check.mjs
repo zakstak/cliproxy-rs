@@ -36,11 +36,6 @@ api-keys:
           alias: ledger-fixture
       keys:
         - api-key: sk-fake-provider-0001
-observability:
-  logs:
-    logging-to-file: false
-  usage:
-    usage-statistics-enabled: true
 `);
 const upstream = createServer(async (req, res) => {
   for await (const _ of req);

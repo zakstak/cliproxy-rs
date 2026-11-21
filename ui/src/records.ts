@@ -37,7 +37,7 @@ export function parseLine(raw: string, n: number): LogLine {
   };
 }
 
-/** One request the proxy sent upstream, from `GET /observability/usage/live`. */
+/** One request the proxy sent upstream, from the history store (`GET /history/requests`). */
 export type Request = {
   n: number;
   at: number;
@@ -61,8 +61,10 @@ export type Request = {
   tokens: { input: number; uncached: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number };
   /** Milliseconds from the start of the request, in order, for the stages the server timed. */
   stages: { label: string; ms: number }[];
-  /** The record as the server sent it, without the client key. */
+  /** The row as the server stored it. It never holds a key. */
   raw: Record<string, unknown>;
+  /** The history row id: the cursor for the next read. */
+  row: number;
 };
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -90,49 +92,48 @@ function failureMessage(body: string): string {
   }
 }
 
-export function parseRequest(record: unknown, n: number): Request | null {
-  if (!isObject(record)) return null;
-  const tokens = record.tokens;
-  const input = part(record.token_breakdown, "input");
-  const output = part(record.token_breakdown, "output");
-  // The v2 breakdown separates cache reads from uncached input. Without it, the flat counters
-  // are all there is: input is what the provider called input, cache reads are separate.
-  const cacheRead = count(part(input, "cache_read_tokens")) || count(part(tokens, "cache_read_tokens"));
-  const cacheWrite = count(part(input, "cache_write_tokens")) || count(part(tokens, "cache_creation_tokens"));
-  const uncached = isObject(input) ? count(input.uncached_tokens) : count(part(tokens, "input_tokens"));
-  const failed = record.failed === true;
-  const at = Date.parse(text(record.timestamp));
-  const { api_key: _key, ...raw } = record;
+/** One history row (`crates/cliproxy-internal/src/persistence/history.rs`, `RequestEntry`).
+ * `at` there is when the attempt finished; here it is when it started. Input counts every
+ * input token, cache reads and writes included. */
+export function parseRequest(row: unknown, n: number): Request | null {
+  if (!isObject(row) || typeof row.id !== "number" || typeof row.at !== "number") return null;
+  const failed = row.failed === true;
+  const latency = count(row.latency_ms);
+  const input = count(row.input_tokens);
+  const cacheRead = count(row.cache_read_tokens);
+  const cacheWrite = count(row.cache_creation_tokens);
+  const body = text(row.fail_body);
   return {
     n,
-    at: Number.isNaN(at) ? Date.now() : at,
-    id: text(record.request_id),
+    row: row.id,
+    at: row.at - latency,
+    id: text(row.request_id),
     failed,
-    status: count(part(record.fail, "status_code")) || (failed ? 0 : 200),
-    failure: failed ? { code: text(part(record.fail, "code")), body: text(part(record.fail, "body")), message: failureMessage(text(part(record.fail, "body"))) } : null,
-    model: text(record.alias) || text(record.model) || "unknown",
-    provider: text(record.provider) || "unknown",
-    auth: text(record.auth_index),
-    endpoint: text(record.endpoint),
-    client: text(record.user_agent),
-    stream: record.stream === true,
-    effort: text(record.reasoning_effort),
-    latency: count(record.latency_ms),
-    ttft: count(record.ttft_ms),
-    usageReported: typeof record.usage_observed === "boolean" ? record.usage_observed : isObject(tokens) || isObject(input) || isObject(output),
+    status: count(row.status) || (failed ? 0 : 200),
+    failure: failed ? { code: "", body, message: failureMessage(body) } : null,
+    model: text(row.model) || "unknown",
+    provider: text(row.provider) || "unknown",
+    auth: text(row.auth_index),
+    endpoint: text(row.endpoint),
+    client: text(row.user_agent),
+    stream: row.stream === true,
+    effort: text(row.reasoning_effort),
+    latency,
+    ttft: count(row.ttft_ms),
+    usageReported: row.usage_reported !== false,
     tokens: {
-      input: isObject(input) ? count(input.total_tokens) : uncached + cacheRead + cacheWrite,
-      uncached,
+      input,
+      uncached: Math.max(0, input - cacheRead - cacheWrite),
       cacheRead,
       cacheWrite,
-      output: isObject(output) ? count(output.total_tokens) : count(part(tokens, "output_tokens")),
-      reasoning: count(part(output, "reasoning_tokens")) || count(part(tokens, "reasoning_tokens")),
+      output: count(row.output_tokens),
+      reasoning: count(row.reasoning_tokens),
     },
     stages: stageNames.flatMap(([key, label]) => {
-      const ms = part(record.timings, key);
+      const ms = part(row.timings, key);
       return typeof ms === "number" ? [{ label, ms }] : [];
     }),
-    raw,
+    raw: row,
   };
 }
 
@@ -160,14 +161,16 @@ export function retainRequests(requests: Request[], options: { cutoff: number; r
   return { retainedAfter: boundary, requests: recent.slice(-limit).filter((r) => r.at + r.latency > boundary) };
 }
 
-/** One answer of the live feed. Anything else throws, so a wrong server is not an empty feed. */
-export function parseLivePage(raw: unknown, next: () => number) {
-  if (!isObject(raw) || typeof raw.cursor !== "string" || !/^[0-9a-f]{16}\.\d+$/.test(raw.cursor) || !Array.isArray(raw.records))
-    throw new Error("Unexpected live feed format.");
-  return {
-    cursor: raw.cursor,
-    gap: raw.gap === true,
-    statistics: raw.usage_statistics_enabled !== false,
-    requests: raw.records.flatMap((r) => parseRequest(r, next()) ?? []),
-  };
+/** One page of `GET /history/requests`, oldest first. Anything else throws, so a wrong server is not an empty history. */
+export function parseHistoryPage(raw: unknown, next: () => number) {
+  if (!isObject(raw) || !Array.isArray(raw.requests) || typeof raw.more !== "boolean") throw new Error("Unexpected history format.");
+  const requests = raw.requests.flatMap((r) => parseRequest(r, 0) ?? []).sort((a, b) => a.row - b.row);
+  for (const r of requests) r.n = next();
+  return { requests, more: raw.more };
+}
+
+/** One server log event from `GET /history/events`. */
+export function parseEvent(raw: unknown, n: number): (LogLine & { row: number }) | null {
+  if (!isObject(raw) || typeof raw.id !== "number" || typeof raw.line !== "string") return null;
+  return { ...parseLine(raw.line, n), row: raw.id };
 }

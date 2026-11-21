@@ -311,6 +311,7 @@ input[type="text"],
 input[type="search"],
 input[type="password"],
 input[type="url"],
+input[type="number"],
 select,
 textarea {
   min-height: 32px;
@@ -1216,6 +1217,7 @@ dialog .body {
   input[type="search"],
   input[type="password"],
   input[type="url"],
+  input[type="number"],
   select {
     min-height: 44px;
   }
