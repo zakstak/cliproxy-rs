@@ -16,6 +16,7 @@
 //! No row carries a credential or a client key: [`RequestEntry`] has no field for one,
 //! and its builders (the usage tracker) leave out key-derived account names.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use anyhow::Result;
@@ -40,7 +41,8 @@ pub struct RowId(pub i64);
 
 /// One upstream attempt as the history keeps it. Built by the usage tracker from the
 /// same facts as the usage queue's record, without its client key, provider key or
-/// client address fields.
+/// client address fields. Token counts follow the record's v2 breakdown: input counts
+/// every input token, cache reads and writes included.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RequestEntry {
     /// When the attempt finished.
@@ -60,6 +62,8 @@ pub struct RequestEntry {
     /// The account's display name (email, account or project). Empty when the only
     /// name available was a key.
     pub account: String,
+    /// The client's `User-Agent`.
+    pub user_agent: String,
     pub stream: bool,
     pub failed: bool,
     /// The status returned to the client for this attempt (200 when it succeeded).
@@ -67,6 +71,9 @@ pub struct RequestEntry {
     /// The upstream's failure text after the usage tracker scrubbed request values from
     /// it; empty on success.
     pub fail_body: String,
+    /// False when the provider reported no usage, so the token counts are not known
+    /// (rather than zero).
+    pub usage_reported: bool,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub reasoning_tokens: i64,
@@ -76,6 +83,9 @@ pub struct RequestEntry {
     pub latency_ms: i64,
     /// Time to the first token; 0 when none arrived.
     pub ttft_ms: i64,
+    /// Milliseconds from when the server accepted the client request to each stage it
+    /// timed, by the usage record's `timings` names (`upstream_headers_ms`, ...).
+    pub timings: BTreeMap<String, i64>,
     pub session_id: String,
     pub reasoning_effort: String,
     pub service_tier: String,
@@ -497,6 +507,7 @@ pub mod conformance {
             endpoint: "POST /v1/messages".into(),
             auth_index: auth_index.into(),
             account: format!("{auth_index}@example.test"),
+            user_agent: "claude-cli/2.1 (external, cli)".into(),
             stream: at % 2 == 0,
             failed,
             status: if failed { 429 } else { 200 },
@@ -505,6 +516,7 @@ pub mod conformance {
             } else {
                 String::new()
             },
+            usage_reported: tokens > 0,
             input_tokens: tokens,
             output_tokens: tokens / 2,
             reasoning_tokens: tokens / 4,
@@ -513,6 +525,11 @@ pub mod conformance {
             total_tokens: tokens + tokens / 2,
             latency_ms: 1200,
             ttft_ms: 300,
+            timings: if at % 2 == 0 {
+                BTreeMap::from([("upstream_headers_ms".into(), 90), ("client_first_byte_ms".into(), 310)])
+            } else {
+                BTreeMap::new()
+            },
             session_id: "session".into(),
             reasoning_effort: "high".into(),
             service_tier: "default".into(),
