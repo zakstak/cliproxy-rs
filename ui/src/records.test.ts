@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseEvent, parseHistoryPage, parseLine, parseRequest, requestTotals, retainRequests } from "./records.ts";
+import { parseEvent, parseHistoryPage, parseLine, parseRequest, requestTotals, retainRequests, sumByKey } from "./records.ts";
 import { blindSpans, perMinute, watchedMs } from "./observe.ts";
 import { providerEndpoint } from "./account.ts";
 
@@ -90,4 +90,10 @@ test("timezone-free server timestamps stay literal in browsers in different time
 
 test("developer Codex keys default to the OpenAI API profile", () => {
   assert.equal(providerEndpoint("codex"), "https://api.openai.com/v1");
+});
+
+test("grouped totals that straddle an epoch-aligned bucket merge into one row per key", () => {
+  const row = (start: number, key: string, requests: number) => ({ start, key, requests, failed: 1, input_tokens: 10, output_tokens: 2, reasoning_tokens: 0, cache_read_tokens: 5, cache_creation_tokens: 0, total_tokens: 12 });
+  const merged = sumByKey([row(0, "a", 2), row(0, "b", 1), row(86_400_000, "a", 3)]);
+  assert.deepEqual(merged.map((r) => [r.key, r.requests, r.failed, r.input_tokens, r.cache_read_tokens]), [["a", 5, 2, 20, 10], ["b", 1, 1, 10, 5]]);
 });

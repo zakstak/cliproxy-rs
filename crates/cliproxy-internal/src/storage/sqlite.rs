@@ -1,6 +1,7 @@
 //! [`HistoryStore`] in an embedded SQLite file: the default backend, with nothing to
 //! deploy. One connection behind a mutex, used from Tokio's blocking pool; WAL mode lets
-//! the dashboard read while the recorder writes. The schema version is SQLite's
+//! the dashboard read while the recorder writes, and `synchronous=FULL` makes each commit
+//! durable. The schema version is SQLite's
 //! `user_version`, and [`MIGRATIONS`] brings an older file up to date on open.
 
 use std::path::{Path, PathBuf};
@@ -125,7 +126,10 @@ impl SqliteHistory {
     fn init(mut conn: Connection, path: PathBuf) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // FULL syncs the WAL on every commit, so an append that returned Ok survives a power
+        // loss, as the contract promises; NORMAL could lose the last commits. The recorder
+        // commits a batch at most every 250 ms, so the sync cost stays small.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         migrate(&mut conn).with_context(|| format!("migrate history database {}", path.display()))?;
         Ok(Self {
             path,
@@ -494,6 +498,18 @@ fn renumber(sql: &str, first: usize) -> String {
 mod tests {
     use super::*;
     use crate::persistence::history::conformance;
+
+    #[test]
+    fn commits_are_synced_to_disk() {
+        let store = SqliteHistory::open_in_memory().unwrap();
+        let level: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(level, 2, "synchronous=FULL");
+    }
 
     #[tokio::test]
     async fn sqlite_history_meets_the_contract() {

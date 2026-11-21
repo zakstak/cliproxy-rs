@@ -187,6 +187,18 @@ impl UsageQueue {
         self.history.read().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
+    /// An attempt Go's queue does not publish (a usage-required attempt that ended before
+    /// the provider reported usage): recorded in the history alone.
+    pub fn record_history(
+        &self,
+        record: &crate::gateway::usage_record::Record,
+        client: &crate::gateway::usage_record::Client,
+    ) {
+        if let Some(history) = self.history() {
+            history.request(crate::gateway::usage_record::history_entry(record, client));
+        }
+    }
+
     /// One finished attempt: queued as Go's record while usage statistics are on, and
     /// recorded in the history while one is attached.
     pub fn record(&self, record: &crate::gateway::usage_record::Record, client: &crate::gateway::usage_record::Client) {

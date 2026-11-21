@@ -161,6 +161,21 @@ export function retainRequests(requests: Request[], options: { cutoff: number; r
   return { retainedAfter: boundary, requests: recent.slice(-limit).filter((r) => r.at + r.latency > boundary) };
 }
 
+/** Counts and token sums of `GET /history/totals`, per time bucket and group key. */
+export type Totals = { start: number; key: string; requests: number; failed: number; input_tokens: number; output_tokens: number; reasoning_tokens: number; cache_read_tokens: number; cache_creation_tokens: number; total_tokens: number };
+const summed = ["requests", "failed", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_creation_tokens", "total_tokens"] as const;
+
+/** One row per key: buckets are aligned to the epoch, so a period can span two of them. */
+export function sumByKey(rows: Totals[]): Totals[] {
+  const out = new Map<string, Totals>();
+  for (const r of rows) {
+    const t = out.get(r.key);
+    if (!t) out.set(r.key, { ...r });
+    else for (const k of summed) t[k] += r[k];
+  }
+  return [...out.values()];
+}
+
 /** One page of `GET /history/requests`, oldest first. Anything else throws, so a wrong server is not an empty history. */
 export function parseHistoryPage(raw: unknown, next: () => number) {
   if (!isObject(raw) || !Array.isArray(raw.requests) || typeof raw.more !== "boolean") throw new Error("Unexpected history format.");
