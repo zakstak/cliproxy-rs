@@ -139,15 +139,22 @@ class Watch {
     try {
       const now = Date.now();
       const page = parseHistoryPage(await api(`${HISTORY}?since=${now - HOUR}&limit=${PAGE}`), () => ++this.#n);
-      // An empty hour still needs a cursor: the newest row of all, if any.
-      const cursor = page.requests.at(-1)?.row ?? parseHistoryPage(await api(`${HISTORY}?limit=1`), () => ++this.#n).requests.at(-1)?.row ?? 0;
+      // An empty hour still needs a cursor: the newest row of all, if any. A row that
+      // finished between the two reads belongs to the hour and is kept.
+      let rows = page.requests;
+      let cursor = rows.at(-1)?.row ?? 0;
+      if (!rows.length) {
+        const newest = parseHistoryPage(await api(`${HISTORY}?limit=1`), () => ++this.#n).requests;
+        rows = newest.filter((r) => r.at + r.latency > now - HOUR);
+        cursor = newest.at(-1)?.row ?? 0;
+      }
       if (mine !== this.#run) return;
       if (this.since) this.resumedAt = now;
       this.since = now - HOUR;
       // More than a page in the hour: what is older than the page is unknown here.
-      const oldest = page.requests[0];
+      const oldest = rows[0];
       this.retainedAfter = page.more && oldest ? oldest.at + oldest.latency - 1 : 0;
-      this.requests = retainRequests(page.requests, { cutoff: now - HOUR, retainedAfter: this.retainedAfter }).requests;
+      this.requests = retainRequests(rows, { cutoff: now - HOUR, retainedAfter: this.retainedAfter }).requests;
       this.stoppedAt = 0;
       this.#cursor = cursor;
       this.recording = true;
