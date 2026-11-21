@@ -10,6 +10,7 @@ pub mod capabilities;
 pub(crate) mod classify;
 pub mod config_diff;
 pub(crate) mod error_events;
+pub mod history;
 pub mod quota;
 pub mod refresh;
 pub(crate) mod registrations;

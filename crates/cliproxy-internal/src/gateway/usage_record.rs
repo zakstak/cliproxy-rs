@@ -1081,6 +1081,9 @@ pub struct Record {
     pub model: String,
     pub alias: String,
     pub source: String,
+    /// The account's display name for the history store: [`account_name`], never a key.
+    /// Not in the queued record.
+    pub account: String,
     pub auth_index: String,
     pub access_token_sha256: String,
     pub auth_type: String,
@@ -1128,6 +1131,7 @@ impl Record {
             model: _,
             alias: _,
             source: _,
+            account: _,
             auth_index: _,
             access_token_sha256: _,
             auth_type: _,
@@ -2234,7 +2238,7 @@ fn finish(
     if let Some(tier) = reported.sent_tier {
         record.service_tier = tier;
     }
-    queue.enqueue(queued(&record, stamp.client));
+    queue.record(&record, stamp.client);
     warn_model_substitution(&record, &reported.upstream_model, stamp.auth_id);
 }
 
@@ -2297,6 +2301,7 @@ impl Tracker {
             model: crate::protocol::thinking::parse_suffix(upstream_model).model_name,
             alias: facts.alias.clone(),
             source: source(credential, &facts.client.api_key),
+            account: account_name(credential),
             auth_index: crate::config::credentials::auth_index(credential),
             access_token_sha256: access_token_sha256(credential),
             auth_type: crate::catalog::dynamic::auth_kind(credential)
@@ -2569,6 +2574,23 @@ pub fn source(c: &crate::credential::Credential, client_key: &str) -> String {
         .to_owned()
 }
 
+/// The account's display name for the history: a Vertex project or an OAuth account's
+/// email. Empty for an API-key credential, whose [`source`] is its key.
+pub fn account_name(c: &crate::credential::Credential) -> String {
+    let meta = |k: &str| c.str(k).map(str::trim).filter(|v| !v.is_empty());
+    if c.provider.trim().go_eq_fold("vertex")
+        && let Some(project) = meta("project_id").or_else(|| meta("project"))
+    {
+        return project.to_owned();
+    }
+    let (kind, account) = crate::catalog::dynamic::account_info(c);
+    match kind {
+        "api_key" => String::new(),
+        "oauth" if !account.is_empty() => account,
+        _ => meta("email").unwrap_or_default().to_owned(),
+    }
+}
+
 /// Go `AccessTokenSHA256`.
 pub fn access_token_sha256(c: &crate::credential::Credential) -> String {
     crate::config::credentials::access_token_sha256(c)
@@ -2666,6 +2688,7 @@ pub fn publish_home_unauthorized(
         model: model.to_owned(),
         alias: alias.to_owned(),
         source: auth_source_kind(credential).to_owned(),
+        account: account_name(credential),
         auth_index,
         access_token_sha256,
         auth_type: crate::catalog::dynamic::auth_kind(credential)
@@ -2685,7 +2708,62 @@ pub fn publish_home_unauthorized(
         ..Record::default()
     };
     // Go 37fe2608: the record carries the request's client key and access provider.
-    queue.enqueue(queued(&record, &home_session(&facts.client, credential)));
+    queue.record(&record, &home_session(&facts.client, credential));
+}
+
+/// Failure text the history keeps per attempt at most; longer text is cut at a character
+/// boundary.
+const HISTORY_FAIL_BODY_MAX: usize = 4096;
+
+/// The history row for one attempt: the queued record's facts without its client key,
+/// provider key, client address or user agent. `at` is when the attempt finished.
+pub(crate) fn history_entry(record: &Record, client: &Client) -> crate::persistence::history::RequestEntry {
+    use crate::persistence::history::{RequestEntry, UnixMillis};
+    let started = chrono::DateTime::parse_from_rfc3339(&record.timestamp)
+        .map(|t| t.timestamp_millis())
+        .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
+    let detail = ensure_breakdown(record.detail.clone(), &record.provider, &record.executor_type);
+    let status = if !record.failed {
+        200
+    } else if record.fail_status > 0 {
+        u16::try_from(record.fail_status).unwrap_or(500)
+    } else {
+        500
+    };
+    let mut fail_body = if record.failed { record.fail_body.trim() } else { "" };
+    if fail_body.len() > HISTORY_FAIL_BODY_MAX {
+        let mut end = HISTORY_FAIL_BODY_MAX;
+        while !fail_body.is_char_boundary(end) {
+            end -= 1;
+        }
+        fail_body = &fail_body[..end];
+    }
+    RequestEntry {
+        at: UnixMillis(started.saturating_add(record.latency_ms.max(0))),
+        request_id: client.request_id.trim().to_owned(),
+        execution_id: record.execution_id.trim().to_owned(),
+        provider: record.provider.trim().to_owned(),
+        model: record.model.trim().to_owned(),
+        response_model: record.response_model.trim().to_owned(),
+        endpoint: client.endpoint.trim().to_owned(),
+        auth_index: record.auth_index.trim().to_owned(),
+        account: record.account.trim().to_owned(),
+        stream: record.stream,
+        failed: record.failed,
+        status,
+        fail_body: fail_body.to_owned(),
+        input_tokens: detail.input,
+        output_tokens: detail.output,
+        reasoning_tokens: detail.reasoning,
+        cache_read_tokens: detail.cache_read,
+        cache_creation_tokens: detail.cache_creation,
+        total_tokens: detail.total,
+        latency_ms: record.latency_ms,
+        ttft_ms: record.ttft_ms,
+        session_id: client.session_id.trim().to_owned(),
+        reasoning_effort: record.reasoning_effort.trim().to_owned(),
+        service_tier: record.service_tier.trim().to_owned(),
+    }
 }
 
 /// Go `time.Time.MarshalJSON` (RFC 3339 with trailing-zero-trimmed nanoseconds).
@@ -2867,6 +2945,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source(&credential, "client-key"), "sa@p.iam.gserviceaccount.com");
+    }
+
+    #[test]
+    fn history_account_names_an_oauth_account_and_never_a_key() {
+        let file = |metadata: serde_json::Value| {
+            crate::credential::Credential::from_file(
+                std::path::Path::new("/auth"),
+                std::path::Path::new("/auth/c.json"),
+                metadata.as_object().unwrap().clone(),
+            )
+            .unwrap()
+        };
+        let oauth =
+            file(serde_json::json!({"type": "claude", "email": " dev@example.test ", "access_token": "at-FAKE"}));
+        assert_eq!(account_name(&oauth), "dev@example.test");
+        let mut keyed = file(serde_json::json!({"type": "xai"}));
+        keyed.attributes.insert("api_key".into(), "sk-FAKE".into());
+        assert_eq!(
+            source(&keyed, "client-FAKE"),
+            "sk-FAKE",
+            "the queue's source is unchanged"
+        );
+        assert_eq!(account_name(&keyed), "");
+        let record = Record {
+            timestamp: "2026-11-21T10:00:00Z".into(),
+            latency_ms: 1500,
+            source: source(&keyed, "client-FAKE"),
+            account: account_name(&keyed),
+            failed: true,
+            fail_status: 0,
+            fail_body: "é".repeat(HISTORY_FAIL_BODY_MAX),
+            ..Record::default()
+        };
+        let client = Client {
+            api_key: "client-FAKE".into(),
+            request_id: "req-1".into(),
+            ..Client::default()
+        };
+        let entry = history_entry(&record, &client);
+        assert_eq!(entry.at.0, 1_795_255_200_000 + 1500, "when the attempt finished");
+        assert_eq!(
+            entry.status, 500,
+            "a failure without a status is a 500, as in the queue"
+        );
+        assert!(entry.fail_body.len() <= HISTORY_FAIL_BODY_MAX && entry.fail_body.chars().all(|c| c == 'é'));
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("FAKE"), "{json}");
     }
 
     #[test]
@@ -3299,6 +3424,7 @@ mod tests {
                 model: s("model"),
                 alias: s("alias"),
                 source: source(&credential, &s("client_key")),
+                account: account_name(&credential),
                 auth_index: crate::config::credentials::auth_index(&credential),
                 access_token_sha256: access_token_sha256(&credential),
                 auth_type: crate::catalog::dynamic::auth_kind(&credential)

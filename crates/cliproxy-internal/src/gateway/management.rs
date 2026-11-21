@@ -296,6 +296,13 @@ impl Management {
         self.access.config_published(&cfg);
         crate::gateway::logging::configure(&cfg);
         self.rt.usage_queue().configure(self.access.available(), &cfg);
+        // Retention applies live; another backend or path needs a restart.
+        if let Some(history) = self.rt.usage_queue().history() {
+            match crate::storage::HistorySettings::from_config(&cfg) {
+                Ok(settings) => history.set_retention_days(settings.retention_days),
+                Err(e) => tracing::warn!("storage settings ignored: {e:#}"),
+            }
+        }
         let policy = policy(&cfg);
         self.rt.publish_config_and_policy(cfg, policy);
         let rejected = self.rt.store().reconcile_scanned(all, &read, &unsettled);

@@ -1257,6 +1257,25 @@ async fn serve(
     if let Some(cooldown) = store.as_ref().and_then(|store| store.cooldown.clone()) {
         rt.set_cooldown_backend(cooldown);
     }
+    // The history store: request history and server log events for the dashboard. Home
+    // mode has no dashboard. A store that fails to open leaves the proxy serving.
+    if home_config.is_none() {
+        let settings = cliproxy_internal::storage::HistorySettings::from_config(&rt.config())?;
+        match settings.open() {
+            Ok(Some(history)) => {
+                tracing::info!(
+                    backend = history.backend(),
+                    retention_days = settings.retention_days,
+                    "history store opened"
+                );
+                let recorder = cliproxy_internal::runtime::history::Recorder::start(history, settings.retention_days);
+                cliproxy_internal::gateway::logging::add_hook(recorder.log_hook());
+                rt.usage_queue().set_history(recorder);
+            }
+            Ok(None) => tracing::info!("history store disabled (storage.backend: none)"),
+            Err(e) => tracing::error!("history store unavailable, recording nothing: {e:#}"),
+        }
+    }
     // Go `misc.StartAntigravityVersionUpdater` and `startModelCatalogUpdaters`.
     cliproxy_internal::gateway::model_updater::start(&rt, home_config.is_some());
     let home = home_config.map(|home_config| {

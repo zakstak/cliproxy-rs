@@ -387,3 +387,114 @@ mod tests {
         assert_eq!(select(&env_of(&[]), wd, false), None);
     }
 }
+
+/// The history store the `storage` section asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryBackend {
+    /// `storage.backend: none`: nothing is recorded.
+    None,
+    /// `storage.backend: sqlite` (the default) at `storage.sqlite-path`.
+    Sqlite(PathBuf),
+}
+
+/// `storage.*`: where the history lives and how long it is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistorySettings {
+    pub backend: HistoryBackend,
+    /// `storage.retention-days`; 0 keeps everything.
+    pub retention_days: i64,
+}
+
+pub const DEFAULT_RETENTION_DAYS: i64 = 30;
+const HISTORY_FILE: &str = "history.db";
+
+impl HistorySettings {
+    /// Reads `storage.*` from `cfg`. The SQLite file defaults to `$WRITABLE_PATH/history.db`,
+    /// else `history.db` in the auth directory, which the server can always write.
+    pub fn from_config(cfg: &crate::config::Config) -> AnyResult<Self> {
+        let section = cfg.document.get("storage");
+        let text = |key: &str| {
+            section
+                .and_then(|s| s.get(key))
+                .and_then(serde_yaml_ng::Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        };
+        let retention_days = match section.and_then(|s| s.get("retention-days")) {
+            None | Some(serde_yaml_ng::Value::Null) => DEFAULT_RETENTION_DAYS,
+            Some(v) => match v.as_i64() {
+                Some(days) if days >= 0 => days,
+                _ => {
+                    return Err(anyhow!(
+                        "storage.retention-days must be a whole number of days, 0 or more"
+                    ));
+                }
+            },
+        };
+        let backend = match text("backend").map(str::to_ascii_lowercase).as_deref() {
+            None | Some("sqlite") => HistoryBackend::Sqlite(match text("sqlite-path") {
+                Some(path) => PathBuf::from(path),
+                None => default_sqlite_path(cfg),
+            }),
+            Some("none") => HistoryBackend::None,
+            Some(other) => return Err(anyhow!("storage.backend {other:?} is not one of sqlite, none")),
+        };
+        Ok(Self {
+            backend,
+            retention_days,
+        })
+    }
+
+    /// Opens the configured store; `None` for `storage.backend: none`.
+    pub fn open(&self) -> AnyResult<Option<Arc<dyn crate::persistence::history::HistoryStore>>> {
+        Ok(match &self.backend {
+            HistoryBackend::None => None,
+            HistoryBackend::Sqlite(path) => Some(Arc::new(SqliteHistory::open(path)?)),
+        })
+    }
+}
+
+fn default_sqlite_path(cfg: &crate::config::Config) -> PathBuf {
+    for key in ["WRITABLE_PATH", "writable_path"] {
+        if let Ok(v) = std::env::var(key)
+            && !v.trim().is_empty()
+        {
+            return Path::new(v.trim()).join(HISTORY_FILE);
+        }
+    }
+    cfg.auth_dir.join(HISTORY_FILE)
+}
+
+#[cfg(test)]
+mod history_settings_tests {
+    use super::*;
+
+    fn settings(yaml: &str) -> AnyResult<HistorySettings> {
+        HistorySettings::from_config(&crate::config::Config::parse(&format!("auth-dir: /srv/auths\n{yaml}")).unwrap())
+    }
+
+    #[test]
+    fn storage_settings_have_safe_defaults_and_refuse_bad_values() {
+        let defaults = settings("").unwrap();
+        assert_eq!(defaults.retention_days, DEFAULT_RETENTION_DAYS);
+        if std::env::var_os("WRITABLE_PATH").is_none() && std::env::var_os("writable_path").is_none() {
+            assert_eq!(
+                defaults.backend,
+                HistoryBackend::Sqlite(PathBuf::from("/srv/auths/history.db"))
+            );
+        }
+        let custom = settings("storage:\n  backend: SQLite\n  sqlite-path: /data/h.db\n  retention-days: 0\n").unwrap();
+        assert_eq!(custom.backend, HistoryBackend::Sqlite(PathBuf::from("/data/h.db")));
+        assert_eq!(custom.retention_days, 0);
+        assert_eq!(
+            settings("storage: {backend: none}\n").unwrap().backend,
+            HistoryBackend::None
+        );
+        assert!(settings("storage: {backend: mongo}\n").is_err());
+        assert!(settings("storage: {retention-days: -1}\n").is_err());
+        assert!(
+            crate::config::Config::parse("storage: {retention-days: soon}\n").is_err(),
+            "the schema types it"
+        );
+    }
+}
