@@ -304,6 +304,8 @@ impl HistoryStore for PostgresHistory {
     }
 
     fn append_requests(&self, batch: Vec<RequestEntry>) -> BoxFuture<'_, Result<()>> {
+        // PostgreSQL text cannot hold U+0000.
+        let batch: Vec<_> = batch.into_iter().map(RequestEntry::storable).collect();
         let table = self.requests.clone();
         self.run(move |client| async move {
             if batch.is_empty() {
@@ -373,6 +375,7 @@ impl HistoryStore for PostgresHistory {
     }
 
     fn append_events(&self, batch: Vec<EventEntry>) -> BoxFuture<'_, Result<()>> {
+        let batch: Vec<_> = batch.into_iter().map(EventEntry::storable).collect();
         let table = self.events.clone();
         self.run(move |client| async move {
             if batch.is_empty() {
